@@ -191,20 +191,25 @@ export async function revalidateSnapshot(snapshot, config, { env = process.env }
   return true;
 }
 
-// A new branch is checked from where it left the remote's default branch, the
-// same range a pull request shows, instead of from an empty tree. That only
-// holds when the policy also checks the default branch; otherwise code that
-// reached it unchecked would be skipped, so the whole tree is assessed.
+// A new branch is checked from where it left the nearest branch already on the
+// remote, the same range a pull request shows, instead of from an empty tree.
+// For a branch stacked on another feature branch that is the parent branch, not
+// the default branch. Only branches the policy also checks count; otherwise code
+// that reached them unchecked would be skipped, so the whole tree is assessed.
 async function branchPoint(root, remote, head, config) {
   if (!remote || remote === '.' || !/^[\w.-]+$/.test(remote)) return null;
-  const named = (await git(root, ['symbolic-ref', '--quiet', `refs/remotes/${remote}/HEAD`], { allowFailure: true }))?.trim();
-  for (const ref of [named, `refs/remotes/${remote}/main`, `refs/remotes/${remote}/master`].filter(Boolean)) {
-    if (!(await git(root, ['rev-parse', '--verify', '--quiet', ref], { allowFailure: true }))) continue;
-    if (!triggered(config, 'pre-push', ref.slice(`refs/remotes/${remote}/`.length), remote)) return null;
+  const prefix = `refs/remotes/${remote}/`;
+  const refs = (await git(root, ['for-each-ref', '--format=%(refname)', prefix], { allowFailure: true }) || '')
+    .split('\n').filter(ref => ref && ref !== `${prefix}HEAD`);
+  let nearest = null;
+  for (const ref of refs) {
+    if (!triggered(config, 'pre-push', ref.slice(prefix.length), remote)) continue;
     const base = (await git(root, ['merge-base', head, ref], { allowFailure: true }))?.trim();
-    if (base && OID.test(base)) return base; // Equal to head: nothing new to check.
+    if (!base || !OID.test(base)) continue;
+    const distance = Number((await git(root, ['rev-list', '--count', `${base}..${head}`])).trim());
+    if (!nearest || distance < nearest.distance) nearest = { base, distance };
   }
-  return null;
+  return nearest?.base ?? null; // Equal to head: nothing new to check.
 }
 
 export async function pushSnapshots({ cwd = process.cwd(), remote, remoteUrl, input, config, env = process.env }) {

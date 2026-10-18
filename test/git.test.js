@@ -360,6 +360,26 @@ test('project context is attached explicitly and invalidates the exact checkpoin
   assert.equal(await revalidateSnapshot(ignored, defaults), true);
 });
 
+test('a new branch stacked on a pushed feature branch is checked from that branch', async t => {
+  const cwd = await fixture(t);
+  const main = await commit(cwd, { 'base.js': 'export const base = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/main', main);
+  await command(cwd, 'checkout', '-b', 'parent');
+  const parent = await commit(cwd, { 'parent.js': 'export const parent = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/parent', parent);
+  await command(cwd, 'checkout', '-b', 'child');
+  const head = await commit(cwd, { 'child.js': 'export const child = 1;\n' });
+  const input = `refs/heads/child ${head} refs/heads/child ${zero}\n`;
+  const remoteUrl = 'https://example.invalid/sphinx.git';
+  const [snapshot] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, input, config: { ...defaults, branches: ['*'] } });
+  assert.equal(snapshot.base, parent);
+  assert.deepEqual(snapshot.files, ['child.js']);
+  // A parent branch the policy does not check was never assessed, so it is not a base.
+  const [unchecked] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, input, config: { ...defaults, branches: ['main', 'child'] } });
+  assert.equal(unchecked.base, main);
+  assert.deepEqual(unchecked.files, ['child.js', 'parent.js']);
+});
+
 test('branch and path glob semantics handle nested names', () => {
   assert.equal(matches('release/*', 'release/team/stable'), true);
   assert.equal(matches('*.js', 'src/main.js', { path: true }), false);
