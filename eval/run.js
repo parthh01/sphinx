@@ -25,7 +25,7 @@ Default: deterministic scripted transports, real Pi and isolated committed Git f
   --case <ids>           Comma-separated: ${CASES.map(item => item.id).join(', ')}
   --model <id>           Override all tiers with this OpenRouter model
   --allow-paid           Explicitly permit a paid live route for this evaluation
-  --max-calls <1-1000>    Hard run-wide request cap (live: 20; scripted: 60)
+  --max-calls <1-1000>    Hard run-wide request cap (live: 20; scripted: 80)
   --max-cost <USD>       Stop after reported cost reaches this amount; can exceed by one request
   --delay-ms <0-60000>    Delay after each response (live default: 1000; scripted: 0)
   --max-output-tokens <512-16384>  Override the per-request output cap for this run only
@@ -50,7 +50,7 @@ No Sphinx session receipts are created, and real pending assessments are never r
     if (values.live && !config.allowPaid && Object.values(config.models).some(route => route.model && route.model !== 'openrouter/free' && !route.model.endsWith(':free'))) throw new Error('The selected route may be paid. Pass --allow-paid explicitly or choose --model openrouter/free.');
     const apiKey = values.live ? await openRouterKey(process.env) : undefined;
     const report = await runEvaluation({ cases, config, live: !!values.live, apiKey,
-      maxCalls: Number(values['max-calls'] ?? (values.live ? 20 : 60)), maxCost: values['max-cost'] === undefined ? undefined : Number(values['max-cost']), probes: values.probes,
+      maxCalls: Number(values['max-calls'] ?? (values.live ? 20 : 80)), maxCost: values['max-cost'] === undefined ? undefined : Number(values['max-cost']), probes: values.probes,
       delayMs: values['delay-ms'] === undefined ? undefined : Number(values['delay-ms']),
       onCase: async (result, partial) => {
         if (values.out) await writeFile(resolve(values.out), `${JSON.stringify(partial, null, 2)}\n`, { mode: 0o600 });

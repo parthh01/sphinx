@@ -286,7 +286,7 @@ export async function runCase(fixture, { config, budget, live = false, apiKey, p
   return diagnosticCopy(report, apiKey);
 }
 
-export async function runEvaluation({ cases = CASES, config = structuredClone(DEFAULT_CONFIG), maxCalls = 60, maxCost, live = false, apiKey, probes = 'both', fetchImpl, onCase, delayMs = live ? 1000 : 0, sleep } = {}) {
+export async function runEvaluation({ cases = CASES, config = structuredClone(DEFAULT_CONFIG), maxCalls = 80, maxCost, live = false, apiKey, probes = 'both', fetchImpl, onCase, delayMs = live ? 1000 : 0, sleep } = {}) {
   validateConfig(config);
   if (!['both', 'generated', 'canonical'].includes(probes)) throw new Error('probes must be both, generated, or canonical.');
   if (live && !apiKey) throw new Error('Live evaluations require an OpenRouter key; no requests were made.');
