@@ -22,7 +22,8 @@ const clean = (value, max) => typeof value === 'string' ? value.replace(/[\u0000
 
 async function git(root, args, env, optional = false) {
   try {
-    const { stdout } = await exec('git', ['--no-pager', '-c', 'core.fsmonitor=false', ...args], { cwd: root, env: { ...env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' }, encoding: 'utf8', timeout: 15000, maxBuffer: 4 * 1024 * 1024 });
+    // Literal pathspecs: a file named '*' or ':(glob)**' must name only itself, never the excluded files beside it.
+    const { stdout } = await exec('git', ['--no-pager', '--literal-pathspecs', '-c', 'core.fsmonitor=false', ...args], { cwd: root, env: { ...env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' }, encoding: 'utf8', timeout: 15000, maxBuffer: 4 * 1024 * 1024 });
     return stdout;
   } catch (error) { if (optional) return null; throw error; }
 }
