@@ -139,6 +139,13 @@ Pushing the same change again does not ask again. A pass lasts 24 hours, unless 
 - **`sphinx check`** runs the same check in your terminal instead of the browser.
 - **Headless or terminal-first.** Over SSH, or anywhere Sphinx can't open the browser in the background, the questions appear right in the terminal where you ran `git push`. Type `/hint`, `/learn`, `/dispute <reason>`, `/skip`, or `/quit` there. To always use the terminal, run `sphinx config --interface terminal`; to always use the browser, use `--interface browser`.
 - **On GitHub.** With the GitHub CLI (`gh`) signed in, a pass stamps the pushed commit. For a push to a pull request branch, the questionnaire offers "Post the Sphinx stamp to the pull request": a comment summarising the questions and first-try results. Add the Sphinx Action to a repository (`sphinx init --github-check`) and its pull requests show a **Sphinx** check: stamped with that summary, or neutral until the author passes. None of this ever blocks a push. See [GitHub stamps and the Sphinx check](docs/configuration.md#github-commit-status-and-pull-requests).
+- **Keep the questions.** After you pass, Sphinx saves those questions locally. `sphinx drill` poses due cards later: you answer, see the stored explanation, and mark **again** (due tomorrow) or **good** (1, 3, 7, 14, then 30 days). This does not call a model and does not block Git. `sphinx status` shows how many cards are due.
+
+```sh
+sphinx drill
+sphinx drill --list
+sphinx drill --json
+```
 
 Every skip and yolo toggle is logged with its reason, and `sphinx status` lists recent ones. If Git exited before you finished, for example because your agent's shell timed out, run the push once more. Never start a second copy while one is still waiting. For more cases, see [troubleshooting](docs/integrations.md#troubleshooting).
 
@@ -167,6 +174,7 @@ Version 0.1 checks local commits and pushes only. It does not cover web merges, 
 | `status` | Show this repository's policy, pending checks, and recent skips |
 | `check` | Start or resume a check in the terminal (`--staged` for commits) |
 | `pending` | List unfinished checks |
+| `drill` | Revisit passed questions when they are due |
 | `yolo` | Toggle skipping checks |
 | `config` | Change reviewer models and limits |
 | `auth` | Save your OpenRouter key or an OpenAI-compatible endpoint |

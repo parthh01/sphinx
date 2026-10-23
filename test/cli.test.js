@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
+import { deckFile, readDeck } from '../src/deck.js';
 
 const CLI = fileURLToPath(new URL('../bin/sphinx.js', import.meta.url));
 
@@ -151,6 +152,49 @@ test('CLI blocks a push, conducts the learning loop, reuses completion, and reje
   }
   f.cli('uninstall');
   assert.notEqual(f.run('git', ['config', '--global', '--get', 'core.hooksPath']).status, 0);
+});
+
+test('a passed check fills the local deck and sphinx drill lists it without model calls or answer keys', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  assert.notEqual(f.run('git', ['push', 'origin', 'main']).status, 0);
+  const pending = f.cliJson('pending')[0];
+  f.cliJson('check');
+  f.cliJson('answer', pending.id, '--text', 'Yes. Restart recreates the set, so it cannot remember the previous process\'s IDs.');
+  const before = (await f.calls()).length;
+  const empty = f.cliJson('drill');
+  assert.equal(empty.due, 0);
+  assert.equal(empty.upcoming, 1);
+  assert.equal(empty.cards.length, 0);
+  const listed = f.cliJson('drill', '--list');
+  assert.equal(listed.cards.length, 1);
+  assert.match(listed.cards[0].prompt, /same ID twice/);
+  assert.equal(Object.hasOwn(listed.cards[0], 'back'), false);
+  assert.equal(Object.hasOwn(listed.cards[0], 'expectedAnswer'), false);
+  assert.equal(Object.hasOwn(listed.cards[0], 'rationale'), false);
+  assert.doesNotMatch(JSON.stringify(listed), /recreated on restart|in-memory set/i);
+  const status = f.cliJson('status');
+  assert.equal(status.drill.total, 1);
+  assert.equal(status.drill.due, 0);
+  const human = f.cli('drill', '--list');
+  assert.match(human, /same ID twice/);
+  assert.doesNotMatch(human, /recreated on restart|in-memory set/i);
+  const rejected = f.run(process.execPath, [CLI, 'drill', '--limit', '0']);
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /1 to 50/);
+  const file = deckFile(f.repo, f.env);
+  const stored = JSON.parse(await readFile(file, 'utf8'));
+  const id = Object.keys((await readDeck(f.repo, f.env)).cards)[0];
+  stored.cards[id].dueAt = '2020-01-01T00:00:00.000Z';
+  await writeFile(file, `${JSON.stringify(stored, null, 2)}\n`);
+  const interactive = f.run(process.execPath, [CLI, 'drill']);
+  assert.equal(interactive.status, 1);
+  assert.match(interactive.stderr, /terminal|--json/);
+  const dueNow = f.cliJson('drill');
+  assert.equal(dueNow.due, 1);
+  assert.equal(dueNow.cards.length, 1);
+  assert.equal(Object.hasOwn(dueNow.cards[0], 'back'), false);
+  assert.equal((await f.calls()).length, before, 'drill makes no model calls');
 });
 
 test('CLI keeps a failed evaluator pending and enforces the checkpoint on retry', { timeout: 30000 }, async t => {
@@ -319,7 +363,7 @@ test('canonical repository policy controls actual destination pushes through exi
 
 test('each public CLI command provides contextual help without setup or model calls', { timeout: 30000 }, async t => {
   const f = await fixture(t);
-  const commands = ['install', 'activate', 'init', 'auth', 'check', 'pending', 'answer', 'explain', 'dispute', 'status', 'config', 'doctor', 'uninstall'];
+  const commands = ['install', 'activate', 'init', 'auth', 'check', 'pending', 'answer', 'explain', 'dispute', 'status', 'config', 'doctor', 'uninstall', 'drill'];
   const generalHelp = f.cli('--help');
   for (const command of commands) {
     const optionHelp = f.cli(command, '--help');

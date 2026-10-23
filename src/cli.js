@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { readStats, scoreSummary } from './stats.js';
+import { deckSummary, dueCards, publicCard, readDeck, reviewCard } from './deck.js';
 import { planProviders } from './evaluator.js';
 import { VERSION } from './version.js';
 import { fileURLToPath } from 'node:url';
@@ -38,7 +39,7 @@ const OPTIONS = {
   prepare: ['json', 'worker', 'retry'],
   answer: ['json', 'text'], explain: ['json'], dispute: ['json', 'text'], pending: ['json'],
   status: ['json'], config: ['json', 'distance', 'interface', ...MODEL_FLAGS], doctor: ['json'], auth: ['provider', 'base-url'], uninstall: ['repo'],
-  mcp: [], yolo: ['json', 'reason'], usage: ['json'],
+  mcp: [], yolo: ['json', 'reason'], usage: ['json'], drill: ['json', 'list', 'limit'],
 };
 const json = value => console.log(JSON.stringify(value, null, 2));
 const ui = () => createTerminal();
@@ -118,6 +119,11 @@ function parseModelCalls(value) {
 
 function parseOutputTokens(value) {
   if (!/^\d+$/u.test(String(value)) || Number(value) < 512 || Number(value) > 16384) throw new Error('--max-output-tokens must be a whole number from 512 to 16384.');
+  return Number(value);
+}
+
+function parseLimit(value) {
+  if (!/^(?:[1-9]|[1-4][0-9]|50)$/u.test(String(value))) throw new Error('--limit must be a whole number from 1 to 50.');
   return Number(value);
 }
 
@@ -464,7 +470,8 @@ async function statusCommand(command, values) {
   const preparation = command === 'status' ? await preparationStatus({ cwd: repo.root }) : null;
   for (const session of await store.pending(repo.root)) if (await git.revalidateSnapshot(session.snapshot, config)) pending.push(store.public(session));
   const yolo = command === 'status' ? await yoloStatus(repo.root) : null, overrides = command === 'status' ? await recentOverrides({ repoRoot: repo.root }) : [];
-  if (values.json) { json(command === 'status' ? { repo: repo.root, config, pending, preparation, yolo, overrides } : pending); return 0; }
+  const drill = command === 'status' ? deckSummary(await readDeck(repo.root)) : null;
+  if (values.json) { json(command === 'status' ? { repo: repo.root, config, pending, preparation, yolo, overrides, drill } : pending); return 0; }
   const terminal = ui();
   if (command === 'pending') { terminal.section('Pending assessments'); printPending(terminal, pending); return 0; }
   const info = await repositoryConfigInfo(repo.root), report = await doctor();
@@ -479,10 +486,76 @@ async function statusCommand(command, values) {
   if (!active) { terminal.blank(); terminal.warning('Policy alone does not install hooks. Use sphinx install, or sphinx install --repo when this repository overrides core.hooksPath.'); }
   const score = scoreSummary(await readStats(repo.root));
   terminal.rows([['Understanding', score.calibrating ? `Calibrating · ${score.answered} of ${score.answered + score.needed} answers` : `${score.accuracy}% first try · ${score.answered} questions${score.streak > 1 ? ` · ${score.streak} in a row` : ''}${score.skipRate !== null ? ` · skipped ${score.skipRate}% of checks` : ''}`]]);
+  if (drill) terminal.rows([['Retention', drill.total ? `${drill.due} due · ${drill.total} saved · sphinx drill` : 'No saved questions yet']]);
   if (yolo) { terminal.blank(); terminal.warning(`Yolo mode is on ${yolo.scope === 'repo' ? 'for this repository' : 'globally'} since ${yolo.since}: checks are skipped. Run sphinx yolo${yolo.scope === 'global' ? ' outside a repository' : ''} to turn it off.`); }
   terminal.section('Pending assessments'); printPending(terminal, pending);
   if (overrides.length) { terminal.section('Recent overrides'); terminal.rows(overrides.map(row => [row.at, `${row.kind}${row.target ? ` · ${row.target}` : ''}${row.reason ? ` · ${row.reason}` : ''}`])); }
   terminal.blank(); terminal.note('Status uses local Git state only. Agent hook trust is not verified here.'); return 0;
+}
+
+function printDeckList(terminal, cards, { due }) {
+  if (!cards.length) { terminal.success(due ? 'No cards due.' : 'No saved questions yet.'); return; }
+  for (const card of cards) {
+    terminal.section(card.dueAt ? `${card.target || 'question'} · due ${card.dueAt.slice(0, 10)}` : 'question');
+    terminal.paragraph(card.prompt);
+  }
+}
+
+async function drillCommand(values) {
+  const { repo } = await repoConfig();
+  const now = new Date();
+  const deck = await readDeck(repo.root);
+  const summary = deckSummary(deck, now);
+  const due = dueCards(deck, now);
+  const listed = Object.values(deck.cards).sort((a, b) => a.dueAt.localeCompare(b.dueAt) || a.id.localeCompare(b.id));
+  const limit = values.limit !== undefined ? parseLimit(values.limit) : 10;
+  const cards = values.list ? listed : due.slice(0, limit);
+  if (values.json) {
+    json({ repo: repo.root, ...summary, cards: cards.map(publicCard) });
+    return 0;
+  }
+  const terminal = ui();
+  if (values.list || !due.length) {
+    terminal.section(values.list ? 'Saved questions' : 'Retention');
+    printDeckList(terminal, values.list ? listed.map(publicCard) : [], { due: !values.list });
+    if (!values.list && summary.nextDue) terminal.note(`Next card is due ${summary.nextDue.slice(0, 10)}.`);
+    if (!values.list && listed.length) terminal.command('sphinx drill --list');
+    terminal.note('Makes no model calls.');
+    return 0;
+  }
+  if (!process.stdin.isTTY) throw new Error('Run sphinx drill in a terminal, or use --json. See sphinx drill --help.');
+  return withReadline(async ask => {
+    terminal.banner();
+    terminal.section('Retention');
+    terminal.paragraph(`Due now: ${due.length}. You will see the stored explanation after you answer, then mark again or good.`);
+    let asked = 0;
+    for (const card of due.slice(0, limit)) {
+      asked += 1;
+      terminal.blank();
+      terminal.section(`Card ${asked} of ${Math.min(limit, due.length)}`);
+      terminal.paragraph(card.prompt);
+      terminal.note('Write a prediction and a short reason. Enter to reveal. /quit to stop.');
+      const answer = (await ask('\nYour answer: ')).trim();
+      if (answer === '/quit') { terminal.note('Stopped. Remaining cards stay due.'); return 0; }
+      terminal.blank();
+      terminal.section('Stored explanation');
+      terminal.paragraph(card.back || 'No stored explanation for this card.');
+      let rating;
+      for (;;) {
+        const raw = (await ask('\nagain (tomorrow) or good (next interval): ')).trim().toLowerCase();
+        if (raw === '/quit') { terminal.note('Stopped. This card stays due.'); return 0; }
+        if (['again', 'a'].includes(raw)) { rating = 'again'; break; }
+        if (['good', 'g'].includes(raw)) { rating = 'good'; break; }
+        terminal.warning('Type again or good.');
+      }
+      const reviewed = await reviewCard({ repoRoot: repo.root, id: card.id, rating });
+      terminal.note(rating === 'again' ? 'Due tomorrow.' : `Next due ${reviewed.dueAt.slice(0, 10)}.`);
+    }
+    terminal.blank();
+    terminal.success(`Reviewed ${asked} card${asked === 1 ? '' : 's'}.`);
+    terminal.note('Makes no model calls.');
+    return 0;
+  });
 }
 
 // Parses and validates a command line before any command runs; exported so documented commands can be checked.
@@ -493,6 +566,7 @@ export function parseCommandLine(argv) {
     remote: { type: 'string' }, branch: { type: 'string' }, id: { type: 'string' }, text: { type: 'string' }, 'allow-paid': { type: 'boolean' },
     context: { type: 'string' }, 'github-check': { type: 'boolean' }, suggest: { type: 'boolean' }, apply: { type: 'string' }, worker: { type: 'boolean' }, retry: { type: 'boolean' }, reason: { type: 'string' }, 'base-url': { type: 'string' }, 'cli-billing': { type: 'string' },
     launch: { type: 'boolean' }, 'no-launch': { type: 'boolean' }, 'retry-review': { type: 'boolean' }, 'max-model-calls': { type: 'string' }, 'max-output-tokens': { type: 'string' },
+    list: { type: 'boolean' }, limit: { type: 'string' },
   } });
   const [command, id] = positionals;
   if (values.version || values.help || !command || command === 'help') return { values, command, id };
@@ -602,6 +676,7 @@ export async function main(argv) {
     if (values.json) json(summary); else printUsage(ui(), summary, { ledgerPath: summary.ledger });
     return 0;
   }
+  if (command === 'drill') return drillCommand(values);
   if (command === 'yolo') {
     const repo = await git.repository(process.cwd()).catch(() => null);
     const result = await toggleYolo({ repoRoot: repo?.root ?? null, reason: values.reason });

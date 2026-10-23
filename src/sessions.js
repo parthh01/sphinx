@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { REVIEWER_PRESETS } from './model-presets.js';
 import { recordAnswer, recordCheck } from './stats.js';
+import { capturePassedCheck } from './deck.js';
 import { withUsageMeter, withUsagePurpose, addUsage } from './usage.js';
 import { mkdir, open, readdir, stat, unlink } from 'node:fs/promises';
 import { DEFAULT_CONFIG, getPaths, readJson, writeJson, policyHash } from './config.js';
@@ -404,7 +405,10 @@ export function createSessionStore({ env = process.env, generate = generateAsses
         throw error;
       }
       if (scoreThis) await recordAnswer({ repoRoot: session.snapshot.repoRoot, correct: result.verdict === 'correct' && !learn, env });
-      if (session.status === 'passed') await recordCheck({ repoRoot: session.snapshot.repoRoot, outcome: 'completed', env });
+      if (session.status === 'passed') {
+        await recordCheck({ repoRoot: session.snapshot.repoRoot, outcome: 'completed', env });
+        await capturePassedCheck({ session, env });
+      }
       return {...publicSession(session), verdict:result.verdict};
     });
   }
