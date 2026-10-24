@@ -12,13 +12,18 @@ const MARKER = /<!-- sphinx-stamp:v1 ([A-Za-z0-9+/=]+) -->/;
 // Comments from these users can stamp a PR: its author, or people with write access.
 const MAINTAINERS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
+// A question as the contributor's Sphinx writes it: its prompt, and its tries when they were tracked.
+const validQuestion = question => Boolean(question) && typeof question === 'object' && typeof question.prompt === 'string'
+  && (question.tries === undefined || (Number.isInteger(question.tries) && question.tries >= 0))
+  && (question.firstTry === undefined || typeof question.firstTry === 'boolean');
+
 /** The stamp in one comment body, validated, or null. */
 export function parseStamp(body) {
   const match = MARKER.exec(String(body || ''));
   if (!match) return null;
   let stamp;
   try { stamp = JSON.parse(Buffer.from(match[1], 'base64').toString('utf8')); } catch { return null; }
-  if (!stamp || stamp.v !== 1 || !/^[a-f0-9]{40,64}$/.test(stamp.head || '') || !['passed', 'skipped'].includes(stamp.outcome) || !Array.isArray(stamp.questions)) return null;
+  if (!stamp || stamp.v !== 1 || !/^[a-f0-9]{40,64}$/.test(stamp.head || '') || !['passed', 'skipped'].includes(stamp.outcome) || !Array.isArray(stamp.questions) || !stamp.questions.every(validQuestion)) return null;
   return stamp;
 }
 
@@ -60,7 +65,7 @@ export function checkFor(found, { require = false } = {}) {
     stamp.level && ['Depth', clean(stamp.level, 40)],
     stamp.distance && ['Distance', clean(stamp.distance, 40)],
     stamp.model && ['Reviewer', clean(stamp.model, 80)],
-    stamp.at && ['Checked', `${String(stamp.at).slice(0, 16).replace('T', ' ')} UTC`],
+    typeof stamp.at === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(stamp.at) && ['Checked', `${stamp.at.slice(0, 16).replace('T', ' ')} UTC`],
   ].filter(Boolean);
   const lines = [`**${title}**`, ''];
   if (rows.length) lines.push('| | |', '|---|---|', ...rows.map(([key, value]) => `| ${key} | ${value} |`), '');
@@ -102,9 +107,10 @@ export async function run({ event, eventName, repository, api, require = false, 
   }
   const result = checkFor(findStamp({ comments, head, author }), { require });
   const existing = (await api('GET', `/repos/${repository}/commits/${head}/check-runs?check_name=${encodeURIComponent(CHECK_NAME)}&filter=latest`)).check_runs?.[0];
-  const body = { name: CHECK_NAME, head_sha: head, status: 'completed', conclusion: result.conclusion, output: { title: result.title.slice(0, 255), summary: result.summary.slice(0, 60000) } };
+  const body = { name: CHECK_NAME, status: 'completed', conclusion: result.conclusion, output: { title: result.title.slice(0, 255), summary: result.summary.slice(0, 60000) } };
+  // An update takes no head_sha, which GitHub documents only for creating a check run.
   if (existing) await api('PATCH', `/repos/${repository}/check-runs/${existing.id}`, body);
-  else await api('POST', `/repos/${repository}/check-runs`, body);
+  else await api('POST', `/repos/${repository}/check-runs`, { ...body, head_sha: head });
   log(`${CHECK_NAME}: ${result.title} (${result.conclusion}) on ${head.slice(0, 7)}`);
   return result;
 }

@@ -41,6 +41,18 @@ test('the check says stamped with a summary, failed when skipped, and neutral or
   assert.equal(checkFor(null, { require: true }).conclusion, 'failure');
 });
 
+const raw = stamp => `<!-- sphinx-stamp:v1 ${Buffer.from(JSON.stringify({ v: 1, head, outcome: 'passed', questions: [], ...stamp })).toString('base64')} -->`;
+
+test('a stamp with malformed questions is ignored, and its time cannot inject markup', () => {
+  for (const questions of [[null], ['text'], [{ prompt: 7 }], [{ prompt: 'p', tries: '2 | x' }], [{ prompt: 'p', tries: -1 }], [{ prompt: 'p', firstTry: 'yes' }]]) {
+    assert.equal(parseStamp(raw({ questions })), null, JSON.stringify(questions));
+  }
+  assert.ok(parseStamp(raw({ questions: [{ prompt: 'p' }, { prompt: 'q', tries: 2, firstTry: false }] })), 'what Sphinx writes still parses');
+  const summary = at => checkFor(findStamp({ comments: [comment(raw({ at }))], head, author: 'alice' })).summary;
+  assert.match(summary('2026-10-24T19:40:57.000Z'), /\| Checked \| 2026-10-24 19:40 UTC \|/);
+  for (const at of ['[x](https://e.co) |', ['2026-10-24T19:40'], 5]) assert.doesNotMatch(summary(at), /Checked/, JSON.stringify(at));
+});
+
 function fakeApi({ comments, existing = [] }) {
   const calls = [];
   const api = async (method, route, body) => {
@@ -61,7 +73,9 @@ test('the Action creates the Sphinx check, then updates it in place; non-PR comm
   assert.deepEqual([created.body.name, created.body.head_sha, created.body.conclusion], [CHECK_NAME, head, 'success']);
   const second = fakeApi({ comments: [comment(stampedBody('passed'))], existing: [{ id: 42 }] });
   await run({ event: { issue: { number: 1, pull_request: {} } }, eventName: 'issue_comment', repository: 'o/r', api: second.api, log: () => {} });
-  assert.ok(second.calls.some(call => call.method === 'PATCH' && call.route === '/repos/o/r/check-runs/42'));
+  const updated = second.calls.find(call => call.method === 'PATCH');
+  assert.equal(updated.route, '/repos/o/r/check-runs/42');
+  assert.deepEqual([updated.body.name, updated.body.conclusion, 'head_sha' in updated.body], [CHECK_NAME, 'success', false], 'GitHub documents head_sha only for creating a check run');
   const issue = fakeApi({ comments: [] });
   assert.equal(await run({ event: { issue: { number: 5 } }, eventName: 'issue_comment', repository: 'o/r', api: issue.api, log: () => {} }), null);
   assert.equal(issue.calls.length, 0);
