@@ -48,9 +48,11 @@ export async function updatePlan({ root = PACKAGE_ROOT } = {}) {
 /** What the questionnaire shows. Never throws. */
 export async function updateStatus({ env = process.env, fetchImpl, root } = {}) {
   const latest = await latestVersion({ env, fetchImpl });
-  const available = !!latest && isNewer(latest, VERSION);
-  const plan = available ? await updatePlan({ root }).catch(() => ({ manager: null })) : null;
-  return { current: VERSION, latest, available, ...(plan ? { command: plan.command?.join(' ') ?? null, note: plan.note ?? null } : {}) };
+  const plan = !!latest && isNewer(latest, VERSION) ? await updatePlan({ root }).catch(() => ({ manager: null })) : null;
+  // A linked development copy never offers one: releases bump the version only in the
+  // published package, so its package.json stays behind npm and git pull never catches up.
+  const available = !!plan?.manager;
+  return { current: VERSION, latest, available, ...(available ? { command: plan.command?.join(' ') ?? null, note: plan.note ?? null } : {}) };
 }
 
 const shellQuote = value => `'${String(value).replace(/'/g, `'\\''`)}'`;

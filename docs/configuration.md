@@ -289,7 +289,7 @@ How it fits together:
 - **Safety:** the workflow uses `pull_request_target` and `issue_comment` so it can write checks for fork pull requests, and it never checks out or runs pull request code. It reads comments through the API only. It needs `checks: write` and read access to pull requests and issues.
 - When a repository runs the Action, Sphinx skips the separate commit status, since the check replaces it.
 
-The workflow pins the Action to a Sphinx release tag (`parthh01/sphinx/action@v0.1.12`, for example). Any repository can use it; the path only says where the Action's code lives.
+The workflow pins the Action to the exact commit your installed Sphinx release was published from, with the release in a comment (`parthh01/sphinx/action@<commit> # sphinx-understand@0.2.0`, for example). Any repository can use it; the path only says where the Action's code lives.
 
 **Requiring it for a team.** With the Action, set `require: true` and add the **Sphinx** check to branch protection. Without it, add `sphinx/understanding` as a required status check. Pull requests whose head commit was not pushed through a passing check then cannot merge. The status is self-reported by the pusher's machine: it shows the check happened, but it is not a cryptographic proof, and anyone with write access can set a commit status.
 

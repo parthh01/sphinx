@@ -4,7 +4,8 @@ import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { isNewer, latestVersion, scheduleUpdate, updatePlan } from '../src/update.js';
+import { VERSION } from '../src/version.js';
+import { isNewer, latestVersion, scheduleUpdate, updatePlan, updateStatus } from '../src/update.js';
 
 async function home(t) {
   const dir = await mkdtemp(path.join(tmpdir(), 'sphinx-update-'));
@@ -41,6 +42,17 @@ test('updates with the package manager that installed it, and never touches a li
   await mkdir(checkout); await symlink(checkout, link);
   const linked = await updatePlan({ root: link });
   assert.equal(linked.manager, null); assert.match(linked.note, /git pull/);
+});
+
+test('an installed copy offers a newer release; a linked development copy never does', async t => {
+  const dir = await home(t), env = { SPHINX_HOME: path.join(dir, 'state') };
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ version: '99.0.0' }) });
+  const installed = path.join(dir, 'lib/node_modules/sphinx-understand'), checkout = path.join(dir, 'sphinx');
+  await mkdir(installed, { recursive: true }); await mkdir(checkout);
+  assert.deepEqual(await updateStatus({ env, fetchImpl, root: installed }), { current: VERSION, latest: '99.0.0', available: true, command: 'npm install -g sphinx-understand@latest', note: null });
+  // Releases bump the version only on npm, so a checkout's package.json is always behind.
+  assert.deepEqual(await updateStatus({ env, fetchImpl, root: checkout }), { current: VERSION, latest: '99.0.0', available: false });
+  assert.deepEqual(await updateStatus({ env: { SPHINX_HOME: path.join(dir, 'current') }, fetchImpl: async () => ({ ok: true, json: async () => ({ version: VERSION }) }), root: installed }), { current: VERSION, latest: VERSION, available: false });
 });
 
 test('the install waits for this process to exit and runs detached', async t => {

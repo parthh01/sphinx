@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { readStats, scoreSummary } from './stats.js';
 import { planProviders } from './evaluator.js';
-import { VERSION } from './version.js';
+import { GIT_HEAD, VERSION } from './version.js';
 import { fileURLToPath } from 'node:url';
 import { lstat, readFile } from 'node:fs/promises';
 import { parseArgs, promisify } from 'node:util';
@@ -377,7 +377,7 @@ async function githubCheckCommand(values) {
   const file = path.join(repo.root, '.github', 'workflows', 'sphinx.yml');
   await mkdir(path.dirname(file), { recursive: true });
   let created = true;
-  try { await writeFile(file, workflowTemplate(VERSION), { flag: 'wx' }); } catch (error) { if (error.code !== 'EEXIST') throw error; created = false; }
+  try { await writeFile(file, workflowTemplate(VERSION, GIT_HEAD), { flag: 'wx' }); } catch (error) { if (error.code !== 'EEXIST') throw error; created = false; }
   if (values.json) { json({ file, created }); return 0; }
   const terminal = ui();
   if (created) terminal.success(`Created ${path.relative(repo.root, file)}`); else terminal.note(`${path.relative(repo.root, file)} already exists and was kept.`);

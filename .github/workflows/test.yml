@@ -17,3 +17,43 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+  # Publishes each push to main that passes the tests (see Releases in CONTRIBUTING.md).
+  # The version bump exists only in this job's checkout, and the job cannot write to the
+  # repository, so a release never creates a commit or tag and never triggers another run.
+  release:
+    needs: test
+    if: github.repository == 'parthh01/sphinx' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # npm's trusted publisher accepts only this environment, and the repository's settings let only
+    # main use it, so a copy of this workflow edited on another branch cannot publish.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing and provenance; no token or secret
+    # No concurrency group: GitHub cancels a group's waiting job when another queues, which can drop
+    # main's newest release. Only main's head publishes, and npm never publishes a version twice.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer. There is no npm ci: publishing needs no
+      # dependencies, and no install scripts should run in a job that can mint an npm token.
+      - run: printf '%s\n' 11.5.1 "$(npm --version)" | sort -C -V || npm install --global --ignore-scripts npm@11
+      - id: release
+        run: node scripts/release.mjs
+      # Trusted publishing adds provenance by default; --provenance makes it required, so the
+      # publish fails rather than ship without it.
+      - if: steps.release.outputs.publish == 'true'
+        run: npm publish --provenance
+      # Later runs find this commit by the gitHead npm recorded; without it they would publish it again.
+      - if: steps.release.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do recorded=$(npm view "sphinx-understand@$VERSION" gitHead) && break; sleep 10; done
+          [ "$recorded" = "$GITHUB_SHA" ] || { echo "::error::sphinx-understand@$VERSION should record gitHead $GITHUB_SHA, but npm shows '${recorded:-nothing}'. Later runs would publish this commit again."; exit 1; }
