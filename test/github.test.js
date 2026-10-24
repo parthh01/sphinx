@@ -1,11 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, githubRepository, runStampJob, scheduleStamp, statusFor, workflowTemplate } from '../src/github.js';
+import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, githubRepository, runStampJob, scheduleStamp, statusFor } from '../src/github.js';
 import { DEFAULT_CONFIG, policyHash, validateConfig, validateRepositoryConfig } from '../src/config.js';
 
 const snapshot = { event: 'pre-push', repoRoot: '/repo', head: 'b'.repeat(40), base: 'a'.repeat(40), stats: { files: 2, additions: 10, deletions: 1 }, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/feature' } };
@@ -152,16 +151,4 @@ test('a repository running the Sphinx Action gets the comment instead of a commi
   calls.length = 0;
   await scheduleStamp({ snapshot: { ...snapshot, repoRoot }, session, outcome: 'passed', config: config({}), env, spawnImpl: fakeSpawn(calls), post: false });
   assert.equal(calls.length, 0, 'turning the toggle off posts nothing');
-});
-
-test('the Sphinx workflow pins the Action to the commit the installed release was published from', async t => {
-  const sha = 'f'.repeat(40);
-  // Releases have no tags. The release job writes the commit into the published package.json, where version.js reads it.
-  assert.match(workflowTemplate('0.2.0', sha), new RegExp(`\\n      - uses: parthh01/sphinx/action@${sha} # sphinx-understand@0\\.2\\.0\\n`));
-  assert.match(workflowTemplate('0.1.13', null), /\n      - uses: parthh01\/sphinx\/action@v0\.1\.13\n/, 'a development copy has no commit');
-  const { SPHINX_HOME: dir } = await home(t);
-  await mkdir(join(dir, 'src')); await copyFile(new URL('../src/version.js', import.meta.url), join(dir, 'src', 'version.js'));
-  await writeFile(join(dir, 'package.json'), JSON.stringify({ type: 'module', version: '0.2.0', gitHead: sha }));
-  const installed = await import(pathToFileURL(join(dir, 'src', 'version.js')).href);
-  assert.deepEqual([installed.VERSION, installed.GIT_HEAD], ['0.2.0', sha]);
 });

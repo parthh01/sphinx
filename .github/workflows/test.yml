@@ -1,5 +1,5 @@
 name: Test
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
@@ -17,26 +17,30 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-  # Publishes each push to main that passes the tests (see Releases in CONTRIBUTING.md).
-  # The version bump exists only in this job's checkout, and the job cannot write to the
-  # repository, so a release never creates a commit or tag and never triggers another run.
+  # Releases each push to main that passes the tests (see Releases in CONTRIBUTING.md): it commits the
+  # new version to main as "Release <version> [skip ci]", tags it, pushes both, then publishes that commit.
+  # A release commit never starts another release: this job's own token pushes it, and GitHub starts no
+  # run for that; [skip ci] skips it even for a token that would; and release.mjs skips any commit npm's
+  # latest was published from or already contains. Tags never reach this job, which runs for main only.
+  # Run workflow on main publishes a release commit whose publish failed.
   release:
     needs: test
-    if: github.repository == 'parthh01/sphinx' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.repository == 'parthh01/sphinx' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # npm's trusted publisher accepts only this environment, and the repository's settings let only
     # main use it, so a copy of this workflow edited on another branch cannot publish.
     environment: npm
     permissions:
-      contents: read
+      contents: write # the release commit and tag, pushed with this job's own token
       id-token: write # npm trusted publishing and provenance; no token or secret
     # No concurrency group: GitHub cancels a group's waiting job when another queues, which can drop
-    # main's newest release. Only main's head publishes, and npm never publishes a version twice.
+    # main's newest release. Only main's newest commit releases: an older one's push is rejected.
     steps:
+      # Checkout's default token is this job's own, and a push made with it starts no run. A personal
+      # token or a secret here would start a run for every release commit. release.mjs removes it from
+      # .git/config once it has pushed, so the publish steps cannot read it.
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -44,16 +48,24 @@ jobs:
       # Trusted publishing needs npm 11.5.1 or newer. There is no npm ci: publishing needs no
       # dependencies, and no install scripts should run in a job that can mint an npm token.
       - run: printf '%s\n' 11.5.1 "$(npm --version)" | sort -C -V || npm install --global --ignore-scripts npm@11
+      # Pushes the release commit and tag to main before anything is published, so npm never records a
+      # commit GitHub lacks, and leaves the checkout at the commit to publish.
       - id: release
         run: node scripts/release.mjs
-      # Trusted publishing adds provenance by default; --provenance makes it required, so the
-      # publish fails rather than ship without it.
-      - if: steps.release.outputs.publish == 'true'
-        run: npm publish --provenance
-      # Later runs find this commit by the gitHead npm recorded; without it they would publish it again.
+      # npm records the checkout's commit as gitHead. Trusted publishing adds provenance by default;
+      # --provenance makes it required, so the publish fails rather than ship without it. Releases count
+      # from npm's latest, so --tag latest moves latest to each one, even below a higher version npm has
+      # under another tag or from before latest was moved back by hand, which npm 11 otherwise refuses.
       - if: steps.release.outputs.publish == 'true'
         env:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
+          npm publish --provenance --tag latest || { echo "::error::npm did not publish $VERSION, though its commit and tag are on main. Fix the cause, then use Actions, Test, Run workflow on main, which publishes it from that commit with no new commit (see Releases in CONTRIBUTING.md). Re-running this job skips once a release commit is on main."; exit 1; }
+      # Later runs skip a commit npm records as published from, so check that npm recorded this one.
+      - if: steps.release.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
           for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do recorded=$(npm view "sphinx-understand@$VERSION" gitHead) && break; sleep 10; done
-          [ "$recorded" = "$GITHUB_SHA" ] || { echo "::error::sphinx-understand@$VERSION should record gitHead $GITHUB_SHA, but npm shows '${recorded:-nothing}'. Later runs would publish this commit again."; exit 1; }
+          [ "$recorded" = "$COMMIT" ] || { echo "::error::sphinx-understand@$VERSION should record gitHead $COMMIT, the commit it was published from, but npm shows '${recorded:-nothing}'."; exit 1; }

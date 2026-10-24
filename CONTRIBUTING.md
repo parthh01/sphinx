@@ -20,13 +20,34 @@ Before proposing a stronger model or additional model calls, measure whether the
 
 ## Releases
 
-Every push to `main` that passes the tests publishes to npm from that exact commit, through the `release` job in `.github/workflows/test.yml`. The version is the next minor after npm's latest, so 0.1.13 is followed by 0.2.0. To choose another version, such as a major or a patch, set `version` in `package.json` higher than every version published so far; one that is not higher than npm's latest is ignored. If npm's `latest` tag is ever moved back by hand, the next minor may already exist, and npm refuses it until `package.json` is set above the newest published version.
+Every push to `main` that passes the tests is released to npm by the `release` job in `.github/workflows/test.yml`.
 
-The job writes the version, and the commit as `gitHead`, into its own checkout and never writes to the repository: no commits and no tags. A release therefore cannot trigger another run, and `package.json` in the repository stays behind npm. npm records the commit each version was built from, so re-running the job for a published commit does nothing. Installed copies pin the Action that `sphinx init --github-check` sets up to that commit, so never rewrite `main`'s history. A run whose commit is no longer the tip of `main` skips and leaves the release to the newer commit's run. If that run fails, re-run it or push again; a commit whose message contains `[skip ci]` starts no run, so nothing is published until the next push.
+The version is the next patch after npm's `latest`, so 0.1.13 is followed by 0.1.14. For a minor or major release, set `version` in `package.json` above npm's `latest` in a normal pull request, and that version is published as it is. Nothing is published at or below npm's `latest`. A version npm already has, or whose `v<version>` tag names another commit, is skipped for the next patch. Each release becomes npm's `latest`, even when npm has a higher version under another tag.
+
+For each release, the job:
+
+1. Commits the new version to `main` as `Release <version> [skip ci]`, by `github-actions[bot]`, changing only the version in `package.json` and `package-lock.json`. A version set by hand needs no release commit.
+2. Tags the commit it publishes `v<version>`.
+3. Pushes the commit and tag in one atomic push. If `main` moved on meanwhile, the push is rejected, nothing is published, and the newer commit's run releases.
+4. Publishes that commit with npm trusted publishing and provenance, then checks that npm recorded it.
+
+A release commit follows every merge, so pull before pushing to `main` directly.
+
+A release commit never starts another release:
+
+- The job's own token pushes it, and GitHub starts no workflow run for that.
+- Its `[skip ci]` skips push runs whatever pushed it.
+- The job skips any commit npm's `latest` was published from or already contains. Resetting `main` back to a released commit therefore releases nothing; push a revert instead.
+
+Never connect an integration that commits to `main` whenever `main` changes, such as a badge, changelog or formatting bot, unless its commits say `[skip ci]`. Each of its commits would release a version, and each release commit would set it off again. Your own commit whose message contains `[skip ci]` starts no run either, and neither does a squash merge whose pull request's commit messages quote it. It is released with the next commit, or with **Run workflow** below.
+
+If publishing fails, or the job is cancelled, after the push, `main` ends at a tagged commit whose version npm does not have, and no run starts for a release commit. Fix the cause, then open **Actions**, **Test**, **Run workflow** on `main`. That run publishes the version from that commit, reusing its tag, with no new commit. Re-running the failed job does nothing, and its log says to use **Run workflow**. If another commit reaches `main` first, its release skips the unpublished version and publishes the next patch.
+
+Installed copies pin the Action that `sphinx init --github-check` sets up to their version's tag, so never move or delete release tags. `main` and `v*` tags must stay pushable by `github-actions`: branch protection, or a ruleset on `main` or on tags, that blocks its push stops releases, and each release job then fails without publishing.
 
 Publishing uses npm trusted publishing, with no token or secret. It needs a one-time setup:
 
 1. On GitHub, open the repository's **Settings**, **Environments**, **New environment**, and name it `npm`. Under **Deployment branches and tags**, choose **Selected branches and tags** and add the branch `main`. It needs no secrets.
 2. On npmjs.com, open the `sphinx-understand` package, then **Settings**, **Trusted publishing**, **GitHub Actions**, and enter owner `parthh01`, repository `sphinx`, workflow filename `test.yml`, and environment `npm`.
 
-npm then accepts only the `npm` environment, which only `main` can use, so a workflow edited on another branch cannot publish. Renaming `test.yml`, the environment, or the repository stops publishing until these settings and the job match again. Without the npm setting, the release job fails without publishing; re-run it once the setting is saved.
+npm then accepts only the `npm` environment, which only `main` can use, so a workflow edited on another branch cannot publish. Renaming `test.yml`, the environment, or the repository stops publishing until these settings match again. Without the npm setting, the first release commit and tag are pushed and the publish fails; save the setting, then use **Run workflow**.

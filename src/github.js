@@ -141,11 +141,8 @@ export async function pullRequestPush(snapshot) {
   return fallback ? branch !== fallback : !['main', 'master'].includes(branch);
 }
 
-/**
- * The workflow that runs the Sphinx Action, pinned to the commit this release was published
- * from: releases have no tags. A development copy has no such commit and keeps its version's tag.
- */
-export function workflowTemplate(version, gitHead) {
+/** The workflow that runs the Sphinx Action, pinned to this release's tag. */
+export function workflowTemplate(version) {
   return `# Shows a "Sphinx" check on pull requests, from the stamp a contributor's Sphinx
 # posts after they pass its understanding check. https://github.com/parthh01/sphinx
 # It reads PR comments only and never checks out or runs pull request code, so it
@@ -169,7 +166,7 @@ jobs:
     if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     steps:
-      - uses: ${ACTION_REF}@${gitHead ? `${gitHead} # sphinx-understand@${version}` : `v${version}`}
+      - uses: ${ACTION_REF}@v${version}
         with:
           require: false
 `;
