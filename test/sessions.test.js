@@ -604,3 +604,64 @@ test('a saved draft is not offered for a different question', () => {
   assert.equal(savedDraft(session),null);
   assert.deepEqual(savedDraft({...session,questions:[{id:'retry'}]}),{kind:'answer',text:'Old.'});
 });
+
+test('a wrong answer or an explanation without a follow-up keeps the same question, records each attempt, and scores one miss', async t => {
+  const { readStats } = await import('../src/stats.js');
+  const grades = [{ verdict: 'incorrect', feedback: 'Nothing deduplicates the insert.' }, { verdict: 'incorrect', feedback: 'Here is how it works.' }, { verdict: 'correct', feedback: '' }];
+  const { store, config, env } = await fixture(t, { grade: async () => ({ ...grades.shift(), followUp: null }) });
+  await store.ensure(snapshot, config); await store.start(snapshot.id, config);
+  const missed = await store.answer(snapshot.id, 'No.', config, { expectedQuestionId: q.id });
+  assert.deepEqual([missed.status, missed.verdict, missed.question.id, missed.feedback], ['active', 'incorrect', q.id, 'Nothing deduplicates the insert.']);
+  const explained = await store.answer(snapshot.id, 'Teach me.', config, { learn: true, expectedQuestionId: q.id });
+  assert.deepEqual([explained.question.id, explained.feedback], [q.id, 'Here is how it works.']);
+  assert.equal((await store.answer(snapshot.id, 'Yes: it inserts every time.', config, { expectedQuestionId: q.id })).status, 'passed');
+  const saved = await store.read(snapshot.id);
+  assert.deepEqual(saved.attempts.map(item => [item.kind, item.verdict, item.questionId]), [['answer', 'incorrect', q.id], ['learn', 'incorrect', q.id], ['answer', 'correct', q.id]]);
+  const stats = await readStats(snapshot.repoRoot, env);
+  assert.deepEqual([stats.answered, stats.firstTry], [1, 0]);
+});
+
+test('a grader reply Sphinx cannot use is explained in plain words with the original text on detail; other failures are unchanged', async t => {
+  const plain = { answer: 'The grader\'s reply couldn\'t be used, so this wasn\'t graded. Your text is saved; sending it again makes another model call.', learn: 'The grader\'s reply couldn\'t be used, so no explanation is shown. Asking again makes another model call.' };
+  for (const code of ['INVALID_MODEL_OUTPUT', 'INSUFFICIENT_EVIDENCE', 'INVALID_REVIEW_ACTION']) {
+    const failure = Object.assign(new Error(`Return one complete JSON object (${code}). Retry the assessment.`), { code });
+    const { store, config } = await fixture(t, { grade: async () => { throw failure; } });
+    await store.ensure(snapshot, config); await store.start(snapshot.id, config);
+    for (const [options, message] of [[{}, plain.answer], [{ dispute: true }, plain.answer], [{ learn: true }, plain.learn]]) {
+      await assert.rejects(store.answer(snapshot.id, 'Yes: it inserts every time.', config, options), error => {
+        assert.deepEqual([error.message, error.detail, error.code], [message, failure.message, code], JSON.stringify(options));
+        return true;
+      });
+    }
+    const saved = await store.read(snapshot.id);
+    assert.deepEqual(savedDraft(saved), { kind: 'dispute', text: 'Yes: it inserts every time.' });
+    assert.deepEqual([saved.attempts.length, saved.index, saved.status], [0, 0, 'active']);
+  }
+  const outage = Object.assign(new Error('Provider unavailable.'), { code: 'OPENROUTER_PROVIDER_ERROR' });
+  const { store, config } = await fixture(t, { grade: async () => { throw outage; } });
+  await store.ensure(snapshot, config); await store.start(snapshot.id, config);
+  await assert.rejects(store.answer(snapshot.id, 'Teach me.', config, { learn: true }), error => error === outage);
+  await assert.rejects(store.answer(snapshot.id, 'Yes.', config), error => error.message === 'Provider unavailable. Your answer was saved and is offered again when you resume this question.' && error.detail === undefined);
+});
+
+test('a renamed replacement id skips every id the check has used and stays within 80 characters', async t => {
+  const later = { ...q, id: 'x'.repeat(80), prompt: 'Does a second worker share the guard? Why?' };
+  // The next question's id twice, then the id of the question the first replacement took over.
+  const proposed = [later.id, later.id, q.id];
+  const graded = [];
+  const { store, config } = await fixture(t, {
+    generate: async () => ({ questions: [q, later] }),
+    grade: async request => {
+      graded.push(request.question.id);
+      const id = proposed.shift();
+      return id ? { verdict: 'incorrect', feedback: 'No.', followUp: { ...q, id, prompt: `Scenario ${graded.length}: after a restart, can the request run again? Why?` } } : { verdict: 'correct', feedback: '', followUp: null };
+    },
+  });
+  const medium = { ...snapshot, id: '8'.repeat(64), stats: { additions: 200, deletions: 40, files: 6 } };
+  await store.ensure(medium, config); await store.start(medium.id, config);
+  const shown = [q.id];
+  for (let miss = 0; miss < 3; miss++) shown.push((await store.answer(medium.id, 'No.', config, { expectedQuestionId: shown.at(-1) })).question.id);
+  assert.deepEqual(shown, [q.id, `${'x'.repeat(70)}-2`, `${'x'.repeat(70)}-3`, `${q.id}-2`]);
+  for (const old of shown.slice(0, -1)) await assert.rejects(store.answer(medium.id, 'A late answer.', config, { expectedQuestionId: old }), { code: 'SPHINX_STALE_QUESTION' }, old);
+  assert.equal(graded.length, 3, 'A stale answer is never graded');
+});

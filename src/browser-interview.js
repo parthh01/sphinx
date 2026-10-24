@@ -251,7 +251,7 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
     if (data.action === 'answer') say({ role: 'human', kind: 'answer', text: data.response.trim(), status: 'checking' });
     else if (data.action === 'dispute') say({ role: 'human', kind: 'dispute', text: `Dispute: ${data.response.trim()}`, status: 'checking' });
     else if (data.action === 'learn') say({ role: 'human', kind: 'learn', text: 'Explain this concept.', status: 'checking' });
-    publish({ ...publicFields(state), phase: 'working', message: data.action === 'answer' ? 'Checking your reasoning…' : data.action === 'learn' ? 'Preparing an explanation and a new scenario…' : data.action === 'dispute' ? 'Reviewing the question…' : 'Continuing the review…' });
+    publish({ ...publicFields(state), phase: 'working', message: data.action === 'answer' ? 'Checking your reasoning…' : data.action === 'learn' ? 'Preparing an explanation…' : data.action === 'dispute' ? 'Reviewing the question…' : 'Continuing the review…' });
     send(res, 202, state); current.resolve(data);
   }
   async function ensureServer(operationEnv) {
@@ -470,6 +470,8 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
           settle('graded');
           await refreshScore(request.repoRoot, operationEnv).catch(() => {});
           if (visible.feedback) say({ role: 'sphinx', kind: 'feedback', text: visible.feedback });
+          // Without a usable new question no new bubble appears, so say that the same one stays open.
+          if (visible.status !== 'passed' && visible.question?.id === action.questionId) say({ role: 'sphinx', kind: 'notice', text: 'The same question is still open.' });
         } catch (error) {
           settle('not-graded');
           localSignal.throwIfAborted(); await validate(session.snapshot, config);

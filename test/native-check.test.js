@@ -261,18 +261,131 @@ test('source changes during final grading prevent completion', async t => {
     await f.git('commit', '-m', 'Changed during grading');
     return { verdict: 'correct', feedback: 'This was correct for the old source.', followUp: null };
   } });
-  const result = await f.run({ elicit: async () => answer('Yes.') });
+  let forms = 0;
+  const result = await f.run({ elicit: async () => { forms++; return answer('Yes.'); } });
   assert.equal(result.status, 'error');
+  assert.equal(forms, 1, 'A code change ends the dialog instead of offering the question again');
   assert.equal(await f.store.approved(f.snapshot, f.config), false);
 });
 
 test('provider errors never escape through the coding-agent result', async t => {
   const f = await fixture(t, { grade: async () => { throw new Error('PROVIDER_ERROR_WITH_PRIVATE_FEEDBACK'); } });
-  const result = await f.run({ elicit: async () => answer('Yes.') });
+  let forms = 0;
+  const result = await f.run({ elicit: async () => ++forms > 3 ? { action: 'cancel' } : answer('Yes.') });
   assert.equal(result.status, 'error');
-  assert.equal(result.calls, 2);
+  assert.equal(forms, 3);
+  assert.equal(result.calls, 4, 'The question generation plus three ungraded attempts');
   assert.doesNotMatch(JSON.stringify(result), /PROVIDER_ERROR|feedback/i);
   assert.equal(await f.store.approved(f.snapshot, f.config), false);
+});
+
+test('a rejected grade offers the same question and draft again, and the resubmission is graded', async t => {
+  const f = await fixture(t, { grade: async (_request, count) => {
+    if (count === 1) throw Object.assign(new Error('PRIVATE_GRADER_REJECTION'), { code: 'INVALID_MODEL_OUTPUT' });
+    return { verdict: 'correct', feedback: 'Understood.', followUp: null };
+  } });
+  const forms = [];
+  const result = await f.run({ elicit: async form => { forms.push(form); return forms.length > 2 ? { action: 'cancel' } : answer('Yes, both attempts insert.'); } });
+  assert.equal(result.status, 'passed');
+  assert.equal(forms.length, 2);
+  assert.match(forms[1].message, /That response was not graded, and nothing was marked complete\. Your draft is kept: send it again, or choose pause\./);
+  assert.match(forms[1].message, /Could retrying after a timeout/);
+  assert.equal(forms[1].requestedSchema.properties.response.default, 'Yes, both attempts insert.');
+  assert.equal(f.graded.length, 2);
+  assert.equal(result.calls, 3);
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_GRADER_REJECTION|not graded/i);
+  assert.equal(await f.store.approved(f.snapshot, f.config), true);
+});
+
+test('a failed explanation request offers learn again and promises no draft, since it saves none', async t => {
+  const f = await fixture(t, { grade: async (request, count) => {
+    if (count === 1) throw Object.assign(new Error('PRIVATE_GRADER_REJECTION'), { code: 'INVALID_MODEL_OUTPUT' });
+    return { verdict: 'correct', feedback: 'Understood.', followUp: null };
+  } });
+  const forms = [], replies = [{ action: 'accept', content: { action: 'learn' } }, answer('Yes, both attempts insert.')];
+  const result = await f.run({ elicit: async form => { forms.push(form); return replies.shift() ?? { action: 'cancel' }; } });
+  assert.equal(result.status, 'passed');
+  assert.equal(f.graded[0].learn, true);
+  assert.match(forms[1].message, /The explanation was not shown, and nothing was marked complete\. Choose learn to ask again, or choose pause\./);
+  assert.doesNotMatch(forms[1].message, /draft/i);
+  assert.equal(forms[1].requestedSchema.properties.action.default, 'learn');
+  assert.equal(forms[1].requestedSchema.properties.response.default, undefined);
+});
+
+test('a response the store never saved is not called a kept draft', async t => {
+  const f = await fixture(t);
+  const submit = f.store.answer;
+  let busy = true;
+  f.store.answer = async (...args) => {
+    if (busy) { busy = false; throw Object.assign(new Error('This assessment is already running. Wait for preparation to finish, then resume the check.'), { code: 'SPHINX_SESSION_BUSY' }); }
+    return submit(...args);
+  };
+  const forms = [];
+  const result = await f.run({ elicit: async form => { forms.push(form); return forms.length > 2 ? { action: 'cancel' } : answer('Yes, both attempts insert.'); } });
+  assert.equal(result.status, 'passed');
+  assert.match(forms[1].message, /That response was not graded or saved, and nothing was marked complete\. Enter it again, or choose pause\./);
+  assert.equal(forms[1].requestedSchema.properties.response.default, undefined);
+  assert.equal(f.graded.length, 1);
+});
+
+test('a failure that sending the same response again cannot change ends the native dialog at once', async t => {
+  const f = await fixture(t);
+  f.store.answer = async () => { throw Object.assign(new Error('The grading context cannot fit its evidence and rubric.'), { code: 'CONTEXT_LIMIT' }); };
+  let forms = 0;
+  const result = await f.run({ elicit: async () => ++forms > 1 ? { action: 'cancel' } : answer('Yes.') });
+  assert.equal(result.status, 'error');
+  assert.equal(forms, 1);
+  assert.equal(result.calls, 1, 'Only the question generation was charged');
+  assert.equal(await f.store.approved(f.snapshot, f.config), false);
+});
+
+test('three ungraded responses in a row end the native dialog, and a graded response resets the count', async t => {
+  const f = await fixture(t, { grade: async (_request, count) => {
+    if (count !== 3) throw Object.assign(new Error('PRIVATE_GRADER_REJECTION'), { code: 'INVALID_MODEL_OUTPUT' });
+    return { verdict: 'incorrect', feedback: 'Revisit retries.', followUp: { ...q, id: 'transfer', prompt: 'Can a retried background job repeat this write?' } };
+  } });
+  let forms = 0;
+  const result = await f.run({ elicit: async () => ++forms > 6 ? { action: 'cancel' } : answer('No.') });
+  assert.equal(result.status, 'error');
+  assert.equal(forms, 6);
+  assert.deepEqual(f.graded.map(request => request.question.id), ['retry', 'retry', 'retry', 'transfer', 'transfer', 'transfer']);
+  assert.equal(result.calls, 7);
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_GRADER_REJECTION/);
+  assert.equal(await f.store.approved(f.snapshot, f.config), false);
+});
+
+test('pausing after an ungraded attempt reports the calls it used', async t => {
+  const f = await fixture(t, { grade: async () => { throw new Error('PROVIDER_ERROR'); } });
+  const replies = [answer('Yes.'), { action: 'accept', content: { action: 'pause' } }];
+  const result = await f.run({ elicit: async () => replies.shift() ?? { action: 'cancel' } });
+  assert.equal(result.status, 'pending');
+  assert.equal(result.calls, 2);
+});
+
+test('an ungraded attempt that spends the call allowance ends the dialog', async t => {
+  const f = await fixture(t, { grade: async () => { throw new Error('PROVIDER_ERROR'); } });
+  let forms = 0;
+  const result = await f.run({ elicit: async () => {
+    if (++forms > 1) return { action: 'cancel' };
+    await saveConfig({ ...f.config, maxModelCalls: 2 }, f.env);
+    return answer('Yes.');
+  } });
+  assert.equal(result.status, 'error');
+  assert.equal(forms, 1);
+  assert.deepEqual(result.checkpoints[0].usage, { calls: 2, limit: 2 });
+});
+
+test('a question replaced during submission ends the dialog without grading the stale answer', async t => {
+  const f = await fixture(t, { grade: async () => ({ verdict: 'incorrect', feedback: 'Revisit retries.',
+    followUp: { ...q, id: 'replacement', prompt: 'Can a retried background job repeat this write?' } }) });
+  const submit = f.store.answer;
+  f.store.answer = async (...args) => { await submit(f.snapshot.id, 'Another client answered this.', f.config); return submit(...args); };
+  let forms = 0;
+  const result = await f.run({ elicit: async () => ++forms > 1 ? { action: 'cancel' } : answer('STALE_NATIVE_RESPONSE') });
+  assert.equal(result.status, 'error');
+  assert.equal(forms, 1);
+  assert.equal(f.graded.length, 1);
+  assert.doesNotMatch(JSON.stringify(f.graded), /STALE_NATIVE_RESPONSE/);
 });
 
 test('mismatched queue metadata cannot open a different repository assessment', async t => {

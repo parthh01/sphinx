@@ -5,7 +5,7 @@ import { withUsageMeter, withUsagePurpose, addUsage } from './usage.js';
 import { mkdir, open, readdir, stat, unlink } from 'node:fs/promises';
 import { DEFAULT_CONFIG, getPaths, readJson, writeJson, policyHash } from './config.js';
 import { selectRoute, evaluatorConfig, questionLimit } from './routing.js';
-import { generateAssessment, gradeAnswer } from './evaluator.js';
+import { generateAssessment, gradeAnswer, MODEL_OUTPUT_ERRORS } from './evaluator.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { hasPreferences } from './repo-context.js';
 
@@ -347,12 +347,19 @@ export function createSessionStore({ env = process.env, generate = generateAsses
         session.draft = {questionId:question.id,kind:dispute?'dispute':'answer',text:text.trim(),at:now()};
         await save(session);
       }
-      const beforeCall = async () => { signal?.throwIfAborted(); await budget(session); signal?.throwIfAborted(); };
+      let requested = false;
+      const beforeCall = async () => { signal?.throwIfAborted(); await budget(session); requested = true; signal?.throwIfAborted(); };
       let result;
       try {
         result = await withUsageMeter(meterFor(session), () => withUsagePurpose('grading', () => grade({snapshot:session.snapshot,question,answer:text.trim(),config:evaluatorConfig(config,session.route),review:session.review,dispute,learn,beforeCall,signal,env})));
       } catch (error) {
-        if (learn || signal?.aborted || error?.name === 'AbortError') throw error;
+        if (signal?.aborted || error?.name === 'AbortError') throw error;
+        // The same codes also reject inputs before any request (such as control characters in the answer), which a resend cannot fix.
+        if (requested && MODEL_OUTPUT_ERRORS.includes(error?.code)) {
+          throw Object.assign(withRecoveryMessage(error, learn ? 'The grader\'s reply couldn\'t be used, so no explanation is shown. Asking again makes another model call.'
+            : 'The grader\'s reply couldn\'t be used, so this wasn\'t graded. Your text is saved; sending it again makes another model call.'), { detail: error.message });
+        }
+        if (learn) throw error;
         throw withRecoveryMessage(error, `${error.message} Your ${dispute ? 'dispute reason' : 'answer'} was saved and is offered again when you resume this question.`);
       }
       signal?.throwIfAborted();
@@ -380,14 +387,14 @@ export function createSessionStore({ env = process.env, generate = generateAsses
         }
       } else if (result.followUp) {
         if (result.followUp.prompt.trim() === question.prompt.trim()) throw new Error('The evaluator repeated the question. Retry; no concept was marked complete.');
-        // Keep IDs unique across the check, so nothing keyed by question ID can confuse two questions.
-        const taken = new Set(session.questions.filter((_, index) => index !== session.index).map(item => item.id));
+        // Keep IDs unique across the check, answered and replaced questions included, so an answer to any earlier
+        // question is refused as stale and a replacement is never taken for one already shown.
+        const taken = new Set([...session.questions.map(item => item.id), ...session.attempts.map(item => item.questionId)]);
         let followUp = result.followUp;
-        for (let n = 2; taken.has(followUp.id); n++) followUp = { ...result.followUp, id: `${result.followUp.id}-${n}` };
+        for (let n = 2; taken.has(followUp.id); n++) followUp = { ...result.followUp, id: `${result.followUp.id.slice(0, 70)}-${n}` };
         session.questions[session.index] = followUp;
-      } else if (result.verdict === 'incorrect' || learn) {
-        throw new Error('The evaluator did not provide a transfer question. The concept remains pending.');
       }
+      // Without a usable follow-up the same question stays open, with the attempt and its explanation kept.
       session.updatedAt = now();
       signal?.throwIfAborted();
       try {

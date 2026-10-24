@@ -71,10 +71,10 @@ export function printHeader(terminal, { session, score }) {
   terminal.line(style.muted(`  ${'─'.repeat(Math.max(10, terminal.width - 4))}`));
 }
 
-function printQuestion(terminal, state, { followUp }) {
+function printQuestion(terminal, state, { note }) {
   const { style } = terminal;
   terminal.line('');
-  const label = `Question ${state.progress.completed + 1} of ${state.progress.total}${followUp ? ' · follow-up' : ''}`;
+  const label = `Question ${state.progress.completed + 1} of ${state.progress.total}${note ? ` · ${note}` : ''}`;
   terminal.line(`  ${style.strong(label)}`);
   block(terminal, state.question.prompt, s => s.amber('┃'));
   if (state.question.choices?.length) state.question.choices.forEach((choice, index) => terminal.line(`    ${style.muted(`${index + 1}.`)} ${plain(choice)}`));
@@ -128,7 +128,7 @@ export async function runTerminalCheck({ store, session, config, ask, terminal: 
   while (state.status !== 'passed') {
     if (state.question && state.question.id !== shownId) {
       const number = state.progress.completed + 1;
-      printQuestion(terminal, state, { followUp: number === shownNumber });
+      printQuestion(terminal, state, { note: number === shownNumber ? 'follow-up' : '' });
       commandsLine(terminal, { waitingGit });
       shownId = state.question.id; shownNumber = number;
     }
@@ -158,7 +158,7 @@ export async function runTerminalCheck({ store, session, config, ask, terminal: 
     if (answer.startsWith('/') && !dispute && !learn) { terminal.warning('Use /hint, /learn, /dispute <reason>, /quit, or type your answer.'); continue; }
     const previous = state;
     try {
-      state = await withSpinner(learn ? 'Preparing an explanation and a new scenario' : dispute ? 'Reviewing the question' : 'Checking your reasoning', () => store.answer(session.id, learn ? LEARN : dispute ? answer.slice(9) : answer, config, { dispute, learn, expectedQuestionId: previous.question.id, signal }));
+      state = await withSpinner(learn ? 'Preparing an explanation' : dispute ? 'Reviewing the question' : 'Checking your reasoning', () => store.answer(session.id, learn ? LEARN : dispute ? answer.slice(9) : answer, config, { dispute, learn, expectedQuestionId: previous.question.id, signal }));
     } catch (error) {
       // Like the browser: a failed grade leaves the same question open. Only cancelling ends the check.
       if (signal?.aborted || ['SPHINX_CANCELLED', 'EVALUATOR_CANCELLED'].includes(error?.code) || error?.name === 'AbortError') throw error;
@@ -170,6 +170,8 @@ export async function runTerminalCheck({ store, session, config, ask, terminal: 
     }
     signal?.throwIfAborted();
     printVerdict(terminal, state, { learn, dispute });
+    // Without a usable new question the same one stays open; show it again below the explanation.
+    if (state.status !== 'passed' && state.question?.id === previous.question.id) printQuestion(terminal, state, { note: 'still open' });
   }
   terminal.line('');
   terminal.line(`  ${style.green('✓')} ${style.strong('Understanding check complete.')}`);

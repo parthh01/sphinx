@@ -9,7 +9,7 @@
 <p align="center"><b>Works with</b> Claude Code · Codex · Cursor · OpenCode · Pi · or a plain <code>git push</code><br>
 <b>Reviews run on</b> your Claude Code or Codex plan · OpenRouter · any OpenAI-compatible endpoint</p>
 
-Sphinx adds an understanding check to agent-assisted development. When you push to a protected branch, Git waits while Sphinx asks you to predict what your change will do. If you miss something, it explains and gives you a new scenario to try. Once you pass, the same push continues. This works whether you or a coding agent ran `git push`.
+Sphinx adds an understanding check to agent-assisted development. When you push to a protected branch, Git waits while Sphinx asks you to predict what your change will do. If you miss something, it explains and gives you another try, usually with a new scenario. Once you pass, the same push continues. This works whether you or a coding agent ran `git push`.
 
 The questions come from a separate reviewer model. It reads the committed change through read-only Git tools and does not see the conversation that produced the code.
 
@@ -129,8 +129,8 @@ Pushing the same change again does not ask again. A pass lasts 24 hours, unless 
 
 ## During and after a check
 
-- **Wrong answer.** You get an explanation and a new scenario about the same concept. Disputes and errors never count as passing.
-- **Explain this.** Shows the concept and asks you a new question.
+- **Wrong answer.** You get an explanation and a new scenario about the same concept. If the grader can't supply a usable new scenario, you answer the same question again. Disputes and errors never count as passing.
+- **Explain this.** Shows the concept and asks you a new question, or the same one again if no usable new scenario comes back.
 - **Dispute question.** Use this if a question's premise is wrong or ambiguous. A bad question must be corrected before that concept can pass.
 - **Pause check.** Saves your progress and stops the push. Run the same `git push` later to pick up where you left off.
 - **Closing the tab** doesn't stop anything. Git keeps waiting, and the same address works until the 25-minute deadline.

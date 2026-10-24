@@ -49,6 +49,18 @@ test('a wrong answer explains and asks a labelled follow-up; /quit saves progres
   assert.match(h.output(), /Progress saved/);
 });
 
+test('after a miss or an explanation without a new question, the same question is shown again below the explanation', async () => {
+  const results = [];
+  const h = harness({ answers: ['Charged once', '/learn', 'It charges twice'], results });
+  const same = feedback => ({ status: 'active', question: h.q1, progress: { completed: 0, total: 1 }, verdict: 'incorrect', feedback });
+  results.push(same('The job saves nothing before charge().'), same('Here is how it works.'), { status: 'passed', question: null, progress: { completed: 1, total: 1 }, verdict: 'correct', feedback: '' });
+  assert.equal(await h.run(), 0);
+  const out = h.output();
+  assert.match(out, /✗ Not quite\n {2}│ The job saves nothing before charge\(\)\.\n\n {2}Question 1 of 1 · still open\n {2}┃ What happens on redelivery\?/);
+  assert.match(out, /Preparing an explanation…\n\n {2}◇ Here's how it works\n {2}│ Here is how it works\.\n\n {2}Question 1 of 1 · still open\n/);
+  assert.doesNotMatch(out, /new scenario|follow-up/, 'Nothing promises a new question that did not come');
+});
+
 test('/skip asks for a reason and lets a waiting Git operation through', async () => {
   const h = harness({ answers: ['/skip', 'prod hotfix'], results: [], waitingGit: true });
   assert.equal(await h.run(), 3);
@@ -92,14 +104,14 @@ test('a failed grade keeps the question open instead of ending the check; cancel
   let calls = 0;
   const done = { status: 'passed', question: null, progress: { completed: 1, total: 1 }, verdict: 'correct', feedback: '' };
   const store = { start: async () => ({ status: 'active', question: failing.q1, progress: { completed: 0, total: 1 } }), read: async () => ({}), public: s => s,
-    answer: async () => { calls++; if (calls === 1) throw new Error('The explanation came back without a new scenario. Ask for it again.'); return done; } };
+    answer: async () => { calls++; if (calls === 1) throw new Error("The grader's reply couldn't be used, so no explanation is shown. Asking again makes another model call."); return done; } };
   let output = '';
   const { Writable } = await import('node:stream');
   const stream = new Writable({ write(chunk, _e, next) { output += chunk; next(); } });
   const answers = ['/learn', 'It charges twice'];
   const code = await runTerminalCheck({ store, session: { id: 'x', questions: [failing.q1], route: {}, snapshot: { repoRoot: '/r', target: { ref: 'refs/heads/main' } } }, config: DEFAULT_CONFIG, ask: async () => answers.shift(), terminal: createTerminal({ stream, env: { NO_COLOR: '1' }, width: 80 }), stream, env: { SPHINX_HOME: '/nonexistent' }, validate: async () => {}, choose: async () => 'pause' });
   assert.equal(code, 0, 'the check carried on and passed');
-  assert.match(output, /That didn't go through: The explanation came back without a new scenario\./);
+  assert.match(output, /That didn't go through: The grader's reply couldn't be used, so no explanation is shown\./);
   assert.match(output, /Your progress is kept/);
   const cancelled = Object.assign(new Error('cancelled'), { code: 'SPHINX_CANCELLED' });
   const stopping = { ...store, answer: async () => { throw cancelled; } };

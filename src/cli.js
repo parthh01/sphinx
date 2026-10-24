@@ -618,7 +618,7 @@ export async function main(argv) {
     const { repo, config } = await repoConfig(), existing = await store.read(id);
     if (existing.snapshot.repoRoot !== repo.root) throw new Error('This checkpoint belongs to a different repository.');
     const learn = command === 'explain', dispute = command === 'dispute';
-    const result = await withProgress(learn ? 'Preparing an explanation and new scenario' : dispute ? 'Reviewing the question' : 'Checking your reasoning', () => store.answer(id, learn ? 'I do not know. Explain this concept and give me a different scenario to apply it to.' : values.text, config, { learn, dispute }), { enabled: !values.json });
+    const result = await withProgress(learn ? 'Preparing an explanation' : dispute ? 'Reviewing the question' : 'Checking your reasoning', () => store.answer(id, learn ? 'I do not know. Explain this concept and give me a different scenario to apply it to.' : values.text, config, { learn, dispute }), { enabled: !values.json });
     if (values.json) json(result); else printSession(result); return 0;
   }
 }

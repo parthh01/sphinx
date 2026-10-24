@@ -119,7 +119,7 @@ The tier and your chosen depth set the maximum number of initial questions:
 - `standard`: behavior, failure modes, and relevant system interactions.
 - `thorough`: also supported rollout, rollback, and compatibility assumptions.
 
-These are ceilings, not quotas: the reviewer asks fewer questions when the evidence supports fewer distinct behaviors, and never pads. A wrong answer adds a replacement question for the same concept, so a check can ask more than the initial count. Changing the model does not change the question count.
+These are ceilings, not quotas: the reviewer asks fewer questions when the evidence supports fewer distinct behaviors, and never pads. A wrong answer can replace a question with a new one for the same concept, so a check can ask more than the initial count. Changing the model does not change the question count.
 
 ## Question audit
 
@@ -133,7 +133,7 @@ After the reviewer writes questions, an independent model call can audit them ag
 | --- | --- |
 | Investigation for a small / medium / large change | Aims for 5 / 7 / 8, including the question audit. These are planning targets, not stops. |
 | Each answer, learning request, or dispute | 1 |
-| A proposed replacement question | 1 more, for an independent source audit |
+| A proposed replacement question that passes Sphinx's format checks | 1 more, for an independent source audit |
 | Status, help, config, pending, or pushing an already approved change | 0 |
 
 Set or clear an optional cap. This changes no routes and makes no model request:

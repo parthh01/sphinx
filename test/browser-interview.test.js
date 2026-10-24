@@ -79,6 +79,33 @@ test('wrong answers stay in the same page and require a human response to the tr
   await f.post('answer', { response: 'The set is recreated.' }); assert.equal((await done).status, 'passed'); assert.equal(f.opened(), 1);
 });
 
+test('a miss or an explanation without a new question says the same question is still open; a follow-up needs no such note', async t => {
+  const transfer = { ...q, id: 'transfer', prompt: 'What changes after restart?' };
+  const replies = [{ verdict: 'incorrect', feedback: 'There is no durable deduplication.', followUp: null }, { verdict: 'incorrect', feedback: 'Here is how it works.', followUp: null },
+    { verdict: 'incorrect', feedback: 'Still not durable.', followUp: transfer }, { verdict: 'correct', feedback: '', followUp: null }];
+  const f = await fixture(t, { grade: async () => replies.shift() });
+  const done = f.present(); await f.waitFor('question');
+  await f.post('answer', { response: 'No.' }); await f.waitFor('question');
+  assert.equal((await (await f.post('learn')).json()).message, 'Preparing an explanation…', 'Nothing promises a new scenario that may not come');
+  await f.waitFor('question');
+  await f.post('answer', { response: 'Still no.' }); await f.waitFor('question');
+  const shape = f.interview.state.messages.map(item => [item.kind, item.kind === 'question' ? item.questionId : item.text]);
+  assert.deepEqual(shape, [['question', q.id], ['answer', 'No.'], ['feedback', 'There is no durable deduplication.'], ['notice', 'The same question is still open.'],
+    ['learn', 'Explain this concept.'], ['feedback', 'Here is how it works.'], ['notice', 'The same question is still open.'],
+    ['answer', 'Still no.'], ['feedback', 'Still not durable.'], ['question', 'transfer']]);
+  await f.post('answer', { response: 'The set is recreated.' }); assert.equal((await done).status, 'passed');
+});
+
+test('a replacement that repeats the id of the question it replaces still appears as a new question', async t => {
+  const f = await fixture(t, { grade: async (_request, count) => count < 3 ? { verdict: 'incorrect', feedback: 'Not quite.', followUp: { ...q, id: 'transfer', prompt: `Scenario ${count}: what changes after a restart?` } } : { verdict: 'correct', feedback: '', followUp: null } });
+  const done = f.present(); await f.waitFor('question');
+  await f.post('answer', { response: 'No.' }); await f.waitFor('question');
+  await f.post('answer', { response: 'Still no.' }); await f.waitFor('question');
+  const questions = f.interview.state.messages.filter(item => item.kind === 'question').map(item => [item.questionId, item.text]);
+  assert.deepEqual(questions, [[q.id, q.prompt], ['transfer', 'Scenario 1: what changes after a restart?'], ['transfer-2', 'Scenario 2: what changes after a restart?']]);
+  await f.post('answer', { response: 'The set is recreated.' }); assert.equal((await done).status, 'passed');
+});
+
 test('browser responses omit private concept and acceptance metadata even from a permissive public-state adapter', async t => {
   const concept = 'PRIVATE_CONCEPT_ANSWER: yes, each retry repeats the unconditional insertion.';
   const acceptance = { prediction: 'PRIVATE_ACCEPTANCE_PREDICTION: A retry can insert again.', causalReason: 'PRIVATE_ACCEPTANCE_CAUSE: The next request repeats the unconditional insertion.' };

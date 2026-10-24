@@ -8,7 +8,7 @@ const QUOTE = 'https://x.com/yacineMTB/status/2018886083120153046?s=20';
 const steps = [
   ['You push.', 'Or your agent does. Git pauses on the branches you protect.'],
   ['Sphinx asks.', 'A reviewer that never saw your chat reads the diff and asks what the change does when things go wrong.'],
-  ['You answer.', 'Get it wrong and you learn why, then try a new scenario. Get it right and the push continues.'],
+  ['You answer.', 'Get it wrong and you learn why, then try again, usually with a new scenario. Get it right and the push continues.'],
 ];
 
 export default function Home() {
