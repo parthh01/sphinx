@@ -12,10 +12,13 @@ const MARKER = /<!-- sphinx-stamp:v1 ([A-Za-z0-9+/=]+) -->/;
 // Comments from these users can stamp a PR: its author, or people with write access.
 const MAINTAINERS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
-// A question as the contributor's Sphinx writes it: its prompt, and its tries when they were tracked.
+// Only what the contributor's Sphinx writes is accepted, so no field can break the check: text or null,
+// whole-number change stats, and questions with a prompt and, when they were tracked, tries and firstTry.
+const whole = value => Number.isInteger(value) && value >= 0;
+const optionalText = value => value === undefined || value === null || typeof value === 'string';
+const validStats = stats => stats === undefined || stats === null || (typeof stats === 'object' && !Array.isArray(stats) && ['files', 'additions', 'deletions'].every(key => stats[key] === undefined || whole(stats[key])));
 const validQuestion = question => Boolean(question) && typeof question === 'object' && typeof question.prompt === 'string'
-  && (question.tries === undefined || (Number.isInteger(question.tries) && question.tries >= 0))
-  && (question.firstTry === undefined || typeof question.firstTry === 'boolean');
+  && (question.tries === undefined ? question.firstTry === undefined : whole(question.tries) && typeof question.firstTry === 'boolean');
 
 /** The stamp in one comment body, validated, or null. */
 export function parseStamp(body) {
@@ -23,7 +26,8 @@ export function parseStamp(body) {
   if (!match) return null;
   let stamp;
   try { stamp = JSON.parse(Buffer.from(match[1], 'base64').toString('utf8')); } catch { return null; }
-  if (!stamp || stamp.v !== 1 || !/^[a-f0-9]{40,64}$/.test(stamp.head || '') || !['passed', 'skipped'].includes(stamp.outcome) || !Array.isArray(stamp.questions) || !stamp.questions.every(validQuestion)) return null;
+  if (!stamp || stamp.v !== 1 || typeof stamp.head !== 'string' || !/^[a-f0-9]{40,64}$/.test(stamp.head) || !['passed', 'skipped'].includes(stamp.outcome)) return null;
+  if (!['at', 'level', 'distance', 'model', 'noQuestionReason'].every(key => optionalText(stamp[key])) || !validStats(stamp.stats) || !Array.isArray(stamp.questions) || !stamp.questions.every(validQuestion)) return null;
   return stamp;
 }
 
@@ -65,7 +69,7 @@ export function checkFor(found, { require = false } = {}) {
     stamp.level && ['Depth', clean(stamp.level, 40)],
     stamp.distance && ['Distance', clean(stamp.distance, 40)],
     stamp.model && ['Reviewer', clean(stamp.model, 80)],
-    typeof stamp.at === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(stamp.at) && ['Checked', `${stamp.at.slice(0, 16).replace('T', ' ')} UTC`],
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(stamp.at || '') && ['Checked', `${stamp.at.slice(0, 16).replace('T', ' ')} UTC`],
   ].filter(Boolean);
   const lines = [`**${title}**`, ''];
   if (rows.length) lines.push('| | |', '|---|---|', ...rows.map(([key, value]) => `| ${key} | ${value} |`), '');

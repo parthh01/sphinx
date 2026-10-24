@@ -43,9 +43,14 @@ test('the check says stamped with a summary, failed when skipped, and neutral or
 
 const raw = stamp => `<!-- sphinx-stamp:v1 ${Buffer.from(JSON.stringify({ v: 1, head, outcome: 'passed', questions: [], ...stamp })).toString('base64')} -->`;
 
-test('a stamp with malformed questions is ignored, and its time cannot inject markup', () => {
-  for (const questions of [[null], ['text'], [{ prompt: 7 }], [{ prompt: 'p', tries: '2 | x' }], [{ prompt: 'p', tries: -1 }], [{ prompt: 'p', firstTry: 'yes' }]]) {
+test('a stamp with fields Sphinx never writes is ignored, and its time cannot inject markup', () => {
+  for (const questions of [[null], ['text'], [{ prompt: 7 }], [{ prompt: 'p', tries: '2 | x', firstTry: false }], [{ prompt: 'p', tries: -1, firstTry: false }], [{ prompt: 'p', tries: 1, firstTry: 'yes' }], [{ prompt: 'p', firstTry: false }], [{ prompt: 'p', tries: 2 }]]) {
     assert.equal(parseStamp(raw({ questions })), null, JSON.stringify(questions));
+  }
+  // An object whose toString is no function makes String() and Number() throw, which used to fail the whole run.
+  const unprintable = { toString: 0, valueOf: 0 };
+  for (const field of [{ head: unprintable }, { level: unprintable }, { model: ['x'] }, { noQuestionReason: 5 }, { at: unprintable }, { stats: { files: unprintable } }, { stats: [1] }]) {
+    assert.equal(parseStamp(raw(field)), null, JSON.stringify(field));
   }
   assert.ok(parseStamp(raw({ questions: [{ prompt: 'p' }, { prompt: 'q', tries: 2, firstTry: false }] })), 'what Sphinx writes still parses');
   const summary = at => checkFor(findStamp({ comments: [comment(raw({ at }))], head, author: 'alice' })).summary;
