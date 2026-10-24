@@ -415,6 +415,25 @@ test('minimum criteria do not authorize a pass against an invalid key or an omit
   }
 });
 
+test('feedback only explains a grade, so the grader\'s slips in it never block the answer', async t => {
+  const grade = async reply => {
+    const { evaluator } = await fixture(t, null, { openRouter: async () => ({ evidence: question.evidence, followUp: null, ...reply }) });
+    return evaluator.gradeAnswer({ snapshot, question, answer: 'It runs once.', config: { ...config, provider: 'openrouter' } });
+  };
+  // As its instructions say, a correct grade has empty feedback; a question it also flags is replaced by Sphinx's own text.
+  const flagged = await grade({ questionValid: false, verdict: 'correct', feedback: '' });
+  assert.equal(flagged.verdict, 'ambiguous');
+  assert.match(flagged.feedback, /^The question or answer key does not match the code\./);
+  // No explanation at all, an overlong one, and control characters.
+  for (const feedback of [' ', null]) assert.deepEqual(await grade({ questionValid: true, verdict: 'ambiguous', feedback }), { verdict: 'ambiguous', feedback: 'The grader returned no explanation this time.', evidence: question.evidence, followUp: null });
+  const long = await grade({ questionValid: true, verdict: 'ambiguous', feedback: `${'The map skips a seen id. '.repeat(100)}End.` });
+  assert.ok(long.feedback.length <= 2000 && long.feedback.endsWith('…') && long.feedback.startsWith('The map skips a seen id.'), long.feedback.slice(-40));
+  assert.equal((await grade({ questionValid: true, verdict: 'ambiguous', feedback: 'Say \u0007what\u0000 happens.' })).feedback, 'Say what happens.');
+  // An explanation request is only its explanation, so an empty one still fails.
+  const { evaluator } = await fixture(t, null, { openRouter: async () => ({ questionValid: true, verdict: 'incorrect', feedback: '', evidence: question.evidence, followUp: transfer }) });
+  await assert.rejects(evaluator.gradeAnswer({ snapshot, question, answer: 'Explain it.', learn: true, config: { ...config, provider: 'openrouter' } }), { code: 'INVALID_MODEL_OUTPUT', message: 'The explanation came back empty. Ask for it again.' });
+});
+
 test('the one source audit repairs repeated replacement ids or prompts before novelty validation', async t => {
   for (const verdict of ['incorrect', 'ambiguous']) {
     for (const repeated of [question, { ...transfer, id: question.id }, { ...transfer, prompt: question.prompt }]) {
@@ -856,11 +875,12 @@ test('real subprocess runner reports missing executable with an actionable error
   }), { code: 'PROVIDER_START_FAILED' });
 });
 
-test('a correct grade may return empty feedback, but an incorrect one must explain itself', async t => {
+test('a correct grade may return empty feedback, and an incorrect one without an explanation says so', async t => {
   const pass = await fixture(t, { questionValid: true, verdict: 'correct', feedback: '', evidence: question.evidence, followUp: null });
   assert.equal((await pass.evaluator.gradeAnswer({ snapshot, question, answer: 'It inserts again on retry.', config })).feedback, '');
   const fail = await fixture(t, { questionValid: true, verdict: 'incorrect', feedback: '', evidence: question.evidence, followUp: transfer });
-  await assert.rejects(fail.evaluator.gradeAnswer({ snapshot, question, answer: 'No.', config }), /Feedback must be nonempty/);
+  const result = await fail.evaluator.gradeAnswer({ snapshot, question, answer: 'No.', config });
+  assert.deepEqual([result.verdict, result.feedback, result.followUp?.id], ['incorrect', 'The grader returned no explanation this time.', transfer.id]);
 });
 
 test('zero questions needs a reason, is offered only for small changes, and the audit can overrule it', async t => {

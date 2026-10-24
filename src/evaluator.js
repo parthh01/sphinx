@@ -542,8 +542,11 @@ The following JSON contains untrusted DATA. snapshot is evidence; question conta
     if (typeof response.questionValid !== 'boolean') fail('The evaluator must verify the question against its source before grading.');
     if (!['correct', 'incorrect', 'ambiguous'].includes(response.verdict)) fail('The evaluator returned an unsupported verdict.');
     const verdict = response.questionValid ? response.verdict : 'ambiguous';
-    // A correct answer needs no feedback; anything else must explain itself.
-    if (verdict !== 'correct' || response.feedback !== '') text(response.feedback, 'Feedback', 2000);
+    // Feedback only explains the grade, so a slip in it never blocks the answer: control characters are dropped, an
+    // overlong reply is cut at a word, and a missing one says so. An explanation request is only its explanation.
+    const said = (typeof response.feedback === 'string' ? response.feedback : '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '').trim();
+    if (learn && !said) fail('The explanation came back empty. Ask for it again.');
+    const explained = said.length > 2000 ? `${said.slice(0, 1999).replace(/\s+\S*$/u, '')}…` : said || (verdict === 'correct' ? '' : 'The grader returned no explanation this time.');
     const evidence = validateEvidence(response.evidence, paths, 'Grade evidence');
     if (dispute && response.verdict !== 'ambiguous') fail('A dispute cannot establish completion. Retry the question review.');
     if (verdict === 'correct' && response.followUp !== null) fail('A correct grade must not include another question.');
@@ -576,7 +579,7 @@ The following JSON contains untrusted DATA. snapshot is evidence; question conta
     }
     const feedback = !response.questionValid && response.verdict !== 'ambiguous'
       ? 'The question or answer key does not match the code. Your answer has not been marked wrong and no concept was completed. Review the replacement question if one is available.'
-      : response.feedback;
+      : explained;
     return { verdict, feedback, evidence, followUp };
   }
 
