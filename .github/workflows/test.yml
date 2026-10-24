@@ -61,11 +61,18 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           npm publish --provenance --tag latest || { echo "::error::npm did not publish $VERSION, though its commit and tag are on main. Fix the cause, then use Actions, Test, Run workflow on main, which publishes it from that commit with no new commit (see Releases in CONTRIBUTING.md). Re-running this job skips once a release commit is on main."; exit 1; }
-      # Later runs skip a commit npm records as published from, so check that npm recorded this one.
+      # Later runs skip a commit npm records as published from, so check that npm recorded this one. npm can
+      # take a few minutes to show a version it accepted, so one it does not show yet only warns.
       - if: steps.release.outputs.publish == 'true'
         env:
           VERSION: ${{ steps.release.outputs.version }}
           COMMIT: ${{ steps.release.outputs.commit }}
         run: |
-          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do recorded=$(npm view "sphinx-understand@$VERSION" gitHead) && break; sleep 10; done
-          [ "$recorded" = "$COMMIT" ] || { echo "::error::sphinx-understand@$VERSION should record gitHead $COMMIT, the commit it was published from, but npm shows '${recorded:-nothing}'."; exit 1; }
+          for attempt in $(seq 30); do
+            if recorded=$(npm view "sphinx-understand@$VERSION" gitHead 2>/dev/null); then
+              [ "$recorded" = "$COMMIT" ] && exit 0
+              echo "::error::sphinx-understand@$VERSION should record gitHead $COMMIT, the commit it was published from, but npm shows '${recorded:-nothing}'."; exit 1
+            fi
+            sleep 10
+          done
+          echo "::warning::npm accepted sphinx-understand@$VERSION but did not show it within 5 minutes. Check later that npm view sphinx-understand@$VERSION gitHead prints $COMMIT."
