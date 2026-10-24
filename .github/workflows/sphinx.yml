@@ -1,0 +1,29 @@
+# Shows a "Sphinx" check on pull requests, from the stamp a contributor's Sphinx
+# posts after they pass its understanding check. https://github.com/parthh01/sphinx
+# It reads PR comments only and never checks out or runs pull request code, so it
+# is safe for pull requests from forks. Set require: true and make the "Sphinx"
+# check required in branch protection to block merging unstamped commits.
+name: Sphinx
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created, edited]
+permissions:
+  checks: write
+  pull-requests: read
+  issues: read
+concurrency:
+  group: sphinx-${{ github.event.pull_request.number || github.event.issue.number }}
+  # Runs for one PR take turns, and each reads the PR's current head and comments, so
+  # the last to run shows the current state. A comment, such as a bot's seconds after
+  # a PR opens, must not cancel a run that has already started.
+  cancel-in-progress: false
+jobs:
+  stamp:
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: parthh01/sphinx/action@v0.1.16
+        with:
+          require: false

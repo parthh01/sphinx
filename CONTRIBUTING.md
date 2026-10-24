@@ -2,6 +2,8 @@
 
 Use Node.js 22.19+, install the pinned dependencies with `npm ci`, and run `npm test`. Tests must not call real models, change real agent settings, or modify a developer's global Git configuration. The test runner blocks outbound Node requests while permitting local fixtures.
 
+Pull requests show a **Sphinx** check, which does not block merging: stamped once you pass Sphinx for the latest commit, neutral until then, and failed if you skip the check. For the stamp, [install Sphinx](README.md#1-install-required) (this repository's `.sphinxconfig` checks pushes of every branch), sign in to the GitHub CLI (`gh`), and open the pull request within about 15 minutes of pushing; otherwise the check stays neutral until your next checked push.
+
 Keep trigger policy deterministic and separate from model judgment. Preserve existing hooks. Filter paths before reading code. New integrations need isolated install/uninstall tests and clear coverage limitations.
 
 The most useful assessment contributions are small, reproducible change fixtures with:
