@@ -123,7 +123,7 @@ These are ceilings, not quotas: the reviewer asks fewer questions when the evide
 
 ## Question audit
 
-After the reviewer writes questions, an independent model call can audit them against the code before you see them: it fixes answer keys that don't match the code, and rewrites questions that ask for trivia or reveal their own answers. By default (`"audit": "large"` in `config.json`) only large changes get that call; small and medium ones check their own questions in the same request, which saves one long model call (often 10–20 seconds) per check. Set `"audit": "all"` to audit every change. A decision to ask no questions is always audited, at any size.
+After the reviewer writes questions, an independent model call can audit them against the code before you see them: it fixes answer keys that don't match the code, and rewrites questions that ask for trivia or reveal their own answers. By default (`"audit": "large"` in `config.json`) only large changes get that call; small and medium ones check their own questions in the same request, which saves one long model call (often 10–20 seconds) per check. Set `"audit": "all"` to audit every change. A decision to ask no questions is always audited, at any size. The same setting covers the new scenario after a wrong answer or explanation request: on a small or medium change the grader checks that scenario itself instead of a second call. A replacement after an unclear answer or a dispute, or for a question the grader found wrong, is always audited.
 
 ## Model calls, tokens, and limits
 
@@ -133,7 +133,7 @@ After the reviewer writes questions, an independent model call can audit them ag
 | --- | --- |
 | Investigation for a small / medium / large change | Aims for 5 / 7 / 8, including the question audit. These are planning targets, not stops. |
 | Each answer, learning request, or dispute | 1 |
-| A proposed replacement question that passes Sphinx's format checks | 1 more, for an independent source audit |
+| A proposed replacement question that passes Sphinx's format checks | 1 more, for an independent source audit (by default, a new scenario after a wrong answer or explanation gets it only on a large change) |
 | Status, help, config, pending, or pushing an already approved change | 0 |
 
 Set or clear an optional cap. This changes no routes and makes no model request:

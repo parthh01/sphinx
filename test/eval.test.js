@@ -9,7 +9,7 @@ test('curated eval fixtures exercise real immutable repos, Pi review, and all gr
   const report = await runEvaluation();
   assert.equal(report.status, 'passed');
   assert.equal(report.cases.length, 6);
-  assert.equal(report.usage.calls, 67, 'small and medium cases skip the separate audit by default');
+  assert.equal(report.usage.calls, 59, 'small and medium cases skip the separate audit by default');
   assert.equal(report.usage.responses.length, 0, 'Scripted transports make no network requests');
   assert.match(report.interpretation, /do not measure model quality/);
   for (const result of report.cases) {

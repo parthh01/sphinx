@@ -291,7 +291,7 @@ These live in `config.json`, and most can be set with `sphinx config`:
 | `allowPaid` | `--allow-paid` | Lets OpenRouter use paid models |
 | `cliBilling` | `--cli-billing` | `plan` (default) bills your Claude or Codex plan; `api` lets those CLIs use API keys |
 | `github` | edit the file | `status` (default on): mark pushed commits on GitHub. `comment`: keep a summary comment on the pull request. `answers`: include your answers in it. Needs a signed-in `gh` CLI and never blocks a push |
-| `audit` | edit the file | `large` (default): a second, independent model call checks the questions only for large changes, so small and medium checks are ready sooner. `all`: audit every change, slower but more thorough |
+| `audit` | edit the file | `large` (default): a second, independent model call checks the questions, and the new scenario after a wrong answer or explanation, only for large changes, so small and medium checks are ready sooner. `all`: audit every change, slower but more thorough |
 | `receiptHours` | edit the file | How long a pass stays valid for the same change (default 24) |
 
 `sphinx yolo` turns checks off and on again for the current repository, or globally when run outside one. The full reference, including routing thresholds and pricing, is in [configuration and cost](docs/configuration.md).

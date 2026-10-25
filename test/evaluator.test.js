@@ -355,6 +355,21 @@ test('unsupported evidence, omitted files, and malformed questions fail closed',
   assert.ok(authoritative.calls.some(call => call.input.includes('outside the supplied evidence')));
 });
 
+test('a question citation decorated like a diff or review is stored as the supplied path it names, and other paths still fail', () => {
+  const paths = new Set(['src/orders.js']);
+  const cite = path => validateNewQuestion({ ...question, evidence: [{ path, reason: 'The id guard.' }] }, paths).evidence;
+  for (const path of ['src/orders.js (lines 1-2)', 'src/orders.js (diff e1, lines 1-2)', 'b/src/orders.js:2', './src/orders.js#L2']) {
+    assert.deepEqual(cite(path), [{ path: 'src/orders.js', reason: 'The id guard.' }], path);
+  }
+  for (const path of ['.sphinxcontext.md (project context)', '.env (settings)', 'orders.js (lines 1-2)', 'c/src/orders.js', '../src/orders.js', 'src/../src/orders.js']) {
+    assert.throws(() => cite(path), /outside the supplied evidence/, path);
+  }
+  // An exact supplied path wins over the shorter one that stripping a prefix would name.
+  for (const path of ['a/src/orders.js', 'a/src/orders.js:2']) {
+    assert.equal(validateNewQuestion({ ...question, evidence: [{ path, reason: 'The id guard.' }] }, new Set(['a/src/orders.js', 'src/orders.js'])).evidence[0].path, 'a/src/orders.js', path);
+  }
+});
+
 test('too-small active context and absent changed paths fail before making a model call', async t => {
   const { evaluator, calls } = await fixture(t, { questions: [question] });
   await assert.rejects(evaluator.generateAssessment(snapshot, { ...config, maxContextBytes: 10 }), { code: 'CONTEXT_LIMIT' });
@@ -481,7 +496,7 @@ test('an invalid transfer shape, citation, choice, or concept never reaches the 
   for (const followUp of [
     { ...transfer, expectedAnswer: '' },
     { ...transfer, evidence: [{ path: 'unread.js', reason: 'No observed source.' }] },
-    { ...transfer, evidence: [{ path: 'b/src/orders.js', reason: 'Question citations stay exact.' }] },
+    { ...transfer, evidence: [{ path: '.env (settings)', reason: 'A note does not make an omitted file evidence.' }] },
     { ...transfer, choices: ['Yes', 'No'] }, { ...transfer, concept: 'Unrelated concept' }, { ...transfer, hint: 'Unsupported field.' }, 'not a question',
   ]) {
     let calls = 0;
@@ -1021,6 +1036,34 @@ const gradingRoute = (reply, onAudit = audit => audit) => async invocation => {
 };
 const openRouterConfig = { ...config, provider: 'openrouter' };
 
+test('by default only a large change audits the new scenario after a miss or an explanation, and Sphinx still checks it', async t => {
+  const graded = async (reply, options = {}, settings = {}) => {
+    let audits = 0, prompt;
+    const { evaluator } = await fixture(t, null, { openRouter: gradingRoute(invocation => {
+      prompt = invocation.prompt;
+      return { questionValid: true, verdict: 'incorrect', feedback: 'Explained.', evidence: question.evidence, followUp: transfer, ...reply };
+    }, audit => { audits++; return audit; }) });
+    const result = await evaluator.gradeAnswer({ snapshot, question, answer: 'It runs again.', config: { ...openRouterConfig, audit: 'large', changeTier: 'small', ...settings }, ...options });
+    return { ...result, audits, selfCheck: /No separate audit follows for a transfer/.test(prompt) };
+  };
+  // Without the audit, the grader is told to check its own transfer, as the reviewer is for first questions.
+  for (const [settings, audited] of [[{}, 0], [{ changeTier: 'medium' }, 0], [{ changeTier: 'large' }, 1], [{ audit: 'all' }, 1]]) {
+    for (const learn of [false, true]) {
+      const { verdict, followUp, audits, selfCheck } = await graded({}, { learn }, settings);
+      assert.deepEqual([verdict, followUp, audits, selfCheck], ['incorrect', transfer, audited, !audited], `${JSON.stringify(settings)} learn=${learn}`);
+    }
+  }
+  // Without the audit, Sphinx still renames a reused id and drops a repeated or off-concept scenario.
+  assert.deepEqual((await graded({ followUp: { ...transfer, id: question.id } })).followUp, { ...transfer, id: 'q1-next' });
+  for (const followUp of [{ ...transfer, prompt: question.prompt }, { ...transfer, concept: 'Different concept' }]) {
+    assert.deepEqual(await graded({ followUp }), { verdict: 'incorrect', feedback: 'Explained.', evidence: question.evidence, followUp: null, audits: 0, selfCheck: true });
+  }
+  // A dispute, a flagged question, or an unclear answer may replace a wrong question, so that replacement is still audited.
+  for (const [reply, options] of [[{ verdict: 'ambiguous' }, { dispute: true }], [{ questionValid: false }, { learn: true }], [{ verdict: 'ambiguous' }, {}]]) {
+    assert.equal((await graded(reply, options)).audits, 1, JSON.stringify([reply, options]));
+  }
+});
+
 test('every grading schema pins the transfer concept label, and a case or punctuation slip keeps the committed label', async t => {
   for (const mode of ['answer', 'learn', 'dispute']) {
     let schema;
@@ -1070,16 +1113,20 @@ test('a transfer that omits choices gets none, from the grader or the audit', as
   }
 });
 
-test('a grade citation counts when it names a supplied path exactly or behind a diff prefix or line suffix; others are dropped, and one must remain', async t => {
+test('a grade citation counts when it names a supplied path exactly or behind a diff prefix, line suffix or note; others are dropped, and one must remain', async t => {
   const grade = async evidence => {
     const { evaluator } = await fixture(t, null, { openRouter: gradingRoute(() => ({ questionValid: true, verdict: 'correct', feedback: '', evidence, followUp: null })) });
     return evaluator.gradeAnswer({ snapshot, question, answer: 'No, the stored id returns first.', config: openRouterConfig });
   };
-  for (const path of ['src/orders.js:2', 'src/orders.js:2:5', 'src/orders.js#L2', 'b/src/orders.js', 'a/src/orders.js:2', './src/orders.js']) {
+  for (const path of ['src/orders.js:2', 'src/orders.js:2:5', 'src/orders.js#L2', 'b/src/orders.js', 'a/src/orders.js:2', './src/orders.js', 'src/orders.js (lines 1-2)']) {
     assert.deepEqual(await grade([{ path, reason: 'The guard.' }]), { verdict: 'correct', feedback: '', evidence: [{ path: 'src/orders.js', reason: 'The guard.' }], followUp: null }, path);
   }
   const mixed = [{ path: 'src/orders.js', reason: 'The guard.', line: 2 }, { path: 'orders.js', reason: 'No basename guessing.' }, { path: 'src/orders.js', reason: ' ' }];
   assert.deepEqual((await grade(mixed)).evidence, [{ path: 'src/orders.js', reason: 'The guard.' }], 'An extra key is ignored and unusable citations are dropped');
+  // A grade's paths have no length limit, so a degenerate one must not stall the process while its note is stripped.
+  const started = Date.now();
+  assert.deepEqual((await grade([{ path: `${' '.repeat(200000)}x`, reason: 'Degenerate.' }, { path: 'src/orders.js', reason: 'The guard.' }])).evidence, [{ path: 'src/orders.js', reason: 'The guard.' }]);
+  assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
   for (const evidence of [[{ path: 'orders.js', reason: 'Basename only.' }], [{ path: 'c/src/orders.js', reason: 'Not a diff prefix.' }], [{ path: 'src/orders.js', reason: '' }], [{ path: '.sphinxcontext.md', reason: 'Background.' }], ['src/orders.js'], [], 'src/orders.js']) {
     await assert.rejects(grade(evidence), { code: 'INVALID_MODEL_OUTPUT' }, JSON.stringify(evidence));
   }
@@ -1128,12 +1175,13 @@ test('an explanation request is a miss whatever verdict the reply names; on a fl
   }
 });
 
-// The real session store with the real grader; only the model transport is fake.
-async function gradedStore(t, openRouter, id) {
+// The real session store with the real grader; only the model transport is fake. Tests whose scripted replies include
+// the transfer audit pass audit 'all', since by default a small change skips it.
+async function gradedStore(t, openRouter, id, overrides = {}) {
   const { evaluator, directory } = await fixture(t, null, { openRouter });
   const env = { SPHINX_HOME: join(directory, 'store') };
   const stored = { ...snapshot, id: id.repeat(64), stats: { additions: 2, deletions: 0, files: 1 } };
-  const settings = structuredClone(DEFAULT_CONFIG);
+  const settings = { ...structuredClone(DEFAULT_CONFIG), ...overrides };
   const store = createSessionStore({ env, grade: evaluator.gradeAnswer, generate: async (_snapshot, _config, options) => { await options.beforeCall(); return { questions: [question] }; } });
   await store.ensure(stored, settings);
   return { store, env, stored, settings, initial: await store.start(stored.id, settings) };
@@ -1148,7 +1196,7 @@ test('without a usable transfer, a wrong answer is recorded as a miss and the sa
       ...(declined ? [{ questions: [], feedback: 'The replacement only renames the id.' }] : []),
       { questionValid: true, verdict: 'correct', feedback: '', evidence: question.evidence, followUp: null },
     ];
-    const { store, env, stored, settings, initial } = await gradedStore(t, async invocation => { await invocation.beforeCall(); return replies.shift(); }, declined ? 'c' : '8');
+    const { store, env, stored, settings, initial } = await gradedStore(t, async invocation => { await invocation.beforeCall(); return replies.shift(); }, declined ? 'c' : '8', { audit: 'all' });
     const missed = await store.answer(stored.id, 'Every retry creates a result.', settings, { expectedQuestionId: question.id });
     assert.deepEqual([missed.status, missed.verdict, missed.feedback, missed.progress.completed], ['active', 'incorrect', explanation, 0]);
     assert.deepEqual(missed.question, initial.question, 'The same question stays current');
@@ -1168,7 +1216,7 @@ test('an explanation without a usable new scenario is shown on the same question
       { questionValid: !flagged, verdict: 'incorrect', feedback: 'GRADER_EXPLANATION: the id is stored before the result.', evidence: question.evidence, followUp: transfer },
       { questions: [], feedback: '' },
     ];
-    const { store, stored, settings } = await gradedStore(t, async invocation => { await invocation.beforeCall(); return replies.shift(); }, flagged ? 'e' : 'f');
+    const { store, stored, settings } = await gradedStore(t, async invocation => { await invocation.beforeCall(); return replies.shift(); }, flagged ? 'e' : 'f', { audit: 'all' });
     const explained = await store.answer(stored.id, 'I do not know. Explain this concept.', settings, { learn: true });
     assert.deepEqual([explained.status, explained.verdict, explained.question.id], ['active', flagged ? 'ambiguous' : 'incorrect', question.id]);
     assert.match(explained.feedback, flagged ? /^The question or answer key does not match the code\./ : /^GRADER_EXPLANATION/);
@@ -1208,7 +1256,7 @@ test('a wrong answer with neither an explanation nor a usable new scenario is no
     [{ ...silent, feedback: ' ', followUp: transfer }, { questions: [], feedback: 'The replacement only renames the id.' }],
   ];
   for (const [index, replies] of cases.entries()) {
-    const { store, stored, settings } = await gradedStore(t, async invocation => { await invocation.beforeCall(); return replies.shift(); }, String(index + 1));
+    const { store, stored, settings } = await gradedStore(t, async invocation => { await invocation.beforeCall(); return replies.shift(); }, String(index + 1), { audit: 'all' });
     await assert.rejects(store.answer(stored.id, 'Every retry creates a result.', settings, { expectedQuestionId: question.id }), error => {
       assert.equal(error.message, 'The grader\'s reply couldn\'t be used, so this wasn\'t graded. Your text is saved; sending it again makes another model call.');
       assert.deepEqual([error.code, error.detail], ['INVALID_MODEL_OUTPUT', 'The grade came back without an explanation or a new scenario.']);
