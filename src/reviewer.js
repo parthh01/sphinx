@@ -81,6 +81,11 @@ Establish both the changed consequence and a relevant boundary from implementati
 Questions must assess concrete consequences, failure modes, boundaries, or invariants, never names or file-location trivia. A cosmetic edit should test which user-facing surfaces change, which remain unchanged, and the cause of that boundary. Do not turn supplied CSS/markup into a padding-value calculation or require pixel values, specificity tuples, or terminology as the answer. Exact values are appropriate only when they establish a consequential limit or behavior, such as a retry cap. Ask for a neutral prediction followed by its cause; do not state the conclusion the human must infer. For example, ask 'What changes when an override is present, and why?' rather than 'Why does the override remain unaffected?', and 'Can the caller distinguish these responses, and why?' rather than 'Why can the caller not distinguish them?'. Give the scenario and relevant conditions without announcing the outcome. Ground every answer key in exact tool observations. If evidence is insufficient, investigate; if budget is insufficient, fail rather than inventing support. Private answer keys are committed before any human answer.
 Tool observations carry evidence IDs. Cite exact observed file paths in each question; Sphinx retains the underlying observations deterministically. evidenceIds are optional hints, not a second citation obligation. Use read_evidence to recover archived observations after compaction, without reopening files. Model summaries are never a substitute for code evidence. Tool validation errors explain how to correct a request within the remaining allowance. Keep notes concise and factual, without hidden chain-of-thought. Never pad the question ceiling with filler.`;
 
+// On the Codex and Claude Code routes the workspace reads are not native tools; the model requests them in its structured
+// reply. Without this note, Claude Code models called them natively, were refused, and finished from the seeded diffs alone.
+// It names read_evidence only when that read is offered, after a resume or compaction.
+const structuredTurn = archiveAvailable => `In this session you have no callable workspace tools: ${archiveAvailable ? 'list_files, read_file, read_diff, search and read_evidence' : 'list_files, read_file, read_diff and search'} are not available as tools, and calling them directly fails. Request reads in your structured reply instead; it is your complete response to each request. While investigation is open, reply with action "tools" and list each read in calls by name, with its arguments as a JSON object string; Sphinx runs them and sends their observations in the next request. Reply with action "finish" once your questions are grounded or investigation is closed.`;
+
 export function reviewerActionSchema(assessmentSchema, { finishOnly = false, archiveAvailable = true } = {}) {
   return {
     type: 'object', additionalProperties: false,
@@ -449,7 +454,7 @@ async function review({ snapshot, config, assessmentSchema, assessmentInstructio
       const availableNames = new Set([...REVIEW_TOOL_NAMES].filter(name => archiveAvailable || name !== 'read_evidence'));
       if (finishOnly && ![...archive.values()].some(changedDiff)) fail('The reviewer did not collect changed-code diff evidence before its final request. No assessment was accepted.', 'INSUFFICIENT_EVIDENCE');
       const phase = finishOnly
-        ? 'Final synthesis: investigation is closed. Submit finish_review now using only collected evidence. Write fewer questions if needed; never invent support or request further reads.'
+        ? `Final synthesis: investigation is closed. Submit ${nativeTools ? 'finish_review' : 'your finish action'} now using only collected evidence. Write fewer questions if needed; never invent support or request further reads.`
         : remaining() === (auditAssessment ? 3 : 2)
           ? 'One investigation request remains before the reserved final synthesis request. Finish now if sufficient evidence is available; otherwise batch only the missing reads needed for a grounded question.'
           : uncapped && calls >= tierLimit
@@ -468,8 +473,8 @@ async function review({ snapshot, config, assessmentSchema, assessmentInstructio
       } else {
         const instructions = finishOnly
           ? 'Return only a finish action containing the grounded assessment, a short factual summary and calls:[]. evidenceIds are optional narrowing hints.'
-          : `Return an action matching the schema: tools requests 1–${MAX_CALLS_PER_TURN} focused read-only calls with arguments encoded as JSON; finish supplies assessment and a short factual summary, with calls empty. evidenceIds are optional narrowing hints. Tool actions use assessment:null and summary:"". Prefer a small useful batch rather than filling the limit.`;
-        const request = { systemPrompt, prompt: `Continue the investigative review. ${instructions} ${phase}\n${JSON.stringify({ projectContext, remainingCalls: uncapped ? null : remaining(), archivedObservations: manifest(), tools: finishOnly ? [] : tools.filter(tool => availableNames.has(tool.name)).map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })), conversation: conversation(messages) })}`, schema: reviewerActionSchema(assessmentSchema, { finishOnly, archiveAvailable }) };
+          : `Return one action matching the schema. To read, use action "tools" with 1–${MAX_CALLS_PER_TURN} focused reads from the tools list below in calls, each with its arguments encoded as a JSON object string, plus assessment:null and summary:""; Sphinx returns their observations in your next request. To finish, use action "finish" with the assessment, a short factual summary and calls:[]. evidenceIds are optional narrowing hints. Prefer a small useful batch rather than filling the limit.`;
+        const request = { systemPrompt: `${systemPrompt}\n\n${structuredTurn(archiveAvailable)}`, prompt: `Continue the investigative review. ${instructions} ${phase}\n${JSON.stringify({ projectContext, remainingCalls: uncapped ? null : remaining(), archivedObservations: manifest(), tools: finishOnly ? [] : tools.filter(tool => availableNames.has(tool.name)).map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })), conversation: conversation(messages) })}`, schema: reviewerActionSchema(assessmentSchema, { finishOnly, archiveAvailable }) };
         inputBytes = ensureFits(request);
         let action = await abortable(runModel({ ...request, ...common }), requestSignal);
         if (action?.action === 'finish') action = normalizeFinishArguments(action, finishOptions);
@@ -479,7 +484,9 @@ async function review({ snapshot, config, assessmentSchema, assessmentInstructio
           if (action.calls.length) throw correctable('Finishing cannot include tool calls. Use calls:[].');
           toolCalls = [{ id: `finish-${calls}`, name: 'finish_review', arguments: { assessment: action.assessment, summary: action.summary, ...(action.evidenceIds !== undefined ? { evidenceIds: action.evidenceIds } : {}) } }];
         } else {
-          if (action.assessment !== null || action.summary !== '' || (action.evidenceIds !== undefined && (!Array.isArray(action.evidenceIds) || action.evidenceIds.length))) throw correctable('A tool action must use assessment:null, summary:"", and no evidenceIds.');
+          // A tool action uses only its calls. Its summary and evidenceIds are ignored, since models fill them loosely: Haiku
+          // has sent the summary as the two characters "" instead of an empty string.
+          if (action.assessment !== null) throw correctable('A tool action cannot also finish an assessment. Use assessment:null.');
           toolCalls = action.calls.map((call, index) => {
             if (!exactKeys(call, ['name', 'arguments']) || !availableNames.has(call.name) || typeof call.arguments !== 'string' || bytes(call.arguments) > 8000) throw correctable('Choose a supplied tool and encode its arguments as a bounded JSON object string.');
             let args; try { args = JSON.parse(call.arguments); } catch { throw correctable('Reviewer tool arguments must be a valid JSON object string.'); }

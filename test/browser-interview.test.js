@@ -492,13 +492,13 @@ test('picking a model mid-review stops that run and restarts the review on the n
   // restarted review the first call, which this fake would then hold forever.
   await firstCall;
   assert.equal(f.interview.state.models.reviewing, true);
-  const res = await pickModel(f, { provider: 'claude', model: 'haiku' });
+  const res = await pickModel(f, { provider: 'claude', model: 'sonnet' });
   assert.deepEqual(await res.json(), { ok: true, restarting: true });
   // The restarted review can take a while when the whole suite is running.
   for (let i = 0; i < 1500 && f.interview.state.phase !== 'question'; i++) await delay(10);
   const state = await f.waitFor('question');
   assert.equal(f.generated(), 2);
-  assert.deepEqual([state.route.provider, state.route.model], ['claude', 'haiku']);
+  assert.deepEqual([state.route.provider, state.route.model], ['claude', 'sonnet']);
   assert.ok(state.messages.some(item => /Restarting the review on the new model/.test(item.text)));
 });
 
@@ -514,10 +514,10 @@ test('a model picked while another process reviews the check, one that does not 
     const done = f.present();
     for (let i = 0; i < 300 && !f.interview.state.models?.reviewing; i++) await delay(10);
     assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { ok: true, restarting: true });
-    // The switch waits for that review: the page says so, and another pick is refused rather than queued.
+    // The switch waits for that review: the page says so, and another pick, even a repeat one, is refused rather than queued.
     for (let i = 0; i < 300 && !f.interview.state.models?.switching; i++) await delay(10);
     assert.deepEqual(f.interview.state.models.switching, { provider: 'claude', model: 'sonnet' });
-    assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'haiku' })).json(), { error: 'Already switching to Claude Code sonnet.' });
+    assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { error: 'Already switching to Claude Code sonnet.' });
     release(); await preparing;
     const state = await f.waitFor(outcome.questions.length ? 'question' : 'consent');
     assert.deepEqual([state.route.provider, state.route.model], ['claude', 'sonnet']);
@@ -680,7 +680,9 @@ test('an answer refused while another process holds the check says so in the pag
   await f.post('answer', { response: 'Yes, the insert is repeated.' });
   for (let i = 0; i < 300 && !f.interview.state.error; i++) await delay(10);
   assert.deepEqual([f.interview.state.phase, f.interview.state.error], ['question', 'Another Sphinx process is still using this check. Try again once it finishes.']);
-  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  // The error shows a moment before the page takes answers again, which a loaded machine can stretch.
+  for (let i = 0; i < 300 && (await f.post('answer', { response: 'Yes, the insert is repeated.' })).status === 409; i++) await delay(10);
+  await f.confirm();
   assert.equal((await done).status, 'passed');
 });
 

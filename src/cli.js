@@ -8,7 +8,7 @@ import { parseArgs, promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
-import { DISTANCES, getPaths, loadConfig, saveConfig, saveOpenRouterKey, openRouterKey, saveOpenAIEndpoint, openAIEndpoint, validateConfig, repositoryConfigInfo, policyHash } from './config.js';
+import { DISTANCES, getPaths, loadConfig, saveConfig, saveOpenRouterKey, openRouterKey, saveOpenAIEndpoint, openAIEndpoint, validateConfig, repositoryConfigInfo, policyHash, routeMigrationNotice, routeMigrationNoticeShown } from './config.js';
 import { initializeRepository } from './repo-config.js';
 import { applyRepositorySetup, suggestRepositorySetup } from './repo-setup.js';
 import * as git from './git.js';
@@ -486,6 +486,14 @@ async function statusCommand(command, values) {
   terminal.blank(); terminal.note('Status uses local Git state only. Agent hook trust is not verified here.'); return 0;
 }
 
+// The notice about routes moved off Haiku goes once to a terminal a person sees (see git-interview.js).
+// JSON output, agent and protocol hooks, and detached workers never take it, so it waits for the next terminal.
+async function showRouteNotice() {
+  if (!process.stderr.isTTY) return;
+  const notice = await routeMigrationNotice().catch(() => null);
+  if (notice && await new Promise(resolve => process.stderr.write(`${notice}\n`, error => resolve(!error)))) await routeMigrationNoticeShown().catch(() => {});
+}
+
 // Parses and validates a command line before any command runs; exported so documented commands can be checked.
 export function parseCommandLine(argv) {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
@@ -514,6 +522,7 @@ export async function main(argv) {
   if (argv[0] === 'hook') {
     if (process.env.SPHINX_EVALUATOR === '1') return 0;
     if (argv[1] === 'git') {
+      await showRouteNotice();
       const event = argv[2], input = event === 'pre-push' ? await readStdin() : '';
       return dispatchHook({ event, args: argv.slice(3), input, cwd: process.cwd(), env: process.env, gate });
     }
@@ -526,6 +535,8 @@ export async function main(argv) {
     throw new Error('Unknown hook entry point.');
   }
   const { values, command, id } = parseCommandLine(argv);
+  // init --suggest prints JSON even without --json.
+  if (!values.json && !values.suggest && !values.worker) await showRouteNotice();
   if (values.version) { if (values.json) json({ version: VERSION }); else console.log(VERSION); return 0; }
   if (values.help || !command || command === 'help') { printHelp(ui(), command === 'help' ? id : command, { json: values.json }); return 0; }
   if (command === 'install') return installCommand(values);

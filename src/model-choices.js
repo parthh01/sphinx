@@ -11,7 +11,7 @@ const presetModels = provider => [...new Set(REVIEWER_PRESETS.flatMap(preset => 
 export async function modelChoices({ config, env = process.env, plans = [], current }) {
   const groups = [];
   const option = (model, label, note, extra = {}) => ({ model, label: label || model, ...(note ? { note } : {}), ...extra });
-  if (plans.includes('claude')) groups.push({ provider: 'claude', label: 'Claude Code', billing: 'your plan', models: [option('haiku', 'Haiku', 'fastest'), option('sonnet', 'Sonnet', 'stronger')] });
+  if (plans.includes('claude')) groups.push({ provider: 'claude', label: 'Claude Code', billing: 'your plan', models: [option('sonnet', 'Sonnet')] });
   if (plans.includes('codex')) groups.push({ provider: 'codex', label: 'Codex', billing: 'your plan', models: presetModels('codex').map(model => option(model)) });
   if (await openRouterKey(env).catch(() => null)) {
     const models = [...new Set(['openrouter/free', ...presetModels('openrouter'), ...(current?.provider === 'openrouter' && current.model ? [current.model] : [])])];

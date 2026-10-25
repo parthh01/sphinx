@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const CLI = fileURLToPath(new URL('../bin/sphinx.js', import.meta.url));
@@ -20,6 +20,10 @@ async function fixture(t) {
   for (const name of ['claude', 'codex']) await writeFile(path.join(bin, name), `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)},'unexpected model invocation');process.exit(88);\n`, { mode: 0o755 });
   const configPath = path.join(state, 'config.json');
   const run = (args, cwd = base) => spawnSync(process.execPath, [CLI, ...args], { cwd, env, encoding: 'utf8', timeout: 10000, input: '' });
+  // The same CLI as if stderr were a terminal a person sees; its output is still captured. setup runs first.
+  const tty = (args, cwd = base, setup = '') => spawnSync(process.execPath, ['--input-type=module', '-e', `Object.defineProperty(process.stderr, 'isTTY', { value: true });${setup}
+    process.argv = [process.execPath, ${JSON.stringify(CLI)}, ...${JSON.stringify(args)}];
+    await import(${JSON.stringify(pathToFileURL(CLI).href)});`], { cwd, env, encoding: 'utf8', timeout: 10000, input: '' });
   const ok = (args, cwd) => {
     const result = run(args, cwd);
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}\n${result.error || ''}`);
@@ -27,7 +31,7 @@ async function fixture(t) {
   };
   const absent = file => assert.rejects(stat(file), { code: 'ENOENT' });
   t.after(async () => { try { await absent(marker); } finally { await rm(base, { recursive: true, force: true }); } });
-  return { base, home, state, env, configPath, run, ok, absent };
+  return { base, home, state, env, configPath, run, tty, ok, absent };
 }
 
 test('config setter works outside a repository and reports saved global settings without inference or installation', async t => {
@@ -186,7 +190,7 @@ test('a fresh unattended installation accepts an explicit route for every size',
 
 test('economical CLI provider defaults are explicit and custom models remain selectable', async t => {
   const f = await fixture(t);
-  for (const [provider, model] of [['codex', 'gpt-6-luna'], ['claude', 'haiku']]) {
+  for (const [provider, model] of [['codex', 'gpt-6-luna'], ['claude', 'sonnet']]) {
     const result = JSON.parse(f.ok(['config', '--provider', provider, '--json']));
     for (const tier of ['small', 'medium', 'large']) assert.deepEqual(result.config.models[tier], { provider, model });
     assert.equal(result.config.provider, provider);
@@ -250,8 +254,8 @@ test('explicit tier routes retain paid checks and untouched routes', async t => 
   assert.match(denied.stderr, /--allow-paid/);
   assert.equal(await readFile(f.configPath, 'utf8'), previous);
   const saved = JSON.parse(f.ok(['config', '--large', 'openrouter:custom/paid', '--allow-paid', '--max-model-calls', '24', '--json']));
-  assert.deepEqual(saved.config.models.small, { provider: 'claude', model: 'haiku' });
-  assert.deepEqual(saved.config.models.medium, { provider: 'claude', model: 'haiku' });
+  assert.deepEqual(saved.config.models.small, { provider: 'claude', model: 'sonnet' });
+  assert.deepEqual(saved.config.models.medium, { provider: 'claude', model: 'sonnet' });
   assert.deepEqual(saved.config.models.large, { provider: 'openrouter', model: 'custom/paid' });
   assert.equal(saved.maxModelCalls, 24);
 });
@@ -280,7 +284,7 @@ test('preset installation preserves explicit routes on an unattended rerun', asy
   f.ok(['install', '--yes', '--preset', 'claude-economy', '--large', 'codex:custom-reviewer', '--agents', 'none']);
   const previous = await readFile(f.configPath, 'utf8');
   const config = JSON.parse(previous);
-  assert.deepEqual(config.models.small, { provider: 'claude', model: 'haiku' });
+  assert.deepEqual(config.models.small, { provider: 'claude', model: 'sonnet' });
   assert.deepEqual(config.models.large, { provider: 'codex', model: 'custom-reviewer' });
   f.ok(['install', '--yes', '--agents', 'none']);
   assert.equal(await readFile(f.configPath, 'utf8'), previous);
@@ -308,4 +312,67 @@ test('free routing remains an explicit best-effort choice and help never saves p
   assert.equal(free.config.allowPaid, false);
   for (const route of Object.values(free.config.models)) assert.deepEqual(route, { provider: 'openrouter', model: 'openrouter/free' });  // Free router models spend most of the output budget on reasoning (CRI-58).
   assert.equal(free.config.maxOutputTokens, 16384);
+});
+
+test('after the move off claude:haiku, the first command in a terminal says so in one line, once, and its command switches back', async t => {
+  const f = await fixture(t);
+  // An older single-route setup saved by 0.1.19; this version has not run here yet.
+  await mkdir(f.state);
+  await writeFile(f.configPath, JSON.stringify({ version: 1, provider: 'claude', model: 'haiku', maxModelCalls: 12 }));
+  const first = f.tty(['config']);
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stderr, /^Sphinx moved your claude:haiku reviewer routes to claude:sonnet, because Haiku reviews through Claude Code were slow and could time out\. To switch back, run: sphinx config --small claude:haiku --medium claude:haiku --large claude:haiku\n$/);
+  assert.match(first.stdout, /claude:sonnet/);
+  const again = f.tty(['config']);
+  assert.equal(again.status, 0, again.stderr);
+  assert.doesNotMatch(again.stderr, /Sphinx moved/);
+  f.ok([...first.stderr.match(/run: sphinx (.+)$/m)[1].split(' '), '--json']);
+  const config = JSON.parse(f.ok(['config', '--json']));
+  for (const tier of ['small', 'medium', 'large']) assert.deepEqual(config.models[tier], { provider: 'claude', model: 'haiku' }, 'switching back sticks');
+  assert.equal(config.maxModelCalls, 12);
+});
+
+test('the notice waits until a terminal a person sees has shown it: never JSON output, a hidden Git hook, an agent hook, or a background worker', async t => {
+  const f = await fixture(t);
+  f.ok(['install', '--yes', '--preset', 'claude-economy', '--agents', 'none']);
+  // The upgrade from 0.1.19, whose claude-economy preset saved Haiku: nothing has moved yet.
+  const haiku = { provider: 'claude', model: 'haiku' };
+  await writeFile(f.configPath, JSON.stringify({ ...JSON.parse(await readFile(f.configPath, 'utf8')), model: 'haiku', models: { small: haiku, medium: haiku, large: haiku } }));
+  await rm(path.join(f.state, 'migrations.json'));
+  const repo = path.join(f.base, 'repo'); await mkdir(repo);
+  assert.equal(spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: repo, env: f.env }).status, 0);
+  const pending = async () => !JSON.parse(await readFile(path.join(f.state, 'migrations.json'), 'utf8'))['claude-haiku-to-sonnet'].noticeShownAt;
+  const failingWrites = "process.stderr.write = (...args) => { const done = args.find(arg => typeof arg === 'function'); if (done) process.nextTick(done, new Error('EIO')); return true; };";
+  for (const [label, run] of [
+    ['a command without a terminal', () => f.run(['config'], repo)],
+    ['a Git hook without a terminal', () => f.run(['hook', 'git', 'pre-commit'], repo)],
+    ['JSON output', () => f.tty(['status', '--json'], repo)],
+    ['init --suggest', () => f.tty(['init', '--suggest'], repo)],
+    ['a preparation worker', () => f.tty(['prepare', '--worker'], repo)],
+    ['a coding-agent hook', () => f.tty(['hook', 'agent', 'claude'], repo)],
+    ['a terminal whose write fails', () => f.tty(['config'], repo, failingWrites)],
+  ]) {
+    const result = run();
+    assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /Sphinx moved/, label);
+    assert.equal(await pending(), true, label);
+  }
+  assert.deepEqual(JSON.parse(f.ok(['config', '--json'])).models.small, { provider: 'claude', model: 'sonnet' }, 'the move itself happened');
+  // A Git hook whose output the person sees shows it, once.
+  const hook = f.tty(['hook', 'git', 'pre-commit'], repo);
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.match(hook.stderr, /^Sphinx moved your claude:haiku reviewer routes to claude:sonnet\b.*--small claude:haiku --medium claude:haiku --large claude:haiku\n/);
+  assert.equal(await pending(), false);
+  assert.doesNotMatch(f.tty(['status'], repo).stderr, /Sphinx moved/);
+});
+
+test('an unreadable migrations.json never stops a command in a terminal', async t => {
+  const f = await fixture(t);
+  await mkdir(f.state);
+  await writeFile(f.configPath, JSON.stringify({ version: 1, provider: 'claude', model: 'haiku' }));
+  await writeFile(path.join(f.state, 'migrations.json'), 'not json');
+  const result = f.tty(['config']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  assert.match(result.stdout, /claude:haiku/, 'the routes stay');
 });

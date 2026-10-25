@@ -252,7 +252,7 @@ test('an OpenRouter rate limit offers the installed coding-agent plans, and swit
   assert.deepEqual(seen, ['openrouter', 'claude']);
   assert.equal(result.status, 'active');
   const saved = await store.read(snapshot.id);
-  assert.deepEqual([saved.route.provider, saved.route.model], ['claude', 'haiku']);
+  assert.deepEqual([saved.route.provider, saved.route.model], ['claude', 'sonnet']);
   assert.equal(saved.routeChanges.length, 1);
   assert.equal(saved.routeChanges[0].from.provider, 'openrouter');
   assert.equal(f.config.models.small.provider, 'openrouter', 'Saved routes are untouched');

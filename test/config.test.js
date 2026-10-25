@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import fsPromises, { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_CONFIG, getPaths, loadConfig, openRouterKey, policyHash, repositoryConfigInfo, saveConfig, saveOpenRouterKey, stableStringify, validateConfig, writeJson } from '../src/config.js';
+import { DEFAULT_CONFIG, getPaths, loadConfig, openRouterKey, policyHash, repositoryConfigInfo, routeMigrationNotice, routeMigrationNoticeShown, saveConfig, saveOpenRouterKey, stableStringify, validateConfig, writeJson } from '../src/config.js';
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'sphinx-config-test-'));
@@ -46,6 +47,130 @@ test('configuration persists privately and legacy single-provider settings apply
   await writeJson(paths.config, { provider: 'claude', model: 'chosen-model' });
   const legacy = await loadConfig(undefined, env);
   for (const route of Object.values(legacy.models)) assert.deepEqual(route, { provider: 'claude', model: 'chosen-model' });
+});
+
+const haiku = { provider: 'claude', model: 'haiku' }, sonnet = { provider: 'claude', model: 'sonnet' };
+const NOTICE = 'Sphinx moved your claude:haiku reviewer routes to claude:sonnet, because Haiku reviews through Claude Code were slow and could time out. To switch back, run: sphinx config';
+
+test('saved claude:haiku routes move to claude:sonnet once, keeping full model IDs, other settings, and repository policy', async t => {
+  const { repo, env, paths } = await fixture(t);
+  // What 0.1.19 saved for --preset claude-economy, with hand edits.
+  const saved = {
+    version: 1, provider: 'claude', model: 'haiku', level: 'thorough', maxModelCalls: 30, exclude: ['private/**'],
+    github: { status: true, comment: true, answers: false }, routing: { smallMaxLines: 50 },
+    models: { small: haiku, medium: { provider: 'claude', model: 'claude-haiku-4-5' }, large: haiku },
+  };
+  await writeJson(paths.config, saved);
+  const policy = '{ "branches": ["release/*"] }\n';
+  await writeFile(join(repo, '.sphinxconfig'), policy);
+  const config = await loadConfig(repo, env);
+  assert.deepEqual(config.models, { small: sonnet, medium: saved.models.medium, large: sonnet });
+  assert.deepEqual(config.branches, ['release/*']);
+  assert.deepEqual(JSON.parse(await readFile(paths.config, 'utf8')), { ...saved, model: 'sonnet', models: { ...saved.models, small: sonnet, large: sonnet } });
+  assert.equal(await readFile(join(repo, '.sphinxconfig'), 'utf8'), policy, 'repository policy cannot set routes and is never rewritten');
+  // It runs once: claude:haiku chosen afterwards stays, written by hand or saved.
+  await writeJson(paths.config, saved);
+  assert.deepEqual((await loadConfig(undefined, env)).models.small, haiku);
+  await saveConfig({ ...config, models: { small: haiku, medium: haiku, large: haiku } }, env);
+  assert.deepEqual((await loadConfig(undefined, env)).models, { small: haiku, medium: haiku, large: haiku });
+});
+
+test('the move leaves other providers, the OpenRouter Haiku preset, and a top-level route that routes nothing alone', async t => {
+  const { env, paths } = await fixture(t);
+  // With size routes saved, the top-level provider and model are not a route.
+  const saved = { provider: 'claude', model: 'haiku', allowPaid: true, models: {
+    small: { provider: 'openrouter', model: 'anthropic/claude-haiku-5.5' }, medium: { provider: 'codex', model: 'haiku' }, large: { provider: 'claude', model: null } } };
+  await mkdir(paths.home, { recursive: true });
+  await writeFile(paths.config, JSON.stringify(saved));
+  assert.deepEqual((await loadConfig(undefined, env)).models, saved.models);
+  assert.equal(await readFile(paths.config, 'utf8'), JSON.stringify(saved), 'not rewritten');
+  assert.equal(await routeMigrationNotice(env), null);
+  // It still ran, so a claude:haiku route added later stays.
+  await writeJson(paths.config, { ...saved, models: { ...saved.models, large: haiku } });
+  assert.deepEqual((await loadConfig(undefined, env)).models.large, haiku);
+});
+
+test('a legacy single route moves for every size, and the notice waits until it is shown', async t => {
+  const { env, paths } = await fixture(t);
+  await writeJson(paths.config, { provider: 'claude', model: 'haiku' });
+  const notice = `${NOTICE} --small claude:haiku --medium claude:haiku --large claude:haiku`;
+  assert.equal(await routeMigrationNotice(env), notice);
+  assert.deepEqual(JSON.parse(await readFile(paths.config, 'utf8')), { provider: 'claude', model: 'sonnet' });
+  assert.equal(await routeMigrationNotice(env), notice, 'pending until shown');
+  // A route changed since then was chosen deliberately, so the notice leaves it out.
+  const config = await loadConfig(undefined, env);
+  await saveConfig({ ...config, models: { ...config.models, medium: { provider: 'codex', model: 'gpt-6-luna' } } }, env);
+  assert.equal(await routeMigrationNotice(env), `${NOTICE} --small claude:haiku --large claude:haiku`);
+  await routeMigrationNoticeShown(env);
+  assert.equal(await routeMigrationNotice(env), null);
+});
+
+test('the notice names only the sizes that moved, so its command keeps a size that was already on Sonnet', async t => {
+  const { env, paths } = await fixture(t);
+  // The routes 0.1.19's docs suggested: switching every size back would put large on Haiku.
+  await writeJson(paths.config, { models: { small: haiku, medium: haiku, large: sonnet } });
+  assert.equal(await routeMigrationNotice(env), `${NOTICE} --small claude:haiku --medium claude:haiku`);
+});
+
+test('in a fresh home, reading writes nothing and claude:haiku from the first save stays', async t => {
+  const { env, paths } = await fixture(t);
+  assert.equal(await routeMigrationNotice(env), null);
+  assert.deepEqual(await loadConfig(undefined, env), DEFAULT_CONFIG);
+  await assert.rejects(stat(paths.home), { code: 'ENOENT' });
+  await saveConfig({ ...structuredClone(DEFAULT_CONFIG), models: { small: haiku, medium: haiku, large: haiku } }, env);
+  assert.deepEqual((await loadConfig(undefined, env)).models, { small: haiku, medium: haiku, large: haiku });
+  assert.equal(await routeMigrationNotice(env), null);
+});
+
+test('a broken config.json or migration state never blocks loading or saving', async t => {
+  const broken = await fixture(t);
+  await mkdir(broken.paths.home, { recursive: true });
+  await writeFile(broken.paths.config, '{ "provider": "claude", "model": "haiku",');
+  await assert.rejects(loadConfig(undefined, broken.env), /invalid JSON/);
+  // Settings this version rejects are left as they are, and nothing is recorded.
+  for (const rejected of ['{ "provider": "claude", "model": "haiku", "mode": "advisory" }', '{ "provider": "claude", "model": "haiku", "models": null }']) {
+    await writeFile(broken.paths.config, rejected);
+    await assert.rejects(loadConfig(undefined, broken.env), /advisory|models must be a JSON object/);
+    assert.equal(await readFile(broken.paths.config, 'utf8'), rejected);
+  }
+  await assert.rejects(stat(join(broken.paths.home, 'migrations.json')), { code: 'ENOENT' });
+  // The move waits until config.json is fixed.
+  await writeFile(broken.paths.config, '{ "provider": "claude", "model": "haiku" }');
+  assert.deepEqual((await loadConfig(undefined, broken.env)).models.small, sonnet);
+  // Unreadable state leaves the routes alone, saving still works, and the CLI ignores the failed notice.
+  const { env, paths } = await fixture(t);
+  await writeJson(paths.config, { provider: 'claude', model: 'haiku' });
+  await writeFile(join(paths.home, 'migrations.json'), 'not json');
+  assert.deepEqual((await loadConfig(undefined, env)).models.small, haiku);
+  await saveConfig({ ...await loadConfig(undefined, env), level: 'relaxed' }, env);
+  assert.equal((await loadConfig(undefined, env)).level, 'relaxed');
+  await assert.rejects(routeMigrationNotice(env), /migrations\.json: invalid JSON/);
+});
+
+test('a Sphinx home that cannot be written keeps claude:haiku routes and records nothing', { skip: process.getuid?.() === 0 && 'root ignores directory permissions' }, async t => {
+  const { env, paths } = await fixture(t);
+  await writeJson(paths.config, { provider: 'claude', model: 'haiku', models: { small: haiku, medium: haiku, large: haiku } });
+  await chmod(paths.home, 0o555);
+  try { assert.deepEqual((await loadConfig(undefined, env)).models, { small: haiku, medium: haiku, large: haiku }); }
+  finally { await chmod(paths.home, 0o700); }
+  assert.deepEqual(await readdir(paths.home), ['config.json']);
+});
+
+test('a failed rewrite of config.json records nothing, so the next load moves the routes and shows the notice', async t => {
+  const { env, paths } = await fixture(t);
+  await writeJson(paths.config, { provider: 'claude', model: 'haiku' });
+  const rename = fsPromises.rename;
+  let failed = false;
+  t.mock.method(fsPromises, 'rename', async (from, to) => {
+    if (to === paths.config && !failed) { failed = true; throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }); }
+    return rename(from, to);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  assert.deepEqual((await loadConfig(undefined, env)).models.small, haiku);
+  assert.equal(failed, true);
+  assert.deepEqual((await loadConfig(undefined, env)).models.small, sonnet);
+  assert.equal(await routeMigrationNotice(env), `${NOTICE} --small claude:haiku --medium claude:haiku --large claude:haiku`);
 });
 
 test('repository configuration cannot redirect source, raise spend, or change model budgets', async t => {
