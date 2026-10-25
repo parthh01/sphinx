@@ -467,12 +467,12 @@ test('picking a model during the questions grades with it from then on, and can 
   assert.match(f.interview.state.messages.at(-1).text, /Switched this check to Claude Code sonnet\. It becomes your default when this check ends\./);
   const { readFile } = await import('node:fs/promises');
   const before = await readFile(path.join(f.env.SPHINX_HOME, 'config.json'), 'utf8').catch(() => '');
-  assert.doesNotMatch(before, /sonnet/, 'not saved mid-check, which would invalidate it');
+  assert.doesNotMatch(before, /sonnet/, 'saved when the check ends, not mid-check');
   const state = f.interview.state;
   await f.post('answer', { questionId: state.question.id, response: 'Yes, because the insert is unconditional.' });
   await f.confirm();
   assert.equal((await done).status, 'passed');
-  // Git re-checks the policy after the questionnaire returns; saving must wait for close().
+  // Settings for future checks are written on close(), after Git has had its answer.
   assert.doesNotMatch(await readFile(path.join(f.env.SPHINX_HOME, 'config.json'), 'utf8').catch(() => ''), /sonnet/);
   await f.interview.close();
   const saved = JSON.parse(await readFile(path.join(f.env.SPHINX_HOME, 'config.json'), 'utf8'));
@@ -500,6 +500,29 @@ test('picking a model mid-review stops that run and restarts the review on the n
   assert.equal(f.generated(), 2);
   assert.deepEqual([state.route.provider, state.route.model], ['claude', 'haiku']);
   assert.ok(state.messages.some(item => /Restarting the review on the new model/.test(item.text)));
+});
+
+test('a model picked while background preparation holds the check is applied once it finishes, and the push goes on', async t => {
+  // The worker writes questions, or decides a small change needs none; either way no review restarts.
+  for (const outcome of [{ questions: [q] }, { questions: [], noQuestionReason: 'Only renames a local variable.' }]) {
+    let release; const held = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { plans: ['claude'] });
+    // Background preparation runs in another process; a second store takes the same lock file.
+    const worker = createSessionStore({ env: f.env, generate: async (_s, _c, options) => { await options.beforeCall(); await held; return outcome; } });
+    const preparing = worker.prepare(f.snapshot.id, f.config, { wait: true });
+    for (let i = 0; i < 300 && (await f.store.read(f.snapshot.id)).preparation?.status !== 'running'; i++) await delay(10);
+    const done = f.present();
+    for (let i = 0; i < 300 && !f.interview.state.models?.reviewing; i++) await delay(10);
+    assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { ok: true, restarting: true });
+    release(); await preparing;
+    const state = await f.waitFor(outcome.questions.length ? 'question' : 'consent');
+    assert.deepEqual([state.route.provider, state.route.model], ['claude', 'sonnet']);
+    assert.equal(f.generated(), 0, 'the worker\'s review is kept');
+    assert.ok(!state.messages.some(item => /Restarting the review/.test(item.text)), 'no review restarts');
+    if (outcome.questions.length) await f.post('answer', { questionId: state.question.id, response: 'Yes, because the insert is unconditional.' });
+    await f.confirm();
+    assert.equal((await done).status, 'passed');
+  }
 });
 
 test('the page shows the question distance and saves a repository change only when the check ends', async t => {

@@ -131,16 +131,78 @@ test('failed preparation is recorded safely and only an explicit retry spends an
   await runPreparation({ ...f.options, store: f.store }); assert.equal(attempts, 2);
 });
 
-test('evaluator subprocesses, disabled policy, missing tracking refs, and detached HEAD never schedule', async t => {
+test('evaluator subprocesses, disabled policy, and detached HEAD never schedule', async t => {
   const f = await fixture(t);
   assert.equal((await schedulePreparation({ ...f.options, env: { ...f.env, SPHINX_EVALUATOR: '1' } })).status, 'skipped');
   for (const override of [{ backgroundPreparation: false }, { enabled: false }, { events: ['pre-commit'] }, { branches: ['release/*'] }, { remotes: ['upstream'] }]) {
     assert.equal((await schedulePreparation({ ...f.options, config: { ...f.config, ...override } })).status, 'skipped');
   }
-  f.git('update-ref', '-d', 'refs/remotes/origin/main');
-  assert.equal((await schedulePreparation(f.options)).status, 'skipped');
-  f.git('update-ref', 'refs/remotes/origin/main', f.base); f.git('checkout', '--detach', '-q');
+  f.git('checkout', '--detach', '-q');
   assert.equal((await schedulePreparation(f.options)).status, 'skipped'); assert.equal(f.launches.length, 0);
+});
+
+// What the pre-push hook receives for a destination the remote lacks, as from git push -u origin HEAD.
+const firstPush = (f, ref) => {
+  const head = f.git('rev-parse', 'HEAD');
+  return pushSnapshots({ cwd: f.cwd, env: f.env, config: f.config, remote: 'origin', remoteUrl: f.remoteUrl, input: `HEAD ${head} ${ref} ${'0'.repeat(head.length)}\n` });
+};
+
+test('a first push is prepared from the branch point the push checkpoint uses', async t => {
+  const f = await fixture(t); f.config.branches = ['*'];
+  f.git('checkout', '-q', '-b', 'feature');
+  await schedulePreparation(f.options);
+  const ready = await runPreparation({ ...f.options, store: f.store });
+  const [actualPush] = await firstPush(f, 'refs/heads/feature');
+  assert.deepEqual(ready.prepared, [actualPush.id]);
+  assert.equal(f.ensured[0].base, f.base); assert.deepEqual(f.ensured[0].files, ['app.js']);
+  // With no checked branch on the remote yet, the push checkpoint assesses the whole tree, and so does preparation.
+  f.git('checkout', '-q', 'main'); f.git('update-ref', '-d', 'refs/remotes/origin/main');
+  await schedulePreparation(f.options);
+  const whole = await runPreparation({ ...f.options, store: f.store });
+  const [wholePush] = await firstPush(f, 'refs/heads/main');
+  assert.deepEqual(whole.prepared, [wholePush.id]); assert.equal(wholePush.base, null);
+});
+
+test('a branch made from origin/main prepares its push to the same-named branch, not to main', async t => {
+  const f = await fixture(t);
+  f.git('checkout', '-q', '-b', 'feature', '--track', 'origin/main');
+  await writeFile(path.join(f.cwd, 'app.js'), 'export const count = 3;\n'); f.git('commit', '-qam', 'feature');
+  // Only main is checked by default, and this branch's push never goes there.
+  assert.equal((await schedulePreparation(f.options)).status, 'skipped');
+  f.config.branches = ['*'];
+  await schedulePreparation(f.options);
+  const ready = await runPreparation({ ...f.options, store: f.store });
+  const [actualPush] = await firstPush(f, 'refs/heads/feature');
+  assert.deepEqual(ready.prepared, [actualPush.id]);
+  assert.equal(actualPush.base, f.base);
+  // push.default upstream is the one setting under which git push does go to main.
+  f.git('config', 'push.default', 'upstream');
+  await schedulePreparation(f.options); await runPreparation({ ...f.options, store: f.store });
+  assert.equal(f.ensured.at(-1).target.ref, 'refs/heads/main'); assert.equal(f.ensured.at(-1).base, f.base);
+});
+
+test('the prediction follows push mappings and URLs, and skips a destination it cannot know', async t => {
+  const f = await fixture(t); f.config.branches = ['*'];
+  const prepare = async () => { await schedulePreparation(f.options); return runPreparation({ ...f.options, store: f.store }); };
+  // push.default nothing: plain git push names no destination.
+  f.git('config', 'push.default', 'nothing');
+  assert.equal((await schedulePreparation(f.options)).status, 'skipped');
+  f.git('config', '--unset', 'push.default'); f.git('checkout', '-q', '-b', 'feature');
+  // remote.<name>.push sends the branch to another name, here for the first time.
+  f.git('config', 'remote.origin.push', 'refs/heads/feature:refs/heads/team/feature');
+  await prepare();
+  assert.equal(f.ensured.at(-1).target.ref, 'refs/heads/team/feature'); assert.equal(f.ensured.at(-1).base, f.base);
+  f.git('config', '--unset', 'remote.origin.push');
+  // A first push to two URLs: once the first takes it, Git writes the tracking ref and the second has nothing to check.
+  f.git('config', '--add', 'remote.origin.pushurl', f.remoteUrl);
+  f.git('config', '--add', 'remote.origin.pushurl', 'https://mirror-never-contact.invalid/repo.git');
+  assert.equal((await prepare()).prepared.length, 1); assert.equal(f.ensured.at(-1).target.url, f.remoteUrl);
+  // Once the branch is there, each URL is checked from where it stands.
+  f.git('update-ref', 'refs/remotes/origin/feature', f.base);
+  assert.equal((await prepare()).prepared.length, 2);
+  // No fetch refspec covers the destination, so whether the remote has it is unknown.
+  f.git('config', 'remote.origin.fetch', '+refs/heads/main:refs/remotes/origin/main');
+  assert.equal((await schedulePreparation(f.options)).status, 'skipped');
 });
 
 test('repository and global yolo pause background review without launching workers or creating checks', async t => {
@@ -280,6 +342,26 @@ test('workers populate the session cache without approval and foreground start r
   assert.equal(await store.approved(session.snapshot, f.config), false);
   const foreground = await store.start(id, f.config);
   assert.equal(foreground.question.id, 'count'); assert.equal(generations, 1);
+});
+
+test('saving a new default model keeps a prepared check, and the push reuses its questions', async t => {
+  const { createSessionStore } = await import('../src/sessions.js');
+  const { loadConfig, saveConfig } = await import('../src/config.js');
+  const f = await fixture(t), { root } = await repository(f.cwd); let generations = 0;
+  const store = createSessionStore({ env: f.env, generate: async (_snapshot, _config, { beforeCall }) => { await beforeCall(); generations++; return { questions: [QUESTION] }; } });
+  const options = await loadedOptions(f);
+  await schedulePreparation(options);
+  const [id] = (await runPreparation({ ...options, store })).prepared;
+  // What the questionnaire saves when it closes after a model was picked as the default.
+  const sonnet = { provider: 'claude', model: 'sonnet' };
+  await saveConfig({ ...await loadConfig(undefined, f.env), models: { small: sonnet, medium: sonnet, large: sonnet } }, f.env);
+  assert.equal((await schedulePreparation(options)).status, 'existing', 'no second background review');
+  const config = await loadConfig(root, f.env);
+  const [push] = await pushSnapshots({ cwd: f.cwd, env: f.env, config, remote: 'origin', remoteUrl: f.remoteUrl, input: `refs/heads/main ${f.git('rev-parse', 'HEAD')} refs/heads/main ${f.base}\n` });
+  assert.equal(push.id, id, 'the push checkpoint has the prepared identity');
+  assert.equal((await store.ensure(push, config)).status, 'active');
+  assert.equal((await store.start(id, config)).question.id, QUESTION.id);
+  assert.equal(generations, 1, 'the prepared questions are reused');
 });
 
 test('a worker that finds nothing to ask records that without approval; only a started check passes, with no new review', async t => {

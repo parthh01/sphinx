@@ -56,7 +56,7 @@ sphinx install --yes --preset claude-economy
 sphinx install --yes --preset openrouter-value --allow-paid
 ```
 
-Reinstalling keeps saved routes unless you choose a replacement. Updating Sphinx does not migrate saved routes. Changing a route invalidates prepared questions and completion records made under the previous route.
+Reinstalling keeps saved routes unless you choose a replacement. Updating Sphinx does not migrate saved routes. Changing a route applies to reviews that start afterwards, including a retry of one that failed, except on a check whose model you picked in its questionnaire. A check that already has questions keeps its model, questions, and progress, and completion records are kept.
 
 ### Codex and Claude routes
 
@@ -254,7 +254,8 @@ After commits, merges, rewrites, and checkouts, Sphinx schedules a detached revi
 - Preparation and the push check share one assessment, lock, question set, and usage count. A change to source, destination, policy, ignore rules, or context discards prepared work.
 - Set `backgroundPreparation: false` in `config.json` or `.sphinxconfig` to opt out. A repository cannot re-enable preparation disabled machine-wide.
 - While yolo is on, preparation is paused: no new model request starts, although one already in progress may finish.
-- A first push, a branch without local tracking history, or a push to an unexpected destination needs a cold review at push time. Pre-commit checks always review on demand. Run `git fetch` if remote history is missing.
+- Preparation expects the push that `git push` makes, or that `git push -u <remote> HEAD` makes where `git push` needs a destination: the branch of the same name on the push remote, unless `remote.<name>.push` maps it elsewhere or `push.default` is `upstream`. A first push is prepared from where the branch left the remote, as the push check computes it.
+- A push to another destination, or to a remote that changed since your last fetch, needs a fresh review at push time. Pre-commit checks always review on demand. Run `git fetch` if remote history is missing.
 
 ## GitHub commit status and pull requests
 

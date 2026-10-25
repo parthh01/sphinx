@@ -87,38 +87,42 @@ async function trackingRef(root, remote, ref, env) {
   return '';
 }
 
+// The push to prepare is the one git push makes or, where plain git push
+// refuses (no upstream yet, or one with another name under push.default
+// simple), the git push -u <remote> HEAD an agent runs instead. Both reach the
+// same-named branch on the push remote, unless remote.<name>.push maps it or
+// push.default upstream sends it to the upstream branch. A destination with no
+// remote-tracking ref is a first push: Git reports the zero OID as its old
+// value, so pushSnapshots starts from the branch point exactly as the hook will.
+// All commands below read local config/refs; none contact a remote.
 async function expectedSnapshots(root, sourceRef, head, config, env) {
-  // @{push} accounts for pushRemote/pushDefault and configured push refspecs.
-  // All commands below read local config/refs; none contact a remote.
-  const format = '%(push)%00%(push:remotename)%00%(push:remoteref)%00%(upstream)%00%(upstream:remotename)%00%(upstream:remoteref)';
-  const parts = (await git(root, ['for-each-ref', `--format=${format}`, sourceRef], env, true)).split('\0');
-  if (await git(root, ['config', '--get', 'push.default'], env, true) === 'nothing') return [];
+  const setting = key => git(root, ['config', '--get', key], env, true);
+  const mode = await setting('push.default');
+  if (mode === 'nothing') return [];
   const branch = sourceRef.slice('refs/heads/'.length);
-  const preferredRemote = await git(root, ['config', '--get', `branch.${branch}.pushRemote`], env, true)
-    || await git(root, ['config', '--get', 'remote.pushDefault'], env, true);
-  let [tracking, remote, ref] = parts;
-  if (preferredRemote && (remote !== preferredRemote || !tracking || !ref)) {
-    remote = preferredRemote; ref = sourceRef; tracking = await trackingRef(root, remote, ref, env);
-  } else if (!tracking || !remote || !ref) [tracking, remote, ref] = parts.slice(3);
-  if (!tracking || !remote || !ref) {
-    remote = preferredRemote
-      || await git(root, ['config', '--get', `branch.${branch}.remote`], env, true);
-    if (!remote) {
-      const remotes = (await git(root, ['remote'], env)).split('\n').filter(Boolean);
-      remote = remotes.includes('origin') ? 'origin' : remotes.length === 1 ? remotes[0] : '';
-    }
-    ref = sourceRef;
-    tracking = remote ? await trackingRef(root, remote, ref, env) : '';
+  const upstreamRemote = await setting(`branch.${branch}.remote`);
+  let remote = await setting(`branch.${branch}.pushRemote`) || await setting('remote.pushDefault') || upstreamRemote;
+  if (!remote) {
+    const remotes = (await git(root, ['remote'], env)).split('\n').filter(Boolean);
+    remote = remotes.includes('origin') ? 'origin' : remotes.length === 1 ? remotes[0] : '';
   }
-  if (!remote || remote === '.' || !tracking || !ref?.startsWith('refs/heads/')) return [];
+  // %(push:remoteref) is set only when remote.<name>.push maps this branch.
+  const [mapped, upstream] = (await git(root, ['for-each-ref', '--format=%(push:remoteref)%00%(upstream:remoteref)', sourceRef], env, true)).split('\0');
+  const ref = mapped || (remote === upstreamRemote && ['upstream', 'tracking'].includes(mode) && upstream) || sourceRef;
+  if (!remote || remote === '.' || !ref.startsWith('refs/heads/')) return [];
   if (!config.branches.some(pattern => matches(pattern, ref.slice(11))) || !config.remotes.some(pattern => matches(pattern, remote))) return [];
-  const base = await git(root, ['rev-parse', '--verify', '--end-of-options', `${tracking}^{commit}`], env, true);
-  if (!OID.test(base) || base === head) return [];
+  const tracking = await trackingRef(root, remote, ref, env);
+  if (!tracking) return [];
+  const known = await git(root, ['rev-parse', '--verify', '--end-of-options', `${tracking}^{commit}`], env, true);
+  const old = OID.test(known) ? known : '0'.repeat(head.length);
+  if (old === head) return [];
   const urls = [...new Set((await git(root, ['remote', 'get-url', '--push', '--all', remote], env, true)).split('\n').filter(Boolean))];
   // Unusual fan-out configurations are left to the actual push checkpoint.
   if (!urls.length || urls.length > 4) return [];
   const snapshots = [];
-  for (const remoteUrl of urls) snapshots.push(...await pushSnapshots({ cwd: root, remote, remoteUrl, input: `${sourceRef} ${head} ${ref} ${base}\n`, config, env }));
+  // Once the first URL takes a first push, Git writes the tracking ref, so the
+  // other URLs start from head and their checkpoints have nothing to check.
+  for (const remoteUrl of OID.test(known) ? urls : urls.slice(0, 1)) snapshots.push(...await pushSnapshots({ cwd: root, remote, remoteUrl, input: `${sourceRef} ${head} ${ref} ${old}\n`, config, env }));
   return snapshots;
 }
 
@@ -134,7 +138,7 @@ async function planFor({ cwd, env, config }) {
   const head = await git(repo.root, ['rev-parse', '--verify', 'HEAD'], env, true);
   if (!sourceRef || !OID.test(head)) return { reason: 'No committed branch is checked out.', repo };
   const snapshots = await expectedSnapshots(repo.root, sourceRef, head, config, env);
-  if (!snapshots.length) return { reason: 'No changed protected destination is known from local remote-tracking refs.', repo };
+  if (!snapshots.length) return { reason: 'No changed protected destination is expected for this branch.', repo };
   const id = digest(JSON.stringify({ version: 1, root: repo.root, sourceRef, head, policy: policyHash(config), snapshots: snapshots.map(snapshot => snapshot.id).sort() }));
   return { id, config, repo, snapshots };
 }

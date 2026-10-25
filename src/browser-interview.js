@@ -429,8 +429,10 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
               if (!pendingSwitch || localSignal.aborted) throw error;
             } finally { reviewAttempt = null; localSignal.removeEventListener('abort', stop); }
             const picked = pendingSwitch; pendingSwitch = null;
-            await applySwitch(picked);
-            say({ role: 'sphinx', kind: 'activity', text: 'Restarting the review on the new model' });
+            // Background preparation may have finished the review (questions, or a decision
+            // to ask none) while the switch waited for it; then no review restarts.
+            const switched = await applySwitch(picked);
+            if (!switched.progress.total && switched.preparation?.status !== 'ready') say({ role: 'sphinx', kind: 'activity', text: 'Restarting the review on the new model' });
           }
         },
         choose: async prompt => {
@@ -544,8 +546,9 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
     } finally {
       clearTimeout(timer); requestSignal?.removeEventListener('abort', cancel); resolver?.reject(cancelled()); resolver = undefined;
       if (reservation?.status === 'claimed') await release({ id: request.id, token: reservation.token, status: finalStatus, env: operationEnv });
-      // Settings chosen for future checks are part of a check's policy, and the
-      // Git hook re-checks that policy after this returns. Write them on close().
+      // Write settings chosen for future checks on close(). Distance is part of a
+      // check's policy, which the Git hook re-checks after this returns; the
+      // default model is not, and is saved at the same time.
       if (pendingDefault) {
         const { provider, model } = pendingDefault; pendingDefault = null;
         afterClose.push(() => loadConfig(undefined, operationEnv).then(saved => saveConfig({ ...saved, models: { small: { provider, model }, medium: { provider, model }, large: { provider, model } } }, operationEnv)));

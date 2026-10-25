@@ -86,6 +86,18 @@ test('destination ref, rather than local branch, decides push coverage', async t
   assert.equal(snapshots[0].sourceRef, 'refs/heads/feature');
 });
 
+test('a push of HEAD records the branch HEAD names, or HEAD when detached, with the same identity', async t => {
+  const cwd = await fixture(t);
+  const head = await commit(cwd, { 'a.txt': 'content\n' });
+  const input = `HEAD ${head} refs/heads/main ${zero}\n`;
+  const [attached] = await push(cwd, head, zero, defaults, { input });
+  assert.equal(attached.sourceRef, 'refs/heads/main');
+  await command(cwd, 'checkout', '-q', '--detach');
+  const [detached] = await push(cwd, head, zero, defaults, { input });
+  assert.equal(detached.sourceRef, 'HEAD');
+  assert.equal(detached.id, attached.id);
+});
+
 test('handles multiple refs while skipping deletions, unchanged refs, and tags', async t => {
   const cwd = await fixture(t);
   const head = await commit(cwd, { 'a.txt': 'content\n' });

@@ -154,6 +154,40 @@ test('policy changes and expired receipts require a new assessment',async t=>{
   assert.equal((await store.ensure(snapshot,config)).status,'pending');
 });
 
+test('lowering receiptHours also ends an earlier pass at the new lifetime',async t=>{
+  const {store,env,config}=await fixture(t);
+  const month={...config,receiptHours:720};
+  await store.ensure(snapshot,month);await store.start(snapshot.id,month);await store.answer(snapshot.id,'Yes.',month);
+  const record=await store.read(snapshot.id);record.passedAt=new Date(Date.now()-2*3600000).toISOString();
+  await writeJson(sessionFile(snapshot.id,env),record);
+  assert.equal(await store.approved(snapshot,month),true);
+  assert.equal(await store.approved(snapshot,{...config,receiptHours:3}),true);
+  assert.equal(await store.approved(snapshot,{...config,receiptHours:1}),false);
+  assert.equal((await store.ensure(snapshot,{...config,receiptHours:1})).status,'pending');
+});
+
+test('a check without questions takes the saved route when its review starts; a picked model and questions stay',async t=>{
+  const seen=[];let fail=true,resumed;
+  const {store,config}=await fixture(t,{generate:async(_s,c,options)=>{
+    seen.push(`${c.provider}:${c.model}`);resumed=await options.reviewerCheckpoint.load();
+    if(fail){await options.reviewerCheckpoint.save({version:1,snapshotId:snapshot.id,reads:['src/order.js']});throw new Error('Unavailable');}
+    return {questions:[q]};
+  }});
+  const models=model=>Object.fromEntries(['small','medium','large'].map(tier=>[tier,{provider:'claude',model}]));
+  await store.ensure(snapshot,config);
+  await assert.rejects(store.start(snapshot.id,config),/Unavailable/);
+  // Routes are not part of the policy: the failed check carries on under a newly saved default.
+  fail=false;
+  const moved=await store.start(snapshot.id,{...config,models:models('haiku')});
+  assert.deepEqual([moved.route.provider,moved.route.model],['claude','haiku']);
+  assert.equal(resumed,null,'investigation saved on the previous route is not resumed');
+  assert.equal((await store.start(snapshot.id,{...config,models:models('sonnet')})).route.model,'haiku','questions keep their route');
+  assert.deepEqual(seen,['openrouter:openrouter/free','claude:haiku']);
+  const picked={...snapshot,id:'c'.repeat(64)};
+  await store.ensure(picked,config);await store.switchRoute(picked.id,config,'codex');
+  assert.equal((await store.start(picked.id,{...config,models:models('haiku')})).route.provider,'codex','a model picked for the check stays');
+});
+
 test('stale snapshots fail before generation and again before recording completion',async t=>{
   let changed=false;
   const {store,config}=await fixture(t,{validate:async()=>{if(changed)throw new Error('Changed');},grade:async()=>{changed=true;return{verdict:'correct',feedback:'Correct.',followUp:null};}});

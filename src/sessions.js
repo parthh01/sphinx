@@ -51,7 +51,9 @@ async function withLock(id, env, operation, { signal, deadline = 0 } = {}) {
 // with hold), so it approves nothing until the Git gate sees Continue, even
 // if that gate is killed or a window outlives it.
 function validReceipt(session, config) {
-  return session?.status === 'passed' && session.policy === policyHash(config) && Date.parse(session.expiresAt) > Date.now();
+  return session?.status === 'passed' && session.policy === policyHash(config) && Date.parse(session.expiresAt) > Date.now()
+    // receiptHours is not part of the policy: lowering it also ends older passes sooner.
+    && (!session.passedAt || Date.parse(session.passedAt) + config.receiptHours * 3600000 > Date.now());
 }
 function callLimit(session) {
   const limit = session.callLimit === undefined ? session.config.maxModelCalls : session.callLimit;
@@ -105,7 +107,7 @@ export const documentationOnly = files => Array.isArray(files) && files.length >
 // pass is made when someone starts the check, so a waiting push still asks first.
 function passWithoutQuestions(session, config, reason, pass = true, hold = false) {
   session.questions = []; session.index = 0; session.noQuestionReason = reason;
-  if (pass) { session.status = 'passed'; session.expiresAt = new Date(Date.now() + config.receiptHours * 3600000).toISOString(); if (hold) session.held = { at: now() }; }
+  if (pass) { session.status = 'passed'; session.passedAt = now(); session.expiresAt = new Date(Date.now() + config.receiptHours * 3600000).toISOString(); if (hold) session.held = { at: now() }; }
   session.preparation = { status: 'ready', completedAt: now() };
   delete session.reviewerCheckpoint;
   session.updatedAt = now();
@@ -283,6 +285,14 @@ export function createSessionStore({ env = process.env, generate = generateAsses
         return publicSession(session);
       }
       if (!session.questions.length) {
+        // Routes are not part of a check's identity, so a check without questions follows
+        // the saved route for its size, unless one was picked for it: a changed default
+        // also moves a review that failed. Saved investigation belongs to the old route.
+        const saved = config.models?.[session.route.tier];
+        if (saved && !session.routeChanges?.length && (saved.provider !== session.route.provider || saved.model !== session.route.model)) {
+          session.route = { ...session.route, provider: saved.provider, model: saved.model };
+          delete session.reviewerCheckpoint;
+        }
         const reserve = questionLimit(config.level, session.route.tier);
         const limit = callLimit(session);
         const available = Math.min(config.agentMaxTurns ?? Infinity, limit === null ? Infinity : limit - session.calls - reserve);
@@ -417,6 +427,7 @@ export function createSessionStore({ env = process.env, generate = generateAsses
           await validate(session.snapshot,config);
           signal?.throwIfAborted();
           session.status = 'passed';
+          session.passedAt = now();
           session.expiresAt = new Date(Date.now()+config.receiptHours*3600000).toISOString();
           if (hold) session.held = { at: now() };
         }
@@ -490,6 +501,7 @@ export function createSessionStore({ env = process.env, generate = generateAsses
   async function switchRoute(id, config, provider, { signal, model: picked } = {}) {
     if (!['claude', 'codex', 'openrouter', 'openai'].includes(provider)) throw new Error('Unknown reviewer provider.');
     if (picked === undefined && !['claude', 'codex'].includes(provider)) throw new Error('Only Claude Code or Codex can take over a check on your plan.');
+    // Background preparation may be holding the check: wait for it, as start() does.
     return withLock(id, env, async () => {
       signal?.throwIfAborted();
       const session = await read(id);
@@ -504,7 +516,7 @@ export function createSessionStore({ env = process.env, generate = generateAsses
       session.updatedAt = at;
       await save(session);
       return publicSession(session);
-    });
+    }, { signal, deadline: Date.now() + (config.timeoutSeconds + 5) * 1000 });
   }
   /** Pass a documentation-only change before any page or model is involved. */
   async function passTrivial(id, config, snapshot) {

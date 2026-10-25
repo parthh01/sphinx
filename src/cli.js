@@ -576,7 +576,7 @@ export async function main(argv) {
       if (MODEL_FLAGS.some(key => !['max-model-calls', 'max-output-tokens'].includes(key) && values[key] !== undefined)) {
         terminal.success('Saved machine-wide evaluator settings.');
         terminal.rows(['small', 'medium', 'large'].map(tier => [tier[0].toUpperCase() + tier.slice(1), routeText(config.models[tier])]));
-        terminal.note('Changing evaluator routes applies to fresh checkpoints. Existing checkpoints remain bound to their original assessment policy.');
+        terminal.note('Changing evaluator routes applies to reviews that start from now on, including retries. Checks that already have questions keep their route, questions, and progress.');
       }
       terminal.note(result.path);
       if (policyHash(current) !== policyHash(config)) terminal.note('Checks started under the previous settings no longer apply. A Git operation waiting on one stops within a few seconds; run it again to start a fresh check.');

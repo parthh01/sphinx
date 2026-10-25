@@ -185,11 +185,18 @@ test('malformed config document shapes fail before merging defaults', async t =>
   }
 });
 
-test('policy hashes ignore object-key ordering and change with assessment/spend/privacy policy', () => {
+test('policy hashes ignore object-key ordering and cover only what a check asks', () => {
   const original = structuredClone(DEFAULT_CONFIG);
   const reordered = Object.fromEntries(Object.entries(original).reverse());
   assert.equal(policyHash(original), policyHash(reordered));
-  for (const changed of [{ ...original, level: 'relaxed' }, { ...original, exclude: ['private/**'] }, { ...original, allowPaid: true }, { ...original, model: 'another-model' }, { ...original, maxContextBytes: 50000 }]) assert.notEqual(policyHash(original), policyHash(changed));
+  // Which operations and files are checked, and how deep: these change the hash.
+  const assessment = { version: 2, enabled: false, mode: 'other', events: ['pre-commit'], branches: ['release/*'], remotes: ['upstream'], exclude: ['private/**'], level: 'relaxed', distance: 'low', routing: { ...original.routing, largeMinLines: 200 } };
+  // Reviewer routes and run settings do not, so changing them keeps prepared checks and passes.
+  const run = { provider: 'claude', model: 'another-model', models: { ...original.models, large: { provider: 'claude', model: 'sonnet' } }, audit: 'all', maxContextBytes: 50000, timeoutSeconds: 60, receiptHours: 1, maxModelCalls: 5, maxOutputTokens: 8192, allowPaid: true, cliBilling: 'api', agentMaxTurns: 4, toolResultBytes: 8000, backgroundPreparation: false, preparationDebounceMs: 0, workingContext: false, interface: 'terminal', github: { status: false, comment: true, answers: true } };
+  // A new setting must be placed in one group or the other.
+  assert.deepEqual([...Object.keys(assessment), ...Object.keys(run)].sort(), Object.keys(original).sort());
+  for (const [key, value] of Object.entries(assessment)) assert.notEqual(policyHash({ ...original, [key]: value }), policyHash(original), key);
+  for (const [key, value] of Object.entries(run)) assert.equal(policyHash({ ...original, [key]: value }), policyHash(original), key);
 });
 
 test('assessment contract invalidates old caches while call-ceiling edits preserve current identity', () => {

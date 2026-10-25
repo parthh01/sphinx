@@ -237,7 +237,7 @@ export async function pushSnapshots({ cwd = process.cwd(), remote, remoteUrl, in
   for (const line of input.trim().split('\n').filter(Boolean)) {
     const fields = line.trim().split(/\s+/);
     if (fields.length !== 4) throw new Error('Invalid pre-push input: expected local ref, local object, destination ref, destination object.');
-    const [sourceRef, head, ref, old] = fields;
+    const [localRef, head, ref, old] = fields;
     if (!OID.test(head) || !OID.test(old)) throw new Error('Invalid object ID in pre-push input.');
     if (ZERO.test(head) || head === old || !ref.startsWith('refs/heads/')) continue;
     if (!triggered(config, 'pre-push', ref.slice('refs/heads/'.length), remote)) continue;
@@ -245,6 +245,9 @@ export async function pushSnapshots({ cwd = process.cwd(), remote, remoteUrl, in
     const base = ZERO.test(old) ? await branchPoint(repo.root, remote, head, config) : old;
     if (base) await ensureCommit(repo.root, base, remote, true);
     const tree = (await git(repo.root, ['rev-parse', `${head}^{tree}`])).trim();
+    // git push <remote> HEAD (or @) names its source HEAD. Record the branch it points at,
+    // as background preparation does, so that branch's working context is found and dropped.
+    const sourceRef = localRef === 'HEAD' ? (await git(repo.root, ['symbolic-ref', '--quiet', 'HEAD'], { allowFailure: true }))?.trim() || localRef : localRef;
     const snapshot = await buildSnapshot({ repo, event: 'pre-push', target: { remote, url: remoteUrl || '', ref }, base, head, tree, sourceRef, config, env });
     if (snapshot) snapshots.push(snapshot);
   }

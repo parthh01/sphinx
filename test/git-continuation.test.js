@@ -8,8 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { install } from '../src/install.js';
-import { DEFAULT_CONFIG, saveConfig } from '../src/config.js';
+import { DEFAULT_CONFIG, saveConfig, writeJson } from '../src/config.js';
 import { toggleYolo, yoloStatus, recentOverrides } from '../src/overrides.js';
+import { contextFile } from '../src/working-context.js';
 
 const exec = promisify(execFile);
 const modulePath = name => fileURLToPath(new URL(`../src/${name}.js`, import.meta.url));
@@ -245,8 +246,7 @@ test('a settings change while Git waits releases the push promptly with the next
   for (const mode of ['global', 'repository']) await t.test(mode, async t => {
     const f = await fixture(t), child = f.start('push', 'origin', 'main');
     await f.ready(child);
-    // The remediation a failed preparation advises: change settings, never answer.
-    if (mode === 'global') await saveConfig({ ...f.config, maxOutputTokens: 16384 }, f.env);
+    if (mode === 'global') await saveConfig({ ...f.config, level: 'thorough' }, f.env);
     else await writeFile(path.join(f.repo, '.sphinxconfig'), JSON.stringify({ level: 'thorough' }));
     const changed = Date.now(), result = await child.finished;
     assert.ok(Date.now() - changed < 10000, 'the waiting push must not outlive a discarded check');
@@ -255,6 +255,32 @@ test('a settings change while Git waits releases the push promptly with the next
     await assert.rejects(f.bare('rev-parse', '--verify', 'refs/heads/main'));
     assert.deepEqual(await f.pending(), []);
   });
+});
+
+test('a reviewer model or limit change while Git waits keeps the check, and the push goes through', { timeout: 30000 }, async t => {
+  const f = await fixture(t), child = f.start('push', 'origin', 'main');
+  const checkpoint = await f.ready(child);
+  const sonnet = { provider: 'claude', model: 'sonnet' };
+  await saveConfig({ ...f.config, maxOutputTokens: 16384, models: { small: sonnet, medium: sonnet, large: sonnet } }, f.env);
+  await delay(1500); // longer than the gate's settings watcher interval
+  assert.equal(child.exitCode, null, 'still waiting for the questionnaire');
+  await f.release(checkpoint);
+  const result = await child.finished;
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(await f.bare('rev-parse', 'refs/heads/main'), f.baseHead);
+});
+
+test('a push of HEAD drops the working context of the branch it names once Git continues', { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  // What background curation keeps for the branch; git push origin HEAD names its source HEAD.
+  const brief = contextFile(await realpath(f.repo), 'refs/heads/main', f.env);
+  await writeJson(brief, { version: 1, sourceRef: 'refs/heads/main', overview: 'Unpushed work on main.', items: [] });
+  const child = f.start('push', 'origin', 'HEAD'), checkpoint = await f.ready(child);
+  assert.equal(checkpoint.snapshot.sourceRef, 'refs/heads/main');
+  await f.release(checkpoint);
+  const result = await child.finished;
+  assert.equal(result.code, 0, result.stderr);
+  await assert.rejects(readFile(brief), { code: 'ENOENT' });
 });
 
 test('one push waits for every protected destination before any ref is sent', { timeout: 15000 }, async t => {
