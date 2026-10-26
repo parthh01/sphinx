@@ -46,8 +46,10 @@ function diagnostic(error, state) {
 /** Keep a human-owned terminal open after review failure. This function never
  * chooses to retry, expands a budget, changes a route, or awards completion on
  * its own. inspect() exposes public state only; validate() checks current Git
- * content and policy before a recovery choice is shown. */
-export async function prepareInteractiveCheck({ start, inspect, authorizeMore, validate, config, choose, ui, waitingGit = false, signal, planProviders = [], switchRoute }) {
+ * content and policy before a recovery choice is shown. `waiting` describes the
+ * waiting Git operation in the asking surface's own words; the default is the terminal's. */
+export async function prepareInteractiveCheck({ start, inspect, authorizeMore, validate, config, choose, ui, waitingGit = false, signal, planProviders = [], switchRoute,
+  waiting = 'The original Git operation is waiting while this terminal stays open, subject to its time limit. Choose how to continue.' }) {
   for (;;) {
     signal?.throwIfAborted();
     const before = await inspect();
@@ -92,7 +94,7 @@ export async function prepareInteractiveCheck({ start, inspect, authorizeMore, v
           ? `It returned too many requests (HTTP 429). ${switches.length ? 'Switch this check to your coding plan, or wait and continue.' : 'Wait a moment, then continue.'}`
           : failedCli ? `${switches.length ? `Switch this check to ${PLAN_NAMES[switches[0].value.slice(7)][0]}, or pause and` : 'Pause and'} check that ${failedCli} is installed, signed in, and up to date. The details are below.`
           : waitingGit
-          ? 'The original Git operation is waiting while this terminal stays open, subject to its time limit. Choose how to continue.'
+          ? waiting
           : 'Choose how to continue. Nothing is retried automatically.',
         choices, current: 'pause',
       });

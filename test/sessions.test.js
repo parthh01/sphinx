@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fsPromises, { mkdtemp, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import fsPromises, { mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { DEFAULT_CONFIG, writeJson } from '../src/config.js';
+import { DEFAULT_CONFIG, readJson, writeJson } from '../src/config.js';
 import { createSessionStore, savedDraft, sessionFile } from '../src/sessions.js';
 import { OpenRouterError } from '../src/openrouter.js';
 
@@ -261,6 +261,119 @@ test('foreground waits for preparation and the Git gate can inspect its session 
   const foreground=store.start(snapshot.id,config);
   release();await background;
   assert.equal((await foreground).question.id,q.id);assert.equal(calls,1);
+});
+
+const exists=file=>stat(file).then(()=>true,()=>false);
+test('a model switch stops background preparation\'s review of the check within about a second, and drops its investigation',async t=>{
+  let reviewing;
+  const started=new Promise(resolve=>{reviewing=resolve;});
+  // The review may report being stopped as some other failure; the worker still learns it was stopped for a switch.
+  const {store,env,config}=await fixture(t,{generate:async(s,_c,{signal,reviewerCheckpoint})=>{
+    await reviewerCheckpoint.save({version:1,snapshotId:s.id,note:'investigation so far'});reviewing();
+    return new Promise((_,reject)=>{signal.addEventListener('abort',()=>reject(new Error('Sphinx stopped this review request.')),{once:true});setTimeout(reject,10000,new Error('Never stopped.')).unref();});
+  }});
+  await store.ensure(snapshot,config);
+  const background=store.prepare(snapshot.id,config,{wait:true,stoppable:true}).catch(error=>error);await started;
+  // The page or a terminal check, in another process, switching the check.
+  const at=Date.now(),switched=await createSessionStore({env}).switchRoute(snapshot.id,config,'claude',{model:'sonnet'}),waited=Date.now()-at;
+  assert.ok(waited<1500,`the switch waited ${waited} ms`);
+  assert.equal((await background).code,'SPHINX_SWITCHED');
+  const session=await store.read(snapshot.id);
+  assert.deepEqual({route:switched.route.model,calls:session.calls,investigation:session.reviewerCheckpoint??null,stopRequest:await exists(`${sessionFile(snapshot.id,env)}.stop`)},{route:'sonnet',calls:1,investigation:null,stopRequest:false});
+});
+
+// Whether the stop request names this hold within a few seconds.
+const asksFor=async(stop,createdAt)=>{for(let i=0;i<300;i++){if((await readJson(stop,null))?.createdAt===createdAt)return true;await new Promise(resolve=>setTimeout(resolve,10));}return false;};
+test('a waiting switch keeps asking whoever holds the lock, even after another switch gives up',async t=>{
+  const {store,env,config}=await fixture(t);
+  await store.ensure(snapshot,config);
+  const lock=`${sessionFile(snapshot.id,env)}.lock`,stop=`${sessionFile(snapshot.id,env)}.stop`,hold=createdAt=>writeJson(lock,{pid:process.pid,createdAt});
+  await hold('first');
+  const switching=store.switchRoute(snapshot.id,config,'claude',{model:'sonnet'});
+  assert.equal(await asksFor(stop,'first'),true);
+  // Another hold replaces the first without the lock ever coming free.
+  await hold('second');assert.equal(await asksFor(stop,'second'),true);
+  // A second switch of the check, say a terminal check's, gives up and removes the request on its way out.
+  const giveUp=new AbortController(),other=createSessionStore({env}).switchRoute(snapshot.id,config,'codex',{signal:giveUp.signal});
+  await new Promise(resolve=>setTimeout(resolve,100));giveUp.abort();await assert.rejects(other);
+  assert.equal(await asksFor(stop,'second'),true,'the first switch asks again');
+  await rm(lock);
+  assert.equal((await switching).route.model,'sonnet');assert.equal(await exists(stop),false);
+});
+
+test('a stop request reaches only the review it names: a later review, and one that does not listen, run on',async t=>{
+  const holds=[];let release;
+  const held=new Promise(resolve=>{release=resolve;setTimeout(resolve,10000).unref();});
+  const {store,env,config}=await fixture(t,{generate:async(s,_c,{signal})=>{
+    holds.push(JSON.parse(await readFile(`${sessionFile(s.id,env)}.lock`,'utf8')));
+    if(holds.length===1)throw new Error('The first review fails.');
+    await (holds.length===2?new Promise(resolve=>setTimeout(resolve,700)):held);
+    assert.equal(signal?.aborted??false,false);
+    return{questions:[structuredClone(q)]};
+  }});
+  await store.ensure(snapshot,config);
+  await assert.rejects(store.prepare(snapshot.id,config,{stoppable:true}),/first review fails/);
+  // A request naming the first review's hold, arriving after it ended or left behind by a crash.
+  await writeJson(`${sessionFile(snapshot.id,env)}.stop`,{pid:holds[0].pid,createdAt:holds[0].createdAt});
+  assert.equal((await store.prepare(snapshot.id,config,{stoppable:true})).status,'active','a later review is not stopped');
+  // A review that does not listen, as the page's own or a terminal check's, is asked and waited for.
+  const other={...snapshot,id:'c'.repeat(64)};await store.ensure(other,config);
+  const foreground=store.start(other.id,config);
+  while(holds.length<3)await new Promise(resolve=>setTimeout(resolve,10));
+  const at=Date.now(),switching=createSessionStore({env}).switchRoute(other.id,config,'claude',{model:'sonnet'});
+  await new Promise(resolve=>setTimeout(resolve,700));
+  assert.equal(await exists(`${sessionFile(other.id,env)}.stop`),true,'the switch asked');
+  release();
+  assert.equal((await foreground).status,'active');
+  assert.equal((await switching).route.model,'sonnet');assert.ok(Date.now()-at>=700,'the switch waited for that review');
+  assert.equal(await exists(`${sessionFile(other.id,env)}.stop`),false);
+});
+
+test('a stop asked for before the review starts is seen at once, before any call is charged',async t=>{
+  const {env,config}=await fixture(t);let asked=false;
+  const worker=createSessionStore({env,
+    // A switch in another process asks while this review is still getting ready: prepare validates under the lock first.
+    validate:async()=>{if(asked)return;asked=true;const lock=JSON.parse(await readFile(`${sessionFile(snapshot.id,env)}.lock`,'utf8'));await writeJson(`${sessionFile(snapshot.id,env)}.stop`,{pid:lock.pid,createdAt:lock.createdAt});},
+    // The reviewer sets up its workspace before its first request.
+    generate:async(_s,_c,{beforeCall,signal})=>{await new Promise(resolve=>{signal.addEventListener('abort',resolve,{once:true});setTimeout(resolve,200).unref();});await beforeCall();return{questions:[structuredClone(q)]};}});
+  await worker.ensure(snapshot,config);
+  await assert.rejects(worker.prepare(snapshot.id,config,{wait:true,stoppable:true}),{code:'SPHINX_SWITCHED'});
+  assert.equal((await worker.read(snapshot.id)).calls,0);
+});
+
+test('a stop that lands while a call is being charged leaves the switch in place, and charges nothing',async t=>{
+  const {env,config}=await fixture(t);
+  let charging=false,entered,release,settled;
+  const validating=new Promise(resolve=>{entered=resolve;}),released=new Promise(resolve=>{release=resolve;}),charged=new Promise(resolve=>{settled=resolve;});
+  const worker=createSessionStore({env,
+    // Before each call background preparation re-checks yolo, settings and Git; this check is still running when the stop lands.
+    validate:async()=>{if(charging){entered();await released;}},
+    // As in the reviewer (abortable), a stop abandons the request at once, without waiting for its charge.
+    generate:async(_s,_c,{beforeCall,signal})=>{charging=true;beforeCall().then(settled,settled);return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));}});
+  await worker.ensure(snapshot,config);
+  const background=worker.prepare(snapshot.id,config,{wait:true,stoppable:true}).catch(error=>error);
+  await validating;
+  await createSessionStore({env}).switchRoute(snapshot.id,config,'claude',{model:'sonnet'});
+  assert.equal((await background).code,'SPHINX_SWITCHED');
+  release();await charged;
+  const session=await worker.read(snapshot.id);
+  assert.deepEqual({route:session.route.model,switches:session.routeChanges?.length,calls:session.calls},{route:'sonnet',switches:1,calls:0});
+});
+
+test('a switch given up once the review it asked has stopped leaves the check on its model, with its investigation',async t=>{
+  let reviewing;const started=new Promise(resolve=>{reviewing=resolve;});
+  const {store,env,config}=await fixture(t,{generate:async(s,_c,{signal,reviewerCheckpoint})=>{
+    await reviewerCheckpoint.save({version:1,snapshotId:s.id,note:'investigation so far'});reviewing();
+    return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));
+  }});
+  await store.ensure(snapshot,config);
+  // Pause, say, pressed once background preparation has stopped but before the switch takes the check.
+  const pause=new AbortController(),background=store.prepare(snapshot.id,config,{wait:true,stoppable:true}).catch(error=>{pause.abort();return error;});
+  await started;
+  await assert.rejects(createSessionStore({env}).switchRoute(snapshot.id,config,'claude',{model:'sonnet',signal:pause.signal}));
+  assert.equal((await background).code,'SPHINX_SWITCHED');
+  const session=await store.read(snapshot.id);
+  assert.deepEqual({route:session.route.provider,investigation:session.reviewerCheckpoint?.note,stopRequest:await exists(`${sessionFile(snapshot.id,env)}.stop`)},{route:'openrouter',investigation:'investigation so far',stopRequest:false});
 });
 
 test('reviewer cannot consume the calls reserved for human grading',async t=>{

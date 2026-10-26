@@ -182,7 +182,7 @@ export async function schedulePreparation({ cwd = process.cwd(), env = process.e
       await writeJson(files.job(plan.id), previous);
     }
     await writeJson(files.latest, { id: plan.id });
-    if (previous && previous.status !== 'stale' && !(retry && previous.status === 'failed')) return { status: 'existing', state: previous.status, jobId: plan.id };
+    if (previous && previous.status !== 'stale' && !(retry && ['failed', 'stopped'].includes(previous.status))) return { status: 'existing', state: previous.status, jobId: plan.id };
     const now = new Date().toISOString();
     const record = { version: 1, id: plan.id, status: 'scheduled', total: plan.snapshots.length, prepared: [], scheduledAt: now, updatedAt: now, pid: null };
     await writeJson(files.job(plan.id), record);
@@ -256,10 +256,11 @@ export async function runPreparation({ cwd = process.cwd(), env = process.env, c
       const fresh = await planFor({ cwd: repo.root, env, config });
       if (await yoloOn()) return paused();
       if (fresh.id !== id || !await revalidateSnapshot(snapshot, plan.config, { env })) return finish('stale');
-      await store.prepare(session.id, plan.config, { wait: true });
+      // A model picked for this check stops this review (see switchRoute); the check then reviews on that model.
+      await store.prepare(session.id, plan.config, { wait: true, stoppable: true });
       ensured.pop();
       claimed.prepared.push(snapshot.id);
     }
     return finish('ready');
-  } catch (error) { return await yoloOn() ? paused() : finish('failed', failureKind(error)); }
+  } catch (error) { return error?.code === 'SPHINX_SWITCHED' ? finish('stopped') : await yoloOn() ? paused() : finish('failed', failureKind(error)); }
 }

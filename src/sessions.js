@@ -14,7 +14,11 @@ export function sessionFile(id, env = process.env) {
   if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('Invalid assessment ID. Run sphinx pending to find it.');
   return path.join(getPaths(env).sessions, `${id}.json`);
 }
-async function withLock(id, env, operation, { signal, deadline = 0 } = {}) {
+// A model switch waiting for a check asks the review holding it to stop, naming that hold's lock record.
+// Only background preparation listens (prepare's stoppable), so a request naming any other hold,
+// including one left behind after its hold ended, changes nothing.
+const stopFile = (id, env) => `${sessionFile(id, env)}.stop`;
+async function withLock(id, env, operation, { signal, deadline = 0, onBusy } = {}) {
   signal?.throwIfAborted();
   const file = `${sessionFile(id, env)}.lock`;
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -32,17 +36,19 @@ async function withLock(id, env, operation, { signal, deadline = 0 } = {}) {
     }
     if (alive) {
       if (deadline > Date.now()) {
+        await onBusy?.(lock);
         await delay(Math.min(200, deadline - Date.now()), undefined, { signal });
-        return withLock(id, env, operation, { signal, deadline });
+        return withLock(id, env, operation, { signal, deadline, onBusy });
       }
       throw Object.assign(new Error('This assessment is already running. Wait for preparation to finish, then resume the check.'), { code: 'SPHINX_SESSION_BUSY' });
     }
     await unlink(file).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    return withLock(id, env, operation, { signal, deadline });
+    return withLock(id, env, operation, { signal, deadline, onBusy });
   }
+  const held = { pid: process.pid, createdAt: now() };
   try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: now() }));
-    return await operation();
+    await handle.writeFile(JSON.stringify(held));
+    return await operation(held);
   } finally { await handle.close(); await unlink(file).catch(() => {}); }
 }
 // A held pass (session.held, see hold()) is still a valid receipt: it is reused
@@ -263,8 +269,8 @@ export function createSessionStore({ env = process.env, generate = generateAsses
       return publicSession(session);
     }, { signal });
   }
-  async function prepare(id, config, {signal, wait = false, onProgress, interactive = false, hold = false} = {}) {
-    return withLock(id,env,async () => {
+  async function prepare(id, config, {signal, wait = false, onProgress, interactive = false, hold = false, stoppable = false} = {}) {
+    return withLock(id,env,async held => {
       signal?.throwIfAborted();
       const session = await read(id);
       if (session.policy !== policyHash(config)) throw new Error('Sphinx settings changed. Retry your push or start a fresh check.');
@@ -307,11 +313,20 @@ export function createSessionStore({ env = process.env, generate = generateAsses
         }
         session.preparation = { status: 'running', startedAt: now() };
         await save(session);
+        // Background preparation's review stops when a switch asks for this hold (see stopFile),
+        // and the model call in flight is cancelled with it. The first look is at once: a switch may have asked already.
+        const stop = new AbortController(), poll = () => readJson(stopFile(id, env), null).then(request => {
+          if (request?.pid === held.pid && request.createdAt === held.createdAt) stop.abort(Object.assign(new Error('Stopped for a switch to another model.'), { code: 'SPHINX_SWITCHED' }));
+        }, () => {}), watch = stoppable ? (poll(), setInterval(poll, 250)) : undefined;
+        if (stoppable) signal = signal ? AbortSignal.any([signal, stop.signal]) : stop.signal;
         let requests = 0;
         const beforeCall = async () => {
           signal?.throwIfAborted();
           if (maxReviewerCalls !== null && requests >= maxReviewerCalls) throw new Error('Reviewer call limit reached. The check remains pending.');
           await validate(session.snapshot, config);
+          // The reviewer abandons a request once its review stops, without waiting for this charge, and the
+          // check may since have been released and switched: a save now would undo that.
+          signal?.throwIfAborted();
           await budget(session, reserve);
           requests++;
           signal?.throwIfAborted();
@@ -357,8 +372,8 @@ export function createSessionStore({ env = process.env, generate = generateAsses
         } catch (error) {
           session.preparation = { status: 'failed', completedAt: now() };
           await save(session);
-          throw reviewFailure(error, session, signal);
-        }
+          throw stop.signal.aborted ? stop.signal.reason : reviewFailure(error, session, signal);
+        } finally { clearInterval(watch); }
       }
       return publicSession(session);
     }, { signal, deadline: wait ? Date.now() + (config.timeoutSeconds + 5) * 1000 : 0 });
@@ -501,7 +516,15 @@ export function createSessionStore({ env = process.env, generate = generateAsses
   async function switchRoute(id, config, provider, { signal, model: picked } = {}) {
     if (!['claude', 'codex', 'openrouter', 'openai'].includes(provider)) throw new Error('Unknown reviewer provider.');
     if (picked === undefined && !['claude', 'codex'].includes(provider)) throw new Error('Only Claude Code or Codex can take over a check on your plan.');
-    // Background preparation may be holding the check: wait for it, as start() does.
+    // Background preparation may be reviewing the check: ask whoever holds the lock to stop (see stopFile),
+    // again on every wait, since another switch that gives up removes the request on its way out.
+    // That review stops within a second; any other holder is waited for, as start() does.
+    let asked = false;
+    const ask = lock => {
+      if (!Number.isInteger(lock.pid)) return;
+      asked = true;
+      return writeJson(stopFile(id, env), { pid: lock.pid, createdAt: lock.createdAt }).catch(() => {});
+    };
     return withLock(id, env, async () => {
       signal?.throwIfAborted();
       const session = await read(id);
@@ -509,6 +532,8 @@ export function createSessionStore({ env = process.env, generate = generateAsses
       if (!['pending', 'active'].includes(session.status)) throw new Error('Only an unfinished check can switch models.');
       const preset = REVIEWER_PRESETS.find(item => item.id === `${provider}-economy`);
       const model = picked ?? preset?.models[session.route.tier]?.model ?? null;
+      // Another switch may have moved the check here while this one waited for the lock.
+      if (session.route.provider === provider && session.route.model === model) return { ...publicSession(session), unchanged: true };
       const at = now();
       session.routeChanges = [...(session.routeChanges || []), { at, calls: session.calls, from: { provider: session.route.provider, model: session.route.model }, to: { provider, model } }];
       session.route = { ...session.route, provider, model };
@@ -516,7 +541,7 @@ export function createSessionStore({ env = process.env, generate = generateAsses
       session.updatedAt = at;
       await save(session);
       return publicSession(session);
-    }, { signal, deadline: Date.now() + (config.timeoutSeconds + 5) * 1000 });
+    }, { signal, deadline: Date.now() + (config.timeoutSeconds + 5) * 1000, onBusy: ask }).finally(() => asked && unlink(stopFile(id, env)).catch(() => {}));
   }
   /** Pass a documentation-only change before any page or model is involved. */
   async function passTrivial(id, config, snapshot) {

@@ -250,10 +250,11 @@ Evidence comes from Git objects, not your working files: pre-commit reads the st
 
 After commits, merges, rewrites, and checkouts, Sphinx schedules a detached reviewer for the expected destination so questions are ready before you push. It uses local remote-tracking refs and never fetches. It never opens a questionnaire or approves a push, apart from documentation-only changes, which pass without questions anyway. When the reviewer finds nothing to ask, the push still opens the questionnaire, which says so and asks whether to continue.
 
-- `sphinx status` shows preparation progress; `sphinx prepare` schedules it explicitly; `sphinx prepare --retry` retries a failed job (failures never retry on their own).
+- `sphinx status` shows preparation progress; `sphinx prepare` schedules it explicitly; `sphinx prepare --retry` retries a failed or stopped job (neither retries on its own).
 - Preparation and the push check share one assessment, lock, question set, and usage count. A change to source, destination, policy, ignore rules, or context discards prepared work.
 - Set `backgroundPreparation: false` in `config.json` or `.sphinxconfig` to opt out. A repository cannot re-enable preparation disabled machine-wide.
 - While yolo is on, preparation is paused: no new model request starts, although one already in progress may finish.
+- Picking another model for a check, in the questionnaire or at a terminal check's recovery prompt, stops a background review of that check within about a second. Unless that review had already written its questions, the check then reviews on the new model. Usage already spent stays counted, and `sphinx status` shows the job as stopped.
 - Preparation expects the push that `git push` makes, or that `git push -u <remote> HEAD` makes where `git push` needs a destination: the branch of the same name on the push remote, unless `remote.<name>.push` maps it elsewhere or `push.default` is `upstream`. A first push is prepared from where the branch left the remote, as the push check computes it.
 - A push to another destination, or to a remote that changed since your last fetch, needs a fresh review at push time. Pre-commit checks always review on demand. Run `git fetch` if remote history is missing.
 
