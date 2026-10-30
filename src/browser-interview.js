@@ -27,6 +27,10 @@ const offLimits = env => env.SPHINX_EVALUATOR === '1' || (env.CI && !['false', '
 const words = event => event === 'pre-commit' ? ['commit', 'Commit'] : ['push', 'Push'];
 // What a pass that did not go through still does: the Git gate holds it until Continue.
 const keptPass = op => `Your pass is saved, so the next ${op} of this change asks only whether to continue.`;
+// A reviewer route in the page's words, for example Claude Code sonnet.
+const routeName = ({ provider, model }) => [provider === 'openai' ? 'your endpoint' : PLAN_NAMES[provider]?.[0] ?? 'OpenRouter', model].join(' ');
+// The store's busy error tells a terminal to resume the check later; the page has nothing to resume.
+const pageError = error => error?.code === 'SPHINX_SESSION_BUSY' ? 'Another Sphinx process is still using this check. Try again once it finishes.' : error.message;
 
 /**
  * A quiet macOS notification that questions are waiting, since the page opens
@@ -107,8 +111,9 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
   // The repository's name, which in a worktree differs from its folder.
   let repoName = null;
   // The reviewer picker: offered choices, plus what the running check is doing,
-  // because a switch means something different in each phase.
-  let models = null, reviewAttempt = null, grading = false, switchModel = null, pendingDefault = null;
+  // because a switch means something different in each phase. `switching` is the
+  // route a switch is moving the check to while it waits for the check's lock.
+  let models = null, reviewAttempt = null, grading = false, switching = null, switchModel = null, pendingDefault = null;
   // This check's understanding distance, and a change for the repository's next checks.
   // Distance is part of the check's policy, so it is written only when this check ends.
   let distance = null;
@@ -146,7 +151,7 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
   // Display-only updates (change view, evidence) keep the revision, so they
   // never turn an answer already in flight into a stale submission.
   const publish = (next, { display = false } = {}) => {
-    state = { ...next, messages: transcript, ...(score ? { score } : {}), ...(update ? { update } : {}), ...(repoName ? { repoName } : {}), ...(models ? { models: { groups: models.groups, reviewing: !!reviewAttempt, busy: grading } } : {}), ...(distance ? { distance: { current: distance.current, next: distance.next, scope: distance.scope } } : {}), ...(stamp ? { stamp } : {}), change: viewState(), evidence: evidence && evidence.checkpoint === next.id ? { questionId: evidence.questionId, refs: evidence.refs } : undefined, waitingGit, operationClosed: closed, revision: display ? next.revision : randomUUID(), sequence: ++sequence };
+    state = { ...next, messages: transcript, ...(score ? { score } : {}), ...(update ? { update } : {}), ...(repoName ? { repoName } : {}), ...(models ? { models: { groups: models.groups, reviewing: !!reviewAttempt, busy: grading, ...(switching ? { switching } : {}) } } : {}), ...(distance ? { distance: { current: distance.current, next: distance.next, scope: distance.scope } } : {}), ...(stamp ? { stamp } : {}), change: viewState(), evidence: evidence && evidence.checkpoint === next.id ? { questionId: evidence.questionId, refs: evidence.refs } : undefined, waitingGit, operationClosed: closed, revision: display ? next.revision : randomUUID(), sequence: ++sequence };
     const event = `data: ${JSON.stringify(state)}\n\n`;
     for (const stream of streams) writeEvent(stream, event);
   };
@@ -222,7 +227,7 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       let picked; try { picked = JSON.parse(await readBody(req, 4096)); } catch { return send(res, 400, { error: 'Invalid model choice.' }); }
       if (!switchModel || !models) return send(res, 409, { error: 'Wait for the check to start.' });
       try { return send(res, 200, await switchModel({ provider: picked?.provider, model: typeof picked?.model === 'string' ? picked.model.trim() : '', saveDefault: picked?.saveDefault === true })); }
-      catch (error) { return send(res, error.status || 409, { error: error.message }); }
+      catch (error) { return send(res, error.status || 409, { error: pageError(error) }); }
     }
     if (new URL(req.url, origin).searchParams.get('update') === '1') {
       // Independent of the check: the install runs only after this process exits.
@@ -260,6 +265,9 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       publish({ ...publicFields(state), phase: 'paused', message: pauseMessage(), ...(resumeCommand ? { resume: resumeCommand } : {}) });
       return send(res, 200, state);
     }
+    // While a picked model waits for the check, a recovery choice would race it there and could run on the old model.
+    // The switch answers the prompt itself once it lands.
+    if (switching && state.phase === 'recovery') return send(res, 409, { error: `Wait for the switch to ${routeName(switching)}.` });
     if (!resolver || !resolver.allowed.includes(data.action)) return send(res, 409, { error: 'Wait for the current step to finish.' });
     if (['answer', 'learn', 'dispute'].includes(data.action) && data.questionId !== state.question?.id) return send(res, 409, { error: 'The question changed. Use the current question.' });
     if (['answer', 'dispute'].includes(data.action) && !data.response?.trim()) return send(res, 400, { error: 'Enter an answer or a dispute reason first.' });
@@ -383,12 +391,21 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       }
       const refreshModels = async route => { models = { groups: await modelChoices({ config, env: operationEnv, plans, current: route }).catch(() => []) }; };
       await refreshModels(visible.route);
+      // Background preparation reviewing the check is asked to stop (see switchRoute), but another
+      // process can hold the check for minutes. Until the switch lands the page says so, and other picks are refused.
       const applySwitch = async ({ provider, model, saveDefault }) => {
-        visible = await store.switchRoute(request.id, config, provider, { model, signal: localSignal });
-        if (saveDefault) pendingDefault = { provider, model };
-        await refreshModels(visible.route);
-        say({ role: 'sphinx', kind: 'notice', text: `Switched this check to ${[visible.route.provider === 'openai' ? 'your endpoint' : PLAN_NAMES[provider]?.[0] ?? 'OpenRouter', model].join(' ')}.${saveDefault ? ' It becomes your default when this check ends.' : ''}` });
-        return visible;
+        switching = { provider, model }; publish(state, { display: true });
+        try {
+          visible = await store.switchRoute(request.id, config, provider, { model, signal: localSignal });
+          if (saveDefault) pendingDefault = { provider, model };
+          await refreshModels(visible.route);
+          if (!visible.unchanged) say({ role: 'sphinx', kind: 'notice', text: `Switched this check to ${routeName({ provider, model })}.${saveDefault ? ' It becomes your default when this check ends.' : ''}` });
+          return visible;
+        } catch (error) {
+          // The menu that asked may have closed long ago, so say it where every tab sees it.
+          if (!localSignal.aborted) say({ role: 'sphinx', kind: 'notice', text: `Could not switch to ${routeName({ provider, model })}. ${pageError(error)}` });
+          throw error;
+        } finally { switching = null; publish(state, { display: true }); }
       };
       let pendingSwitch = null;
       // What a picked model does depends on the phase: grade with it from now on,
@@ -398,14 +415,22 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
         const problem = validChoice(models.groups, picked.provider, picked.model, config);
         if (problem) throw Object.assign(new Error(problem), { status: 400 });
         const route = store.public(await store.read(request.id)).route;
+        // Checked after the read, so two picks arriving together cannot both switch.
+        if (switching) throw error(`Already switching to ${routeName(switching)}.`);
         if (route.provider === picked.provider && route.model === picked.model) { if (picked.saveDefault) pendingDefault = picked; return { ok: true }; }
         if (grading) throw error('Switch after this answer is checked.');
         if (reviewAttempt) { pendingSwitch = picked; reviewAttempt.abort(cancelled()); return { ok: true, restarting: true }; }
-        if (resolver?.allowed.includes('answer')) { await applySwitch(picked); publish({ ...state, ...publicFields(visible), route: visible.route }); return { ok: true }; }
-        if (state.phase === 'recovery' && resolver) { await applySwitch(picked); resolver.resolve({ action: 'switched' }); return { ok: true }; }
-        throw error('Switch once the current step finishes.');
+        // The step the pick was made in. Once the switch lands it answers that recovery prompt,
+        // and only if the prompt still waits: never a later step's wait.
+        const wait = resolver, recovery = state.phase === 'recovery';
+        if (!wait || !(recovery || wait.allowed.includes('answer'))) throw error('Switch once the current step finishes.');
+        await applySwitch(picked);
+        if (recovery && resolver === wait) wait.resolve({ action: 'switched' });
+        else publish({ ...state, ...publicFields(visible), route: visible.route });
+        return { ok: true };
       };
       visible = await prepareInteractiveCheck({ config, signal: localSignal, waitingGit: request.delivery === 'hook', ui: recoveryUI,
+        waiting: `The ${words(session.snapshot.event)[0]} waits for your choice, subject to its time limit.`,
         planProviders: plans, switchRoute: provider => store.switchRoute(request.id, config, provider, { signal: localSignal }),
         inspect: async () => store.public(await store.read(request.id)),
         validate: () => validate(session.snapshot, config),
@@ -419,11 +444,13 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
             try {
               publish({ ...publicFields(store.public(await store.read(request.id))), repoRoot: request.repoRoot, phase: 'working', message: 'Reviewing the change…' });
               // A pass made while Git waits is saved held: only the Git gate releases it, after Continue.
-              return await store.start(request.id, config, { signal: attempt.signal, hold: waitingGit, onProgress: text => {
+              const result = await store.start(request.id, config, { signal: attempt.signal, hold: waitingGit, onProgress: text => {
                 say({ role: 'sphinx', kind: 'activity', text }); publish(state);
                 // Refresh tokens and cost from the per-call save without blocking review.
                 store.read(request.id).then(saved => { if (active === controller && state.id === request.id) { const fresh = store.public(saved); publish({ ...state, usage: fresh.usage, tokens: fresh.tokens }); } }, () => {});
               } });
+              // A model picked as the review finished came too late to stop it, so it grades the questions instead.
+              return pendingSwitch && result.status !== 'passed' ? await applySwitch(pendingSwitch).catch(() => result) : result;
             } catch (error) {
               // A model picked mid-review stops this run; anything else is a real failure.
               if (!pendingSwitch || localSignal.aborted) throw error;
@@ -484,10 +511,14 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
             if (field.complete || now - lastPublish > 60) { lastPublish = now; publish(state); }
           };
           const dropDraft = () => { transcript = transcript.filter(item => item.id !== draft && item.id !== step); };
+          // A finally block, not .finally(): withTextStream runs its callback synchronously,
+          // and a throw there must not leave the model picker disabled.
           grading = true; publish(state, { display: true });
-          visible = await withTextStream(onText, () => store.answer(request.id, action.action === 'learn' ? 'I do not know. Explain this concept and give me a different scenario to apply it to.' : action.response.trim(), config, {
-            learn: action.action === 'learn', dispute: action.action === 'dispute', expectedQuestionId: action.questionId, signal: localSignal, hold: waitingGit,
-          })).finally(() => { dropDraft(); grading = false; });
+          try {
+            visible = await withTextStream(onText, () => store.answer(request.id, action.action === 'learn' ? 'I do not know. Explain this concept and give me a different scenario to apply it to.' : action.response.trim(), config, {
+              learn: action.action === 'learn', dispute: action.action === 'dispute', expectedQuestionId: action.questionId, signal: localSignal, hold: waitingGit,
+            }));
+          } finally { dropDraft(); grading = false; }
           settle('graded');
           await refreshScore(request.repoRoot, operationEnv).catch(() => {});
           if (visible.feedback) say({ role: 'sphinx', kind: 'feedback', text: visible.feedback });
@@ -501,6 +532,8 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
           if ((isRateLimit(error, visible.route) || isCliFailure(error, visible.route)) && switchChoices(plans, visible.route.provider).length) {
             const choices = [...switchChoices(plans, visible.route.provider), { value: 'back', label: 'Back to the question', description: 'Keep the current model and try again later. Your draft answer is kept.' }];
             const picked = await waitForAction({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'recovery', message: isRateLimit(error, visible.route) ? 'Grading was rate limited' : `${PLAN_NAMES[visible.route.provider][0]} could not grade this answer`, error: error.message, choices }, choices.map(choice => choice.value));
+            // The model picker already moved the check, and said so: back to the question, without this error.
+            if (picked.action === 'switched') continue;
             if (picked.action.startsWith('switch-')) {
               const provider = picked.action.slice('switch-'.length);
               visible = await store.switchRoute(request.id, config, provider, { signal: localSignal });
@@ -508,9 +541,9 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
               continue;
             }
           }
-          publish({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'question', error: error.message, message: 'Your response was not accepted. Review the error before submitting again.' });
+          publish({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'question', error: pageError(error), message: 'Your response was not accepted. Review the error before submitting again.' });
           // Re-display through waitForAction on the next iteration; never resend.
-          visible = { ...visible, browserError: error.message };
+          visible = { ...visible, browserError: pageError(error) };
         }
       }
       localSignal.throwIfAborted(); await validate(session.snapshot, config);
