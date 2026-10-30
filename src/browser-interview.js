@@ -23,6 +23,10 @@ const ID = /^[a-f0-9]{64}$/u;
 const cancelled = () => Object.assign(new Error('Check paused. Progress is saved.'), { code: 'SPHINX_CANCELLED' });
 const equal = (a, b) => typeof a === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const offLimits = env => env.SPHINX_EVALUATOR === '1' || (env.CI && !['false', '0'].includes(env.CI));
+// A waiting Git operation in the page's words, as its scope line names it.
+const words = event => event === 'pre-commit' ? ['commit', 'Commit'] : ['push', 'Push'];
+// What a pass that did not go through still does: the Git gate holds it until Continue.
+const keptPass = op => `Your pass is saved, so the next ${op} of this change asks only whether to continue.`;
 
 /**
  * A quiet macOS notification that questions are waiting, since the page opens
@@ -68,7 +72,9 @@ function publicFields(state) {
     route: state.route && { provider: state.route.provider, model: state.route.model, tier: state.route.tier },
     progress: state.progress, usage: state.usage, tokens: state.tokens,
     ...(state.question ? { question: { id: state.question.id, prompt: state.question.prompt, choices: state.question.choices || [] } } : {}),
-    ...(state.feedback ? { feedback: state.feedback } : {}),
+    // A pass held from an earlier operation shows no question, so its last grade's feedback would read
+    // out of context. A pass made on this page is held too, but its transcript already shows that feedback.
+    ...(state.feedback && !state.held ? { feedback: state.feedback } : {}),
   };
 }
 
@@ -85,10 +91,13 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
   let server, origin, url, opened = false, closed = false, active, skip, resolver, sequence = 0, waitingGit = false;
   // A pause stops the waiting Git operation, and this page's server with it, so
   // the only way back is to run it again. Say so, with the command when known.
+  // Cut short at the consent step (only Git or the deadline can), the pass is already saved.
   let resumeCommand = null;
-  const pauseMessage = () => waitingGit
-    ? 'Paused. Your progress is saved, and the waiting push was stopped. To continue, run the same push again; Sphinx reopens at this question.'
-    : 'Paused. Your progress is saved. To continue, run the command below; Sphinx reopens at this question.';
+  const pauseMessage = () => {
+    const [op, Op] = words(state.event);
+    if (!waitingGit) return 'Paused. Your progress is saved. To continue, run the command below; Sphinx reopens at this question.';
+    return state.phase === 'consent' ? `Git stopped waiting before you chose, so the ${op} did not go through. ${keptPass(op)}` : `${Op} stopped. It did not go through, and your progress is saved. To continue, run the same ${op} again; Sphinx reopens at this question.`;
+  };
   let state = { phase: 'waiting', operationClosed: false, revision: randomUUID(), sequence, message: 'Waiting for the checkpoint.', messages: [] };
   // The chat transcript for the current checkpoint lives only in this process.
   // It contains public questions, feedback, and the human's own text.
@@ -230,9 +239,15 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
     let data; try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, { error: 'Invalid response.' }); }
     if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).some(key => !['id', 'revision', 'action', 'response', 'questionId'].includes(key))
       || typeof data.action !== 'string' || (data.response !== undefined && (typeof data.response !== 'string' || data.response.length > 8000))) return send(res, 400, { error: 'Invalid response.' });
-    // Live progress changes the revision often; Pause and Skip only need the checkpoint.
-    if (!active || active.signal.aborted || data.id !== state.id || (!['pause', 'skip'].includes(data.action) && data.revision !== state.revision)) return send(res, 409, { error: 'This checkpoint changed. Use the current question.' });
+    // Live progress changes the revision often; Pause, Skip, Continue, and Stop only need the checkpoint.
+    if (!active || active.signal.aborted || data.id !== state.id || (!['pause', 'skip', 'proceed', 'stop'].includes(data.action) && data.revision !== state.revision)) return send(res, 409, { error: 'This checkpoint changed. Use the current question.' });
+    if (['proceed', 'stop'].includes(data.action) && resolver?.allowed.includes(data.action)) {
+      const current = resolver;
+      send(res, 200, state); current.resolve(data); return;
+    }
+    const consenting = ['proceed', 'stop'].some(action => resolver?.allowed.includes(action));
     if (data.action === 'skip') {
+      if (consenting) return send(res, 409, { error: `Choose continue or stop for this ${words(state.event)[0]}.` });
       // Available at any step, including while the review is still running.
       skip = { reason: data.response };
       active.abort(cancelled());
@@ -240,6 +255,7 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       return send(res, 200, state);
     }
     if (data.action === 'pause') {
+      if (consenting) return send(res, 409, { error: `Choose continue or stop for this ${words(state.event)[0]}.` });
       active.abort(cancelled());
       publish({ ...publicFields(state), phase: 'paused', message: pauseMessage(), ...(resumeCommand ? { resume: resumeCommand } : {}) });
       return send(res, 200, state);
@@ -251,7 +267,7 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
     if (data.action === 'answer') say({ role: 'human', kind: 'answer', text: data.response.trim(), status: 'checking' });
     else if (data.action === 'dispute') say({ role: 'human', kind: 'dispute', text: `Dispute: ${data.response.trim()}`, status: 'checking' });
     else if (data.action === 'learn') say({ role: 'human', kind: 'learn', text: 'Explain this concept.', status: 'checking' });
-    publish({ ...publicFields(state), phase: 'working', message: data.action === 'answer' ? 'Checking your reasoning…' : data.action === 'learn' ? 'Preparing an explanation and a new scenario…' : data.action === 'dispute' ? 'Reviewing the question…' : 'Continuing the review…' });
+    publish({ ...publicFields(state), phase: 'working', message: data.action === 'answer' ? 'Checking your reasoning…' : data.action === 'learn' ? 'Preparing an explanation…' : data.action === 'dispute' ? 'Reviewing the question…' : 'Continuing the review…' });
     send(res, 202, state); current.resolve(data);
   }
   async function ensureServer(operationEnv) {
@@ -272,7 +288,7 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
     if (!opened) {
       opened = true;
       const automatic = await Promise.resolve().then(() => openBrowser(url, { env: operationEnv })).catch(() => false);
-      output(automatic ? 'Sphinx: questionnaire opened in a background browser tab. Your coding window stays in place.' : 'Sphinx: open the local URL above to answer. No application was brought to the foreground.');
+      output(automatic ? 'Sphinx: questionnaire opened in a background browser tab. Your coding window stays in place.' : 'Sphinx: open the local URL above. No application was brought to the foreground.');
     }
   }
   function startView(request, snapshot, config, operationEnv, store) {
@@ -337,7 +353,8 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       reservation = await reserve({ request, env: operationEnv, kind: 'browser' });
       if (reservation?.status !== 'claimed') {
         const status = await waitForExisting({ id: request.id, env: operationEnv, timeoutMs, signal: localSignal });
-        return { status: status === 'passed' ? 'passed' : 'pending', id: request.id };
+        // Passed in another window while Git waits on this one: this page still asks before it goes through.
+        if (status !== 'passed' || !waitingGit || request.more) return { status: status === 'passed' || status === 'stopped' ? status : 'pending', id: request.id };
       }
       const session = await store.read(request.id), config = await readConfig(request.repoRoot, operationEnv);
       if (session.snapshot.repoRoot !== request.repoRoot) throw new Error('This checkpoint belongs to another repository.');
@@ -401,7 +418,8 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
             reviewAttempt = attempt;
             try {
               publish({ ...publicFields(store.public(await store.read(request.id))), repoRoot: request.repoRoot, phase: 'working', message: 'Reviewing the change…' });
-              return await store.start(request.id, config, { signal: attempt.signal, onProgress: text => {
+              // A pass made while Git waits is saved held: only the Git gate releases it, after Continue.
+              return await store.start(request.id, config, { signal: attempt.signal, hold: waitingGit, onProgress: text => {
                 say({ role: 'sphinx', kind: 'activity', text }); publish(state);
                 // Refresh tokens and cost from the per-call save without blocking review.
                 store.read(request.id).then(saved => { if (active === controller && state.id === request.id) { const fresh = store.public(saved); publish({ ...state, usage: fresh.usage, tokens: fresh.tokens }); } }, () => {});
@@ -411,8 +429,10 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
               if (!pendingSwitch || localSignal.aborted) throw error;
             } finally { reviewAttempt = null; localSignal.removeEventListener('abort', stop); }
             const picked = pendingSwitch; pendingSwitch = null;
-            await applySwitch(picked);
-            say({ role: 'sphinx', kind: 'activity', text: 'Restarting the review on the new model' });
+            // Background preparation may have finished the review (questions, or a decision
+            // to ask none) while the switch waited for it; then no review restarts.
+            const switched = await applySwitch(picked);
+            if (!switched.progress.total && switched.preparation?.status !== 'ready') say({ role: 'sphinx', kind: 'activity', text: 'Restarting the review on the new model' });
           }
         },
         choose: async prompt => {
@@ -422,12 +442,13 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
         },
       });
       if (!visible) return skip ? skipped() : { status: 'pending', id: request.id };
+      const where = [repoName || path.basename(request.repoRoot), String(session.snapshot.target?.ref || '').replace(/^refs\/heads\//, '')].filter(Boolean).join(' → ');
       let notified = false;
       while (visible.status !== 'passed') {
         localSignal.throwIfAborted();
         showQuestion(visible); refreshEvidence(request.id);
         // The page opened in a background tab; say once that questions are ready.
-        if (!notified) { notified = true; notify({ title: 'Sphinx needs your answers', message: [repoName || path.basename(request.repoRoot), String(session.snapshot.target?.ref || '').replace(/^refs\/heads\//, '')].filter(Boolean).join(' → '), env: operationEnv }); }
+        if (!notified) { notified = true; notify({ title: 'Sphinx needs your answers', message: where, env: operationEnv }); }
         // Answers can also arrive from sphinx answer or a terminal check. Follow
         // the saved session so this page, and the Git operation waiting on it, keep up.
         const shown = visible;
@@ -465,11 +486,13 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
           const dropDraft = () => { transcript = transcript.filter(item => item.id !== draft && item.id !== step); };
           grading = true; publish(state, { display: true });
           visible = await withTextStream(onText, () => store.answer(request.id, action.action === 'learn' ? 'I do not know. Explain this concept and give me a different scenario to apply it to.' : action.response.trim(), config, {
-            learn: action.action === 'learn', dispute: action.action === 'dispute', expectedQuestionId: action.questionId, signal: localSignal,
+            learn: action.action === 'learn', dispute: action.action === 'dispute', expectedQuestionId: action.questionId, signal: localSignal, hold: waitingGit,
           })).finally(() => { dropDraft(); grading = false; });
           settle('graded');
           await refreshScore(request.repoRoot, operationEnv).catch(() => {});
           if (visible.feedback) say({ role: 'sphinx', kind: 'feedback', text: visible.feedback });
+          // Without a usable new question no new bubble appears, so say that the same one stays open.
+          if (visible.status !== 'passed' && visible.question?.id === action.questionId) say({ role: 'sphinx', kind: 'notice', text: 'The same question is still open.' });
         } catch (error) {
           settle('not-graded');
           localSignal.throwIfAborted(); await validate(session.snapshot, config);
@@ -491,8 +514,27 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
         }
       }
       localSignal.throwIfAborted(); await validate(session.snapshot, config);
+      const [op, Op] = words(session.snapshot.event), result = visible.noQuestionReason ? `No questions needed: ${visible.noQuestionReason}` : 'You passed.';
+      // Held when this page opened, the pass was made for an earlier push or commit that did not
+      // go through; nothing else is asked. (A pass made here is held too, until Git sees Continue.)
+      const earlier = session.status === 'passed' && session.held && `${visible.noQuestionReason ? 'This change needed no questions' : 'You passed this change'} earlier, but that ${op} did not go through.`;
+      const note = visible.noQuestionReason ? '' : '\nThis records your answers, not a review of every changed line.';
+      // A push to several destinations asks once, after the last one passes.
+      if (waitingGit && !request.more) {
+        // A pass that needed no questions, or a held one, can arrive before anyone looked at the page.
+        if (!notified) notify({ title: `Sphinx: continue the ${op}?`, message: where, env: operationEnv });
+        const consent = await waitForAction({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'consent', message: `${earlier || result} Continue the ${op}?`, choices: [
+          { value: 'proceed', label: `Continue ${op}`, description: `Continue: the ${op} goes through.` },
+          { value: 'stop', label: `Stop ${op}`, description: `Stop: it does not go through. ${keptPass(op)}` },
+        ] }, ['proceed', 'stop']);
+        if (consent.action === 'stop') {
+          finalStatus = 'pending';
+          publish({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'stopped', message: `${Op} stopped. It did not go through. ${keptPass(op)} You can close this tab.`, ...(resumeCommand ? { resume: resumeCommand } : {}) });
+          return { status: 'stopped', id: request.id };
+        }
+      }
       finalStatus = 'passed';
-      publish({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'passed', message: visible.noQuestionReason ? `No questions needed: ${visible.noQuestionReason} You can close this tab${waitingGit ? '; Git is finishing the push on its own' : ''}.` : waitingGit ? 'You passed. You can close this tab; Git is finishing the push on its own.\nThis records your answers, not a review of every changed line.' : 'You passed. You can close this tab.\nThis records your answers, not a review of every changed line.' });
+      publish({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'passed', message: `${result} ${!waitingGit ? 'You can close this tab.' : request.more ? `This ${op} has another destination to check next.` : `You can close this tab; Git is finishing the ${op} on its own.`}${note}` });
       return { status: 'passed', id: request.id };
     } catch (error) {
       settle('not-graded');
@@ -504,8 +546,9 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
     } finally {
       clearTimeout(timer); requestSignal?.removeEventListener('abort', cancel); resolver?.reject(cancelled()); resolver = undefined;
       if (reservation?.status === 'claimed') await release({ id: request.id, token: reservation.token, status: finalStatus, env: operationEnv });
-      // Settings chosen for future checks are part of a check's policy, and the
-      // Git hook re-checks that policy after this returns. Write them on close().
+      // Write settings chosen for future checks on close(). Distance is part of a
+      // check's policy, which the Git hook re-checks after this returns; the
+      // default model is not, and is saved at the same time.
       if (pendingDefault) {
         const { provider, model } = pendingDefault; pendingDefault = null;
         afterClose.push(() => loadConfig(undefined, operationEnv).then(saved => saveConfig({ ...saved, models: { small: { provider, model }, medium: { provider, model }, large: { provider, model } } }, operationEnv)));

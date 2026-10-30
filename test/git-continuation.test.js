@@ -8,8 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { install } from '../src/install.js';
-import { DEFAULT_CONFIG, saveConfig } from '../src/config.js';
+import { DEFAULT_CONFIG, saveConfig, writeJson } from '../src/config.js';
 import { toggleYolo, yoloStatus, recentOverrides } from '../src/overrides.js';
+import { contextFile } from '../src/working-context.js';
 
 const exec = promisify(execFile);
 const modulePath = name => fileURLToPath(new URL(`../src/${name}.js`, import.meta.url));
@@ -60,7 +61,7 @@ process.stdout.write(JSON.stringify({valid:await revalidateSnapshot(snapshot,con
   const launcher = path.join(base, 'hook-launcher.mjs');
   await writeFile(launcher, `import { dispatchHook } from ${JSON.stringify(modulePath('install'))};
 import { runGitGate } from ${JSON.stringify(modulePath('git-gate'))};
-import { readFile,writeFile,rename } from 'node:fs/promises';
+import { readFile,writeFile,rename,rm,readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -73,21 +74,26 @@ const publish=async(file,data)=>{await writeFile(file+'.tmp',data);await rename(
 const read=async(file,fallback)=>{try{return JSON.parse(await readFile(file,'utf8'));}catch(e){if(e.code==='ENOENT')return fallback;throw e;}};
 const event=process.argv[4];let input='';
 if(event==='pre-push')for await(const chunk of process.stdin)input+=chunk;
-const sessions=new Map();let count=0;
+// Numbered across Git runs, so a retry's questionnaire is ready-N for the next N.
+const sessions=new Map();let count=(await readdir(state)).filter(name=>name.startsWith('ready-')&&name.endsWith('.json')).length;
+const has=async file=>!!(await read(join(state,file),null));
 const store={
-  approved:async(snapshot)=>!!(await read(join(state,snapshot.id+'.approval'),null)),
-  ensure:async(snapshot,config)=>{const session={id:snapshot.id,snapshot,config,route:{tier:'small'}};sessions.set(snapshot.id,session);return session;}
+  approved:async(snapshot)=>await has(snapshot.id+'.approval')&&!(await has(snapshot.id+'.held')),
+  ensure:async(snapshot,config)=>{const session={id:snapshot.id,snapshot,config,route:{tier:'small'},held:await read(join(state,snapshot.id+'.held'),undefined),noQuestionReason:await read(join(state,snapshot.id+'.reason'),undefined)};sessions.set(snapshot.id,session);return session;},
+  hold:async(id)=>{if(!(await has(id+'.approval')))return false;await publish(join(state,id+'.held'),JSON.stringify({at:Date.now()}));return true;},
+  confirm:async(id)=>{await rm(join(state,id+'.held'),{force:true});return true;},
 };
 const present=async({request,env,signal})=>{
   const session=sessions.get(request.id),number=count++,file=join(state,'ready-'+number+'.json');
-  const payload={request,snapshot:session.snapshot,config:session.config,pid:process.pid,index:env.GIT_INDEX_FILE??null};
+  const payload={request,snapshot:session.snapshot,config:session.config,held:!!session.held,pid:process.pid,index:env.GIT_INDEX_FILE??null};
   const candidate=join(state,'candidate-'+number+'.json');await writeFile(candidate,JSON.stringify(payload));
   if(event==='pre-commit'){
     const result=await promisify(execFile)(process.execPath,[${JSON.stringify(validator)},candidate],{cwd:request.repoRoot,env});
     payload.externalValidation=JSON.parse(result.stdout);
   }
   await publish(file,JSON.stringify(payload));
-  while(true){signal?.throwIfAborted();const decision=await read(join(state,request.id+'.decision'),null);if(decision)return decision;await delay(10,undefined,{signal});}
+  // Each decision answers one questionnaire; a retry waits for a new one.
+  while(true){signal?.throwIfAborted();const decision=await read(join(state,request.id+'.decision'),null);if(decision){await rm(join(state,request.id+'.decision'));return decision;}await delay(10,undefined,{signal});}
 };
 try{process.exitCode=await dispatchHook({event,args:process.argv.slice(5),input,gate:args=>runGitGate({...args,store,present,signal:controller.signal})});}
 catch(error){process.stderr.write(error.message+'\\n');process.exitCode=1;}
@@ -116,7 +122,8 @@ catch(error){process.stderr.write(error.message+'\\n');process.exitCode=1;}
   };
   const pending = async () => readdir(path.join(env.SPHINX_HOME, 'presentations')).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
   const oldCalls = async () => (await readFile(path.join(state, 'old-hooks'), 'utf8')).trim().split('\n');
-  return { base, repo, remote, env, state, config, baseHead, git, bare, setup, start, ready, release, pending, oldCalls };
+  const held = async checkpoint => readFile(path.join(state, `${checkpoint.request.id}.held`)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+  return { base, repo, remote, env, state, config, baseHead, git, bare, setup, start, ready, release, pending, oldCalls, held };
 }
 
 test('the original push waits, preserves hook input, and continues exactly once after approval', { timeout: 15000 }, async t => {
@@ -137,6 +144,73 @@ test('the original push waits, preserves hook input, and continues exactly once 
   assert.deepEqual(await f.pending(), []);
 });
 
+test('stopping after a pass holds it: the same push then asks only whether to continue, and goes through on Continue', { timeout: 20000 }, async t => {
+  const f = await fixture(t), child = f.start('push', 'origin', 'main');
+  const checkpoint = await f.ready(child);
+  assert.equal(checkpoint.held, false);
+  await f.release(checkpoint, { status: 'stopped', approve: true });
+  const result = await child.finished;
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /Sphinx: you stopped this push after passing, so it did not go through\. Your pass is saved; the next push of this change asks only whether to continue\. A coding agent must not retry it unless you ask\./);
+  assert.doesNotMatch(result.stderr, /without questions/, 'a coding agent reading Git output is not told a retry would go through');
+  assert.doesNotMatch(result.stderr, /before you chose/, 'the human did choose');
+  await assert.rejects(f.bare('rev-parse', '--verify', 'refs/heads/main'));
+  assert.equal(await f.held(checkpoint), true);
+  // The retry a coding agent might make waits for the human instead of going through.
+  const again = f.start('push', 'origin', 'main'), asked = await f.ready(again, 1);
+  assert.equal(asked.request.id, checkpoint.request.id); assert.equal(asked.held, true);
+  assert.equal(again.exitCode, null); await assert.rejects(f.bare('rev-parse', '--verify', 'refs/heads/main'));
+  await f.release(asked);
+  const retried = await again.finished;
+  assert.equal(retried.code, 0, retried.stderr);
+  assert.match(retried.stderr, /Sphinx: you passed the understanding check for refs\/heads\/main earlier, but that push did not go through\.\n/);
+  assert.match(retried.stderr, /Sphinx: Git is waiting for you to choose in the local Sphinx questionnaire whether this push should continue\. Do not start another copy of this push\./);
+  assert.doesNotMatch(retried.stderr, /understanding check needed|waiting for your answers|understanding check complete/);
+  assert.match(retried.stderr, /Sphinx: continuing this Git operation\.\n/, 'nothing was checked again');
+  assert.equal(await f.held(checkpoint), false, 'Continue clears the hold');
+  assert.equal(await f.bare('rev-parse', 'refs/heads/main'), f.baseHead);
+  assert.deepEqual(await f.oldCalls(), ['pre-push', 'pre-push']);
+  assert.deepEqual(await f.pending(), []);
+});
+
+test('a check that ends after its pass was saved, without Continue, says so and holds the pass like Stop', { timeout: 20000 }, async t => {
+  const f = await fixture(t), child = f.start('push', 'origin', 'main');
+  const checkpoint = await f.ready(child);
+  await f.release(checkpoint, { status: 'pending', approve: true });
+  const result = await child.finished;
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /Sphinx: you passed, but this push stopped before you chose to continue, so it did not go through\. Your pass is saved; the next push of this change asks only whether to continue\. A coding agent must not retry it unless you ask\./);
+  assert.doesNotMatch(result.stderr, /incomplete/);
+  await assert.rejects(f.bare('rev-parse', '--verify', 'refs/heads/main'));
+  assert.equal(await f.held(checkpoint), true);
+  // Stop at the retry keeps the hold; a cut-short retry says the pass is saved, not that the check is incomplete.
+  const again = f.start('push', 'origin', 'main');
+  await f.release(await f.ready(again, 1), { status: 'stopped' });
+  assert.notEqual((await again.finished).code, 0);
+  assert.equal(await f.held(checkpoint), true);
+  const third = f.start('push', 'origin', 'main');
+  await f.release(await f.ready(third, 2), { status: 'pending' });
+  assert.match((await third.finished).stderr, /you passed, but this push stopped before you chose to continue/);
+  assert.equal(await f.held(checkpoint), true);
+  await assert.rejects(f.bare('rev-parse', '--verify', 'refs/heads/main'));
+});
+
+test('Git cancelled after the pass was saved also holds it, so a retry still asks', { timeout: 20000 }, async t => {
+  const f = await fixture(t), child = f.start('push', 'origin', 'main');
+  const checkpoint = await f.ready(child);
+  await publish(path.join(f.state, `${checkpoint.request.id}.approval`), JSON.stringify({ id: checkpoint.request.id }));
+  process.kill(checkpoint.pid, 'SIGINT');
+  const result = await child.finished;
+  assert.notEqual(result.code, 0); await assert.rejects(f.bare('rev-parse', '--verify', 'refs/heads/main'));
+  assert.equal(await f.held(checkpoint), true, 'the gate holds the pass on its way out, not only on Stop');
+  assert.match(result.stderr, /Sphinx: you passed, but this push stopped before you chose to continue, so it did not go through\. Your pass is saved; the next push of this change asks only whether to continue\. A coding agent must not retry it unless you ask\.\n/, 'a coding agent whose shell timed out reads the same as after the deadline');
+  const again = f.start('push', 'origin', 'main'), asked = await f.ready(again, 1);
+  assert.equal(asked.request.id, checkpoint.request.id); assert.equal(asked.held, true);
+  await f.release(asked);
+  assert.equal((await again.finished).code, 0);
+  assert.equal(await f.bare('rev-parse', 'refs/heads/main'), f.baseHead);
+});
+
 test('pause, cancellation, and a false terminal success cannot authorize a push or leave forms queued', { timeout: 30000 }, async t => {
   for (const mode of ['pause', 'cancel', 'false-success']) await t.test(mode, async t => {
     const f = await fixture(t), child = f.start('push', 'origin', 'main');
@@ -147,6 +221,8 @@ test('pause, cancellation, and a false terminal success cannot authorize a push 
     assert.notEqual(result.code, 0); await assert.rejects(f.bare('rev-parse', '--verify', 'refs/heads/main'));
     assert.deepEqual(await f.pending(), []);
     assert.deepEqual(await f.oldCalls(), ['pre-push']);
+    assert.equal(await f.held(checkpoint), false, 'with no saved pass there is nothing to hold');
+    assert.doesNotMatch(result.stderr, /you passed/);
   });
 });
 
@@ -160,6 +236,7 @@ test('source and effective policy changes while answering invalidate the origina
     await f.release(checkpoint);
     const result = await child.finished;
     assert.notEqual(result.code, 0); assert.match(result.stderr, /changed while Git was waiting/);
+    assert.doesNotMatch(result.stderr, /you passed/, 'that pass is for the old change');
     await assert.rejects(f.bare('rev-parse', '--verify', 'refs/heads/main'));
     assert.deepEqual(await f.pending(), []);
   });
@@ -169,8 +246,7 @@ test('a settings change while Git waits releases the push promptly with the next
   for (const mode of ['global', 'repository']) await t.test(mode, async t => {
     const f = await fixture(t), child = f.start('push', 'origin', 'main');
     await f.ready(child);
-    // The remediation a failed preparation advises: change settings, never answer.
-    if (mode === 'global') await saveConfig({ ...f.config, maxOutputTokens: 16384 }, f.env);
+    if (mode === 'global') await saveConfig({ ...f.config, level: 'thorough' }, f.env);
     else await writeFile(path.join(f.repo, '.sphinxconfig'), JSON.stringify({ level: 'thorough' }));
     const changed = Date.now(), result = await child.finished;
     assert.ok(Date.now() - changed < 10000, 'the waiting push must not outlive a discarded check');
@@ -181,12 +257,39 @@ test('a settings change while Git waits releases the push promptly with the next
   });
 });
 
+test('a reviewer model or limit change while Git waits keeps the check, and the push goes through', { timeout: 30000 }, async t => {
+  const f = await fixture(t), child = f.start('push', 'origin', 'main');
+  const checkpoint = await f.ready(child);
+  const sonnet = { provider: 'claude', model: 'sonnet' };
+  await saveConfig({ ...f.config, maxOutputTokens: 16384, models: { small: sonnet, medium: sonnet, large: sonnet } }, f.env);
+  await delay(1500); // longer than the gate's settings watcher interval
+  assert.equal(child.exitCode, null, 'still waiting for the questionnaire');
+  await f.release(checkpoint);
+  const result = await child.finished;
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(await f.bare('rev-parse', 'refs/heads/main'), f.baseHead);
+});
+
+test('a push of HEAD drops the working context of the branch it names once Git continues', { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  // What background curation keeps for the branch; git push origin HEAD names its source HEAD.
+  const brief = contextFile(await realpath(f.repo), 'refs/heads/main', f.env);
+  await writeJson(brief, { version: 1, sourceRef: 'refs/heads/main', overview: 'Unpushed work on main.', items: [] });
+  const child = f.start('push', 'origin', 'HEAD'), checkpoint = await f.ready(child);
+  assert.equal(checkpoint.snapshot.sourceRef, 'refs/heads/main');
+  await f.release(checkpoint);
+  const result = await child.finished;
+  assert.equal(result.code, 0, result.stderr);
+  await assert.rejects(readFile(brief), { code: 'ENOENT' });
+});
+
 test('one push waits for every protected destination before any ref is sent', { timeout: 15000 }, async t => {
   const f = await fixture(t); await f.setup('branch', 'master');
   const child = f.start('push', 'origin', 'main', 'master');
   const first = await f.ready(child); await f.release(first);
   const second = await f.ready(child, 1);
   assert.notEqual(first.request.id, second.request.id);
+  assert.deepEqual([first.request.more, second.request.more], [true, undefined], 'only the last destination asks whether to continue');
   assert.deepEqual(new Set([first.snapshot.target.ref, second.snapshot.target.ref]), new Set(['refs/heads/main', 'refs/heads/master']));
   assert.equal(child.exitCode, null);
   assert.equal(await f.bare('for-each-ref', '--format=%(refname)', 'refs/heads'), '');
@@ -194,6 +297,95 @@ test('one push waits for every protected destination before any ref is sent', { 
   const result = await child.finished; assert.equal(result.code, 0, result.stderr);
   assert.equal(await f.bare('rev-parse', 'main'), f.baseHead); assert.equal(await f.bare('rev-parse', 'master'), f.baseHead);
   assert.deepEqual(await f.oldCalls(), ['pre-push']); assert.deepEqual(await f.pending(), []);
+  assert.deepEqual([await f.held(first), await f.held(second)], [false, false]);
+});
+
+test('Stop at the last destination holds every pass in the push, so pushing only the first destination still asks', { timeout: 20000 }, async t => {
+  const f = await fixture(t); await f.setup('branch', 'master');
+  const child = f.start('push', 'origin', 'main', 'master');
+  const first = await f.ready(child); await f.release(first);
+  const second = await f.ready(child, 1); await f.release(second, { status: 'stopped', approve: true });
+  assert.notEqual((await child.finished).code, 0);
+  assert.equal(await f.bare('for-each-ref', '--format=%(refname)', 'refs/heads'), '');
+  assert.deepEqual([await f.held(first), await f.held(second)], [true, true], 'the destination that passed first is held too');
+  const [main, master] = first.snapshot.target.ref === 'refs/heads/main' ? [first, second] : [second, first];
+  const retry = f.start('push', 'origin', 'main'), asked = await f.ready(retry, 2);
+  assert.equal(asked.request.id, main.request.id); assert.equal(asked.held, true);
+  assert.equal(asked.request.more, undefined, 'as the only destination, it asks whether to continue');
+  await f.release(asked);
+  const result = await retry.finished; assert.equal(result.code, 0, result.stderr);
+  assert.equal(await f.bare('rev-parse', 'main'), f.baseHead); await assert.rejects(f.bare('rev-parse', '--verify', 'master'));
+  assert.deepEqual([await f.held(main), await f.held(master)], [false, true], 'master stays held until a push of it continues');
+});
+
+test('a retried push confirms its earlier destination only once the last one continues, so pushing that one alone meanwhile still asks', { timeout: 20000 }, async t => {
+  const f = await fixture(t); await f.setup('branch', 'master');
+  const child = f.start('push', 'origin', 'main', 'master');
+  const first = await f.ready(child); await f.release(first);
+  const second = await f.ready(child, 1); await f.release(second, { status: 'stopped', approve: true });
+  assert.notEqual((await child.finished).code, 0);
+  const again = f.start('push', 'origin', 'main', 'master');
+  const earlier = await f.ready(again, 2); assert.equal(earlier.request.id, first.request.id); assert.equal(earlier.request.more, true);
+  await f.release(earlier);
+  const last = await f.ready(again, 3); assert.equal(last.request.id, second.request.id);
+  assert.deepEqual([await f.held(first), await f.held(second)], [true, true], 'moving on past an earlier destination is no Continue');
+  const alone = f.start('push', 'origin', 'main'), asked = await f.ready(alone, 4);
+  assert.equal(asked.request.id, first.request.id); assert.equal(asked.held, true);
+  await f.release(asked, { status: 'stopped' }); assert.notEqual((await alone.finished).code, 0);
+  await assert.rejects(f.bare('rev-parse', '--verify', 'main'));
+  await f.release(last);
+  const result = await again.finished; assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual([await f.held(first), await f.held(second)], [false, false], 'Continue at the last destination releases the whole push');
+  assert.equal(await f.bare('rev-parse', 'main'), f.baseHead); assert.equal(await f.bare('rev-parse', 'master'), f.baseHead);
+});
+
+test('Git cancelled partway through a push holds what passed, and does not say only the choice is left', { timeout: 20000 }, async t => {
+  const f = await fixture(t); await f.setup('branch', 'master');
+  const child = f.start('push', 'origin', 'main', 'master');
+  const first = await f.ready(child); await f.release(first);
+  const second = await f.ready(child, 1);
+  process.kill(second.pid, 'SIGINT');
+  const result = await child.finished;
+  assert.notEqual(result.code, 0); await assert.rejects(f.bare('rev-parse', '--verify', 'main'));
+  assert.deepEqual([await f.held(first), await f.held(second)], [true, false]);
+  assert.doesNotMatch(result.stderr, /you passed/, 'the second destination still needs its questions');
+});
+
+test('a held pass that needed no questions is named that way in Git output', { timeout: 20000 }, async t => {
+  const f = await fixture(t), child = f.start('push', 'origin', 'main');
+  const checkpoint = await f.ready(child);
+  await publish(path.join(f.state, `${checkpoint.request.id}.reason`), JSON.stringify('Only renames a local variable.'));
+  await f.release(checkpoint, { status: 'stopped', approve: true });
+  assert.notEqual((await child.finished).code, 0);
+  const again = f.start('push', 'origin', 'main');
+  await f.release(await f.ready(again, 1));
+  const result = await again.finished; assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /Sphinx: refs\/heads\/main needed no questions earlier, but that push did not go through\.\n/);
+  assert.doesNotMatch(result.stderr, /you passed the understanding check/);
+});
+
+test('a push with a held destination and a new one still waits for answers, and says the check is complete', { timeout: 20000 }, async t => {
+  const f = await fixture(t); await f.setup('branch', 'master');
+  const child = f.start('push', 'origin', 'main'), main = await f.ready(child);
+  await f.release(main, { status: 'stopped', approve: true }); assert.notEqual((await child.finished).code, 0);
+  const both = f.start('push', 'origin', 'main', 'master');
+  await f.release(await f.ready(both, 1)); await f.release(await f.ready(both, 2));
+  const result = await both.finished; assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /Sphinx: you passed the understanding check for refs\/heads\/main earlier, but that push did not go through\.\nSphinx: understanding check needed for refs\/heads\/master \(small change\)\./);
+  assert.match(result.stderr, /Sphinx: Git is waiting for your answers in the local Sphinx questionnaire\. After you pass, confirm whether this push should continue\./, 'master still has questions');
+  assert.match(result.stderr, /\nSphinx: understanding check complete\. Continuing this Git operation\.\n/);
+  assert.equal(await f.held(main), false);
+});
+
+test('a destination that passed is held again when a later destination ends the push before Continue', { timeout: 20000 }, async t => {
+  const f = await fixture(t); await f.setup('branch', 'master');
+  const child = f.start('push', 'origin', 'main', 'master');
+  const first = await f.ready(child); await f.release(first);
+  // The second destination is cut short before any pass: nothing of it is held, but the first one is.
+  const second = await f.ready(child, 1); await f.release(second, { status: 'pending', approve: false });
+  const result = await child.finished;
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /understanding check is incomplete/);
+  assert.deepEqual([await f.held(first), await f.held(second)], [true, false]);
 });
 
 test('an existing hook rejection prevents the questionnaire and original push', { timeout: 15000 }, async t => {

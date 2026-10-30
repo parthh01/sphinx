@@ -9,7 +9,7 @@ test('curated eval fixtures exercise real immutable repos, Pi review, and all gr
   const report = await runEvaluation();
   assert.equal(report.status, 'passed');
   assert.equal(report.cases.length, 6);
-  assert.equal(report.usage.calls, 67, 'small and medium cases skip the separate audit by default');
+  assert.equal(report.usage.calls, 59, 'small and medium cases skip the separate audit by default');
   assert.equal(report.usage.responses.length, 0, 'Scripted transports make no network requests');
   assert.match(report.interpretation, /do not measure model quality/);
   for (const result of report.cases) {
@@ -280,7 +280,7 @@ test('diagnostic copies redact key echoes and omit opaque provider thinking', ()
   assert.match(text, /REDACTED_OPENROUTER_KEY/);
 });
 
-test('synthetic grade traces preserve rejected structured feedback without retaining credentials', async () => {
+test('synthetic grade traces preserve a rejected structured grade without retaining credentials', async () => {
   const fixture = CASES.find(item => item.id === 'auth');
   const report = await runEvaluation({ cases: [fixture], live: true, apiKey: 'TEST_GRADE_TRACE_KEY', maxCalls: 4, delayMs: 0, probes: 'generated',
     fetchImpl: async (_url, options) => {
@@ -290,7 +290,7 @@ test('synthetic grade traces preserve rejected structured feedback without retai
         finish_reason = 'tool_calls';
       } else {
         const data = JSON.parse(body.messages.at(-1).content.split('\n').at(-1));
-        const result = data.proposedQuestions ? { questions: data.proposedQuestions } : { questionValid: true, verdict: 'correct', feedback: null, evidence: fixture.canonical.evidence, followUp: null };
+        const result = data.proposedQuestions ? { questions: data.proposedQuestions } : { questionValid: true, verdict: 'excellent', feedback: null, evidence: fixture.canonical.evidence, followUp: null };
         message = { content: JSON.stringify(result) };
       }
       return new Response(JSON.stringify({ choices: [{ finish_reason, message }], usage: { cost: 0 } }));

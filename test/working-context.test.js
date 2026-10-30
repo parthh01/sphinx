@@ -48,6 +48,18 @@ test('curation sends only unseen filtered diffs, updates one context, and starts
   assert.match(prompts[2].prompt, /CURRENT CONTEXT \(DATA\): \{"overview":"","items":\[\]\}/, 'A rewrite starts from scratch');
 });
 
+test('a file named like a pathspec pattern or magic never pulls an excluded file into the curated diff', async t => {
+  const r = await repo(t);
+  const prompts = [];
+  const call = async ({ prompt }) => { prompts.push(prompt); return { overview: 'Odd names.', items: [] }; };
+  // As patterns, '*' and ':(glob)**' would match every changed path, .env included.
+  const head = await r.commit({ '*': 'star\n', ':(glob)**': 'magic\n', '.env': 'SECRET=hunter2\n' }, 'odd names');
+  assert.equal((await curateContext({ repoRoot: r.root, sourceRef: SOURCE, base: r.base, head, config: r.config, env: r.env, call })).status, 'updated');
+  assert.match(prompts[0], /\+star/);
+  assert.match(prompts[0], /\+magic/);
+  assert.doesNotMatch(prompts[0], /hunter2|\.env/, 'Ignored credential files are never sent');
+});
+
 test('the brief withholds items whose files changed after curation, and curation can be turned off', async t => {
   const r = await repo(t);
   const head = await r.commit({ 'worker.js': 'retry(job);\n', 'retry.js': 'export const retry = f => f();\n' }, 'add retry');

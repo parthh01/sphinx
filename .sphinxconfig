@@ -2,7 +2,7 @@
   "version": 1,
   "enabled": true,
   "events": ["pre-push"],
-  "branches": ["main"],
+  "branches": ["*"],
   "remotes": ["*"],
   "level": "standard",
   "mode": "block",

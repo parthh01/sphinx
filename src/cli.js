@@ -401,7 +401,7 @@ function printSession(session, terminal = ui()) {
     terminal.blank(); terminal.success('Understanding check complete.');
     terminal.paragraph(process.env.SPHINX_WAITING_GIT === '1'
       ? "Approval saved. Return to the original Git output for the operation's result."
-      : 'Approval saved for this exact change and destination. A waiting Git operation can now continue.');
+      : 'Approval saved for this exact change and destination. A waiting push or commit goes through once you choose Continue in its questionnaire.');
     return;
   }
   terminal.blank(); terminal.note(`${session.route.tier} change · ${routeText(session.route)} · ${modelUsageText(session.usage, session.tokens)}`);
@@ -431,7 +431,8 @@ async function checkCommand(values) {
     json(await start()); return 0;
   }
   const controller = new AbortController(), { signal } = controller;
-  const waitingGit = process.env.SPHINX_WAITING_GIT === '1';
+  // More checks may follow in the same push; only the last one asks whether to continue.
+  const waitingGit = process.env.SPHINX_WAITING_GIT === '1', more = waitingGit && process.env.SPHINX_MORE_CHECKS === '1';
   return withReadline(async ask => {
     const terminal = ui();
     if (values['retry-review']) {
@@ -442,7 +443,7 @@ async function checkCommand(values) {
         : `Starting a new review attempt with up to ${config.maxModelCalls} additional model calls, including grading. Previous usage remains counted.`);
     }
     return runTerminalCheck({
-      store, session: await store.read(session.id), config, ask, terminal, signal, waitingGit,
+      store, session: await store.read(session.id), config, ask, terminal, signal, waitingGit, more,
       choose: createPrompts({ ask, ui: terminal }).choose,
       validate: () => validateCheckpoint(session.snapshot, config),
       planProviders: await planProviders().catch(() => []),
@@ -649,7 +650,7 @@ export async function main(argv) {
       if (MODEL_FLAGS.some(key => !['max-model-calls', 'max-output-tokens'].includes(key) && values[key] !== undefined)) {
         terminal.success('Saved machine-wide evaluator settings.');
         terminal.rows(['small', 'medium', 'large'].map(tier => [tier[0].toUpperCase() + tier.slice(1), routeText(config.models[tier])]));
-        terminal.note('Changing evaluator routes applies to fresh checkpoints. Existing checkpoints remain bound to their original assessment policy.');
+        terminal.note('Changing evaluator routes applies to reviews that start from now on, including retries. Checks that already have questions keep their route, questions, and progress.');
       }
       terminal.note(result.path);
       if (policyHash(current) !== policyHash(config)) terminal.note('Checks started under the previous settings no longer apply. A Git operation waiting on one stops within a few seconds; run it again to start a fresh check.');
@@ -693,7 +694,7 @@ export async function main(argv) {
     const { repo, config } = await repoConfig(), existing = await store.read(id);
     if (existing.snapshot.repoRoot !== repo.root) throw new Error('This checkpoint belongs to a different repository.');
     const learn = command === 'explain', dispute = command === 'dispute';
-    const result = await withProgress(learn ? 'Preparing an explanation and new scenario' : dispute ? 'Reviewing the question' : 'Checking your reasoning', () => store.answer(id, learn ? 'I do not know. Explain this concept and give me a different scenario to apply it to.' : values.text, config, { learn, dispute }), { enabled: !values.json });
+    const result = await withProgress(learn ? 'Preparing an explanation' : dispute ? 'Reviewing the question' : 'Checking your reasoning', () => store.answer(id, learn ? 'I do not know. Explain this concept and give me a different scenario to apply it to.' : values.text, config, { learn, dispute }), { enabled: !values.json });
     if (values.json) json(result); else printSession(result); return 0;
   }
 }

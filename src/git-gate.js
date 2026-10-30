@@ -66,6 +66,9 @@ export async function runGitGate({ event, args = [], input = '', cwd = process.c
     return 0;
   }
   const store = providedStore ?? createSessionStore({ env, validate });
+  const retry = event === 'pre-commit' ? 'git commit' : 'git push', op = event === 'pre-commit' ? 'commit' : 'push';
+  // A coding agent reads this output; it must not take a saved pass as leave to retry.
+  const cutShort = `Sphinx: you passed, but this ${op} stopped before you chose to continue, so it did not go through. Your pass is saved; the next ${op} of this change asks only whether to continue. A coding agent must not retry it unless you ask.`;
   const pending = [];
   for (const snapshot of snapshots) {
     signal?.throwIfAborted();
@@ -73,8 +76,11 @@ export async function runGitGate({ event, args = [], input = '', cwd = process.c
     const session = await store.ensure(snapshot, config);
     if (await store.passTrivial?.(session.id, config, snapshot)) { output(`Sphinx: documentation-only change to ${snapshot.target.ref}; no questions needed.`); continue; }
     pending.push({ snapshot, session });
-    output(`Sphinx: understanding check needed for ${snapshot.target.ref} (${session.route.tier} change).`);
+    // A held pass is queued like any check; its questionnaire asks only whether to continue.
+    output(session.held ? `Sphinx: ${session.noQuestionReason ? `${snapshot.target.ref} needed no questions` : `you passed the understanding check for ${snapshot.target.ref}`} earlier, but that ${op} did not go through.`
+      : `Sphinx: understanding check needed for ${snapshot.target.ref} (${session.route.tier} change).`);
   }
+  const held = pending.length && pending.every(({ session }) => session.held);
 
   const requests = [], skipped = new Set();
   const browser = present ? null : createBrowserInterview({ env, signal, output });
@@ -83,8 +89,7 @@ export async function runGitGate({ event, args = [], input = '', cwd = process.c
   // blocked on a questionnaire that can no longer approve this operation.
   const watcher = new AbortController();
   const waitSignal = signal ? AbortSignal.any([signal, watcher.signal]) : watcher.signal;
-  const retry = event === 'pre-commit' ? 'git commit' : 'git push';
-  let checking = false, watch;
+  let checking = false, watch, continued = false, cancelled = false;
   const discarded = () => watcher.signal.aborted && !signal?.aborted;
   try {
     // These requests belong to the waiting hook, not a post-tool callback.
@@ -96,7 +101,9 @@ export async function runGitGate({ event, args = [], input = '', cwd = process.c
       const old = await listRequests({ cwd: request.repoRoot, host: request.host, hostSession: request.hostSession, env });
       for (const previous of old.filter(item => item.id === request.id)) await claim(previous, { env });
     }
-    if (requests.length) output('Sphinx: Git is waiting for your answers in the local Sphinx questionnaire. It will continue automatically after you pass. Do not start another copy of this Git operation.');
+    if (requests.length) output(held
+      ? `Sphinx: Git is waiting for you to choose in the local Sphinx questionnaire whether this ${op} should continue. Do not start another copy of this ${op}.`
+      : `Sphinx: Git is waiting for your answers in the local Sphinx questionnaire. After you pass, confirm whether this ${op} should continue. Do not start another copy of this ${op}.`);
     const interviewEnv = interviewEnvironment(cwd, env);
     if (requests.length) watch = setInterval(async () => {
       if (checking || watcher.signal.aborted) return;
@@ -114,13 +121,16 @@ export async function runGitGate({ event, args = [], input = '', cwd = process.c
       } catch {} // A transient read failure is retried on the next tick; the final validation still applies.
       finally { checking = false; }
     }, watchMs);
+    const passed = [];
     for (let index = 0; index < requests.length; index++) {
       signal?.throwIfAborted();
+      // A push to several destinations asks whether to continue once, after the last one passes.
+      const request = index < requests.length - 1 ? { ...requests[index], more: true } : requests[index];
       // Headless sessions (or interface: terminal) ask in the terminal first; the browser is the fallback.
       let result;
       try {
-        result = !present && prefersTerminal(config, { env }) ? await askInTerminal({ request: requests[index], env: interviewEnv, signal: waitSignal, cwd }) : null;
-        if (!result || result.status === 'unavailable') result = await (present || browser.present)({ request: requests[index], env: interviewEnv, signal: waitSignal });
+        result = !present && prefersTerminal(config, { env }) ? await askInTerminal({ request, env: interviewEnv, signal: waitSignal, cwd }) : null;
+        if (!result || result.status === 'unavailable') result = await (present || browser.present)({ request, env: interviewEnv, signal: waitSignal });
       } catch (error) { if (!discarded()) throw error; }
       if (discarded()) { output(`Sphinx: ${watcher.signal.reason.message}`); return 1; }
       signal?.throwIfAborted();
@@ -135,11 +145,22 @@ export async function runGitGate({ event, args = [], input = '', cwd = process.c
         return 1;
       }
       if (result?.status === 'skipped') { skipped.add(requests[index].id); output('Sphinx: understanding check skipped for this push and logged.'); continue; }
-      if (result?.status !== 'passed') {
-        output('Sphinx: the understanding check is incomplete, cancelled, or timed out. This Git operation was stopped; progress is saved.');
+      // A coding agent reads this output. Every pass in the push stays held (see finally).
+      if (result?.status === 'stopped') {
+        output(`Sphinx: you stopped this ${op} after passing, so it did not go through. Your pass is saved; the next ${op} of this change asks only whether to continue. A coding agent must not retry it unless you ask.`);
         return 1;
       }
+      if (result?.status !== 'passed') {
+        // approved() refuses a held pass; hold() reports any saved pass, held or not.
+        output(await store.hold?.(requests[index].id, config).catch(() => false) ? cutShort
+          : 'Sphinx: the understanding check is incomplete, cancelled, or timed out. This Git operation was stopped; progress is saved.');
+        return 1;
+      }
+      passed.push(requests[index].id);
     }
+    // Only the last destination asks, so the loop ends only through its Continue. Until
+    // then every pass stays held, so pushing an earlier destination alone still asks.
+    for (const id of passed) await store.confirm?.(id, config);
 
     // The interview result is only a wake-up signal. Every original destination
     // needs a current receipt, including snapshots approved before the wait.
@@ -152,8 +173,9 @@ export async function runGitGate({ event, args = [], input = '', cwd = process.c
       }
     }
     signal?.throwIfAborted();
-    // Skipped checks already reported themselves; only a pass is a completed check.
-    if (requests.length > skipped.size) output('Sphinx: understanding check complete. Continuing this Git operation.');
+    continued = true;
+    // Skipped checks already reported themselves; only a pass is a completed check, and a held one was completed before.
+    if (requests.length > skipped.size) output(held ? 'Sphinx: continuing this Git operation.' : 'Sphinx: understanding check complete. Continuing this Git operation.');
     // GitHub stamps run detached after Git continues; they can never fail this push.
     for (const snapshot of snapshots) {
       try {
@@ -163,8 +185,16 @@ export async function runGitGate({ event, args = [], input = '', cwd = process.c
     }
     await finished();
     return 0;
-  } finally {
+  } catch (error) { cancelled = !!signal?.aborted; throw error; } finally {
     clearInterval(watch);
+    // A pass made while Git waited is not a choice to continue. Presenters save it
+    // held; this also covers one made elsewhere. Stopped, timed out, cancelled, or
+    // discarded before Git continued, every pass among these requests (all
+    // destinations) is held, so the next push or commit of it asks again.
+    const kept = [];
+    if (!continued) for (const request of requests) kept.push(await store.hold?.(request.id, config).catch(() => false));
+    // Cancelled (Ctrl+C, or the host ending a shell that timed out) with every pass saved: say what Stop and the deadline say.
+    if (cancelled && kept.length && kept.every(Boolean)) output(cutShort);
     // A paused or cancelled batch must not reopen from an after-tool callback.
     for (const request of requests) await claim(request, { env });
     await browser?.close();

@@ -228,16 +228,20 @@ test('lowering the ceiling during review preserves the final call reserved for g
   assert.equal(await f.store.approved(snapshot, f.config), false);
 });
 
-test('other assessment or privacy changes still invalidate the legacy checkpoint', async t => {
+test('other assessment or privacy changes still invalidate the legacy checkpoint; reviewer and spending changes keep it', async t => {
   const f = await fixture(t);
   const before = await f.seed();
   await f.setGlobal({ maxModelCalls: 20 });
-  for (const patch of [{ level: 'thorough' }, { exclude: ['private/**'] }, { model: 'another-model' }, { allowPaid: true }]) {
+  for (const patch of [{ level: 'thorough' }, { exclude: ['private/**'] }]) {
     const changed = { ...f.config, maxModelCalls: 20, ...patch };
     await assert.rejects(f.store.refreshBudget(snapshot.id, changed), /settings changed/);
     await assert.rejects(f.store.start(snapshot.id, changed), /settings changed/);
     assert.deepEqual(await f.store.read(snapshot.id), before);
     assert.equal(await f.store.approved(snapshot, changed), false);
+  }
+  // A reviewer route or spending change is not an assessment change.
+  for (const patch of [{ model: 'another-model' }, { allowPaid: true }]) {
+    assert.equal((await f.store.refreshBudget(snapshot.id, { ...f.config, maxModelCalls: 20, ...patch })).id, before.id);
   }
   assert.deepEqual(f.invoked, { generate: 0, grade: 0 });
 });

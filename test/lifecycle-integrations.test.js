@@ -12,9 +12,10 @@ test('Cursor SessionStart uses documented context/env fields and never installs 
   assert.match(output.additional_context, /browser/);
   assert.match(output.additional_context, /Never run the interview/);
   assert.match(output.additional_context, /keeps the original Git operation waiting/);
-  assert.match(output.additional_context, /that same operation continues automatically/);
+  assert.match(output.additional_context, /they confirm whether that same operation should continue/);
   assert.match(output.additional_context, /handles fallback requests only/);
   assert.match(output.additional_context, /verify that the original Git operation has exited with a Sphinx blocking failure before retrying/);
+  assert.match(output.additional_context, /If the human passes and then stops the push or commit, or Git stops waiting before they choose, do not retry it unless they ask\. Stopping is their decision; a retry reopens the questionnaire and interrupts them with the same choice\./);
   assert.match(output.additional_context, /waits up to 25 minutes, but the host may cancel the shell sooner/);
   assert.match(output.additional_context, /supported yielding or background execution; do not terminate or duplicate/);
   assert.deepEqual(await cursorAgentHook({ input: { hook_event_name: 'sessionStart' }, env: { SPHINX_EVALUATOR: '1' } }), {});

@@ -7,8 +7,10 @@ import { modelUsageText } from './usage.js';
 
 const LEARN_REQUEST = 'I do not know. Explain this concept and give me a different scenario to apply it to.';
 const ACTIONS = ['answer', 'learn', 'dispute', 'pause'];
+// Failures that sending the same response again cannot change.
+const SETUP_FAILURES = ['CONTEXT_LIMIT', 'INVALID_CONFIG', 'INVALID_SNAPSHOT', 'INVALID_REVIEW'];
 
-function formFor(state, notice, repoRoot, draft) {
+function formFor(state, notice, repoRoot, draft, action) {
   const question = state.question;
   const lines = [
     `Sphinx: ${state.progress.completed + 1} of ${state.progress.total} concepts`,
@@ -26,7 +28,7 @@ function formFor(state, notice, repoRoot, draft) {
     requestedSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', title: 'Action', enum: ACTIONS, default: draft?.kind ?? 'answer' },
+        action: { type: 'string', title: 'Action', enum: ACTIONS, default: action ?? draft?.kind ?? 'answer' },
         response: { type: 'string', title: 'Your answer or dispute reason', description: 'Required for answer and dispute. Leave blank for learn or pause.', maxLength: 8000, ...(draft ? { default: draft.text } : {}) },
       },
       required: ['action'],
@@ -116,19 +118,19 @@ export async function runNativeCheckpoint({
       if (reservation?.status !== 'claimed') return summary('busy', checkpoints);
       state = await store.start(request.id, config, { signal });
       signal?.throwIfAborted();
-      let notice;
-      let invalidResponses = 0;
+      let notice, retryAction;
+      let invalidResponses = 0, gradingFailures = 0;
       while (state.status !== 'passed') {
         if (!state.question?.id) throw new Error('The assessment has no current question.');
         const expectedQuestionId = state.question.id;
-        const response = formResponse(await elicit(formFor(state, notice, session.snapshot.repoRoot, savedDraft(await store.read(request.id)))));
+        const response = formResponse(await elicit(formFor(state, notice, session.snapshot.repoRoot, savedDraft(await store.read(request.id)), retryAction)));
         signal?.throwIfAborted();
         if (response.invalid) {
           if (++invalidResponses >= 3) throw new Error('The form did not contain a valid response.');
           notice = 'Choose an action and enter an answer or dispute reason, up to 8,000 characters. No answer was submitted.';
           continue;
         }
-        notice = undefined;
+        notice = retryAction = undefined;
         invalidResponses = 0;
         if (response.action === 'pause') {
           checkpoints.push(checkpointSummary(request.id, state, 'pending'));
@@ -138,9 +140,29 @@ export async function runNativeCheckpoint({
         const current = await store.read(request.id);
         if (current.questions[current.index]?.id !== expectedQuestionId && current.status !== 'passed') throw new Error('The question changed.');
         await validate(current.snapshot, config);
-        state = await store.answer(request.id, response.action === 'learn' ? LEARN_REQUEST : response.response, config, {
-          expectedQuestionId, signal, learn: response.action === 'learn', dispute: response.action === 'dispute',
-        });
+        try {
+          state = await store.answer(request.id, response.action === 'learn' ? LEARN_REQUEST : response.response, config, {
+            expectedQuestionId, signal, learn: response.action === 'learn', dispute: response.action === 'dispute',
+          });
+        } catch (error) {
+          // Like the browser and terminal, an ungraded response keeps the question open. Cancellation, a stale question,
+          // a failure a resend cannot change, a code or policy change, a spent call allowance, or a third failure in a row
+          // still ends the dialog.
+          if (signal?.aborted || ['SPHINX_STALE_QUESTION', ...SETUP_FAILURES].includes(error?.code) || ++gradingFailures >= 3) throw error;
+          await validate(current.snapshot, config);
+          // Reload, so the next form and a pause count the calls the failed attempt used.
+          const saved = await store.read(request.id);
+          state = store.public(saved);
+          if (state.usage.limit !== null && state.usage.calls >= state.usage.limit) throw error;
+          // Promise a kept draft only when the store saved this response; an explanation request saves none.
+          const draft = savedDraft(saved);
+          if (response.action === 'learn') { notice = 'The explanation was not shown, and nothing was marked complete. Choose learn to ask again, or choose pause.'; retryAction = 'learn'; }
+          else notice = draft?.kind === response.action && draft.text === response.response
+            ? 'That response was not graded, and nothing was marked complete. Your draft is kept: send it again, or choose pause.'
+            : 'That response was not graded or saved, and nothing was marked complete. Enter it again, or choose pause.';
+          continue;
+        }
+        gradingFailures = 0;
         signal?.throwIfAborted();
       }
       // A receipt is reported only while its exact source and current policy still match.

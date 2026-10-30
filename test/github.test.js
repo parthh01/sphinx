@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, githubRepository, runStampJob, scheduleStamp, statusFor } from '../src/github.js';
+import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, githubRepository, runStampJob, scheduleStamp, statusFor, workflowTemplate } from '../src/github.js';
 import { DEFAULT_CONFIG, policyHash, validateConfig, validateRepositoryConfig } from '../src/config.js';
 
 const snapshot = { event: 'pre-push', repoRoot: '/repo', head: 'b'.repeat(40), base: 'a'.repeat(40), stats: { files: 2, additions: 10, deletions: 1 }, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/feature' } };
@@ -151,4 +151,12 @@ test('a repository running the Sphinx Action gets the comment instead of a commi
   calls.length = 0;
   await scheduleStamp({ snapshot: { ...snapshot, repoRoot }, session, outcome: 'passed', config: config({}), env, spawnImpl: fakeSpawn(calls), post: false });
   assert.equal(calls.length, 0, 'turning the toggle off posts nothing');
+});
+
+test('the workflow template pins the Action to the release tag, never runs pull request code, and lets a started run finish', () => {
+  const text = workflowTemplate('1.2.3');
+  assert.match(text, /\n {6}- uses: parthh01\/sphinx\/action@v1\.2\.3\n/);
+  assert.match(text, /\npermissions:\n {2}checks: write\n {2}pull-requests: read\n {2}issues: read\n(?! )/);
+  assert.match(text, /\n {2}cancel-in-progress: false\n/, 'a comment must not cancel a run that has already started');
+  assert.doesNotMatch(text, /checkout|\brun:/, 'it never checks out or runs pull request code');
 });

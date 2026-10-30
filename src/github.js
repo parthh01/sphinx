@@ -160,7 +160,10 @@ permissions:
   issues: read
 concurrency:
   group: sphinx-\${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
+  # Runs for one PR take turns, and each reads the PR's current head and comments, so
+  # the last to run shows the current state. A comment, such as a bot's seconds after
+  # a PR opens, must not cancel a run that has already started.
+  cancel-in-progress: false
 jobs:
   stamp:
     if: github.event_name == 'pull_request_target' || github.event.issue.pull_request

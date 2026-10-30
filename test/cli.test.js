@@ -131,6 +131,7 @@ test('CLI blocks a push, conducts the learning loop, reuses completion, and reje
   assert.equal(passed.status, 'passed');
   assert.equal(passed.progress.completed, 1);
   assert.equal(Object.hasOwn(passed, 'question'), false);
+  assert.match(f.cli('answer', first.id, '--text', 'Again.'), /Approval saved for this exact change and destination\. A waiting push or commit\s+goes through once you choose Continue in its questionnaire\./);
   const sessionPath = path.join(f.env.SPHINX_HOME, 'sessions', `${first.id}.json`);
   assert.equal((await stat(sessionPath)).mode & 0o777, 0o600);
   f.git('push', 'origin', 'main');
@@ -289,6 +290,8 @@ test('interactive CLI stays open after review failure until the human pauses or 
   resumed.child.stdin.write('1\n');
   await resumed.waitFor('› ');
   resumed.child.stdin.write('No. The existing ID is rejected before insertion.\n');
+  await resumed.waitFor('continue / stop');
+  resumed.child.stdin.write('continue\n');
   assert.equal(await resumed.done, 0);
   assert.match(resumed.output(), /Understanding check complete/);
   const record = JSON.parse(await readFile(path.join(f.env.SPHINX_HOME, 'sessions', `${id}.json`), 'utf8'));
@@ -644,6 +647,40 @@ test('post-commit preparation investigates before push and the native gate reuse
   f.git('push', 'origin', 'main');
   assert.equal(f.git('ls-remote', 'origin', 'refs/heads/main').split('\t')[0], f.git('rev-parse', 'HEAD'));
   client.child.stdin.end();
+});
+
+test('a branch made from origin/main is prepared for its own first push, which git push -u origin HEAD reuses', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { background: true });
+  const curator = call => call.input.includes('You keep a brief orientation for a code reviewer');
+  const allCalls = f.calls;
+  f.calls = async () => (await allCalls()).filter(call => !curator(call) && call.argv[0] !== 'auth');
+  f.git('push', '-u', 'origin', 'main');
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  const configFile = path.join(f.env.SPHINX_HOME, 'config.json');
+  const config = JSON.parse(await readFile(configFile, 'utf8'));
+  config.preparationDebounceMs = 40; config.branches = ['*'];
+  await writeFile(configFile, JSON.stringify(config));
+  // What a coding agent does: branch from the remote's main, commit, then push the branch under its own name.
+  f.git('checkout', '-q', '-b', 'feature', '--track', 'origin/main');
+  await writeFile(path.join(f.repo, 'app.js'), `${f.app}\nexport const retryDelay = 50;\n`);
+  f.git('commit', '-qam', 'Expose retry delay');
+
+  let status;
+  const deadline = Date.now() + 15000;
+  do {
+    status = f.cliJson('status');
+    if (status.preparation?.status === 'failed') assert.fail(status.preparation.error);
+    if (status.preparation?.status === 'ready') break;
+    await delay(100);
+  } while (Date.now() < deadline);
+  assert.equal(status.preparation?.status, 'ready', JSON.stringify(status.preparation));
+  assert.deepEqual(status.pending.map(item => item.target), ['refs/heads/feature'], 'not the push to main that never happens');
+  const [prepared] = status.pending, reviewCalls = (await f.calls()).length;
+  const pushed = f.run('git', ['push', '-u', 'origin', 'HEAD']);
+  assert.notEqual(pushed.status, 0, 'Prepared questions never approve a push');
+  assert.match(pushed.stderr, /understanding check needed for refs\/heads\/feature/);
+  assert.deepEqual(f.cliJson('pending').map(item => item.id), [prepared.id], 'The push checkpoint found the prepared check');
+  assert.equal((await f.calls()).length, reviewCalls, 'No review call at push time');
 });
 
 test('without a call cap, --retry-review simply continues a failed review', { timeout: 30000 }, async t => {

@@ -17,7 +17,7 @@ const STARTUP_MS = 30000;
 const FORWARDED_ENV = ['PATH', 'HOME', 'SPHINX_USER_HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'PI_CODING_AGENT_DIR', 'OPENCODE_CONFIG_DIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'];
 const GIT_CONTEXT = ['GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR'];
 const gitContext = env => Object.fromEntries(GIT_CONTEXT.filter(key => typeof env[key] === 'string' && path.isAbsolute(env[key]) && !env[key].includes('\0')).map(key => [key, env[key]]));
-const withoutGitContext = env => Object.fromEntries(Object.entries(env).filter(([key]) => !GIT_CONTEXT.includes(key) && key !== 'GIT_CONFIG' && !key.startsWith('GIT_CONFIG_') && key !== 'SPHINX_WAITING_GIT'));
+const withoutGitContext = env => Object.fromEntries(Object.entries(env).filter(([key]) => !GIT_CONTEXT.includes(key) && key !== 'GIT_CONFIG' && !key.startsWith('GIT_CONFIG_') && !['SPHINX_WAITING_GIT', 'SPHINX_MORE_CHECKS'].includes(key)));
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 const live = pid => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } };
 const fileFor = (id, env) => {
@@ -208,9 +208,12 @@ export async function launchCheckpointTerminal({ request, env = process.env, pla
     signal?.throwIfAborted();
     const previous = await checkpointTerminalStatus({ id: request.id, env, isAlive });
     if (['starting', 'running'].includes(previous?.status)) return { status: 'already-open', id: request.id };
-    if (previous?.status === 'passed' && request.createdAt <= previous.finishedAt) return { status: 'passed', id: request.id };
+    // Another window's pass never answers whether this waiting push or commit continues
+    // (it may not have asked, as an earlier destination's does not): its own window asks.
+    const asks = request.delivery === 'hook' && !request.more;
+    if ((previous?.status === 'stopped' || (previous?.status === 'passed' && !asks)) && request.createdAt <= previous.finishedAt) return { status: previous.status, id: request.id };
     if (previous?.presentationToken === request.token) return { status: 'suppressed', id: request.id };
-    const record = { version: 1, id: request.id, token: randomUUID(), presentationToken: request.token, repoRoot: request.repoRoot, home, cliPath, kind: 'terminal', waitingGit: request.delivery === 'hook', status: 'starting', createdAt: Date.now(), updatedAt: Date.now() };
+    const record = { version: 1, id: request.id, token: randomUUID(), presentationToken: request.token, repoRoot: request.repoRoot, home, cliPath, kind: 'terminal', waitingGit: request.delivery === 'hook', ...(request.more ? { more: true } : {}), status: 'starting', createdAt: Date.now(), updatedAt: Date.now() };
     await writeJson(file, record);
     let bridge;
     let started = false;
@@ -283,7 +286,7 @@ export async function runCheckpointTerminal({ recordFile, token, env = process.e
   let childWrite = Promise.resolve();
   const code = await new Promise(resolve => {
     let child;
-    try { child = spawnImpl(process.execPath, [record.cliPath, 'check', '--id', id], { cwd: record.repoRoot, env: { ...withoutGitContext(env), ...providerEnv, SPHINX_HOME: home, ...(record.waitingGit ? { SPHINX_WAITING_GIT: '1' } : {}) }, stdio: 'inherit' }); }
+    try { child = spawnImpl(process.execPath, [record.cliPath, 'check', '--id', id], { cwd: record.repoRoot, env: { ...withoutGitContext(env), ...providerEnv, SPHINX_HOME: home, ...(record.waitingGit ? { SPHINX_WAITING_GIT: '1', ...(record.more ? { SPHINX_MORE_CHECKS: '1' } : {}) } : {}) }, stdio: 'inherit' }); }
     catch { resolve(1); return; }
     child.once('error', () => resolve(1));
     child.once('exit', code => resolve(code ?? 1));
@@ -292,7 +295,7 @@ export async function runCheckpointTerminal({ recordFile, token, env = process.e
     if (Number.isInteger(child.pid)) { running.childPid = child.pid; childWrite = writeJson(recordFile, running).catch(() => {}); }
   });
   await childWrite;
-  const result = { ...running, status: code === 0 ? 'passed' : code === 3 ? 'skipped' : 'pending', updatedAt: Date.now(), finishedAt: Date.now() };
+  const result = { ...running, status: code === 0 ? 'passed' : code === 3 ? 'skipped' : code === 4 ? 'stopped' : 'pending', updatedAt: Date.now(), finishedAt: Date.now() };
   if ((await readJson(recordFile, null))?.token === token) await writeJson(recordFile, result);
   // Recorded first, so a waiting Git operation is not held by this prompt.
   if (result.status === 'pending' && isTTY) await pause();

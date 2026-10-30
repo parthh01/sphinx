@@ -350,6 +350,22 @@ test('truncated, refused, malformed, and provider-error responses never pass', a
   }
 });
 
+test('a BOM or one ```json fence parses as on the CLI routes, while prose around the JSON is still rejected', async () => {
+  const json = JSON.stringify(result), fenced = '```json\n' + json + '\n```';
+  for (const content of [fenced, '```\n' + json + '\n```', '\uFEFF' + json, '\uFEFF' + fenced + '\n']) {
+    assert.deepEqual(await callOpenRouter({ ...defaults, fetchImpl: async () => success(content) }), result);
+  }
+  for (const content of ['Here is the assessment:\n' + fenced, fenced + '\nLet me know if you need more.', 'Assessment: ' + json]) {
+    let calls = 0;
+    await assert.rejects(callOpenRouter({ ...defaults, fetchImpl: async () => { calls++; return success(content); } }), error => {
+      assert.match(error.message, /malformed assessment JSON/);
+      assert.equal(error.code, 'INVALID_REVIEW_ACTION');
+      return true;
+    });
+    assert.equal(calls, 1);
+  }
+});
+
 test('output-limit errors identify the actual budget and safe usage counts without accepting partial JSON', async () => {
   let calls = 0;
   await assert.rejects(callOpenRouter({ ...defaults, config: { ...defaults.config, allowPaid: true, model: 'deepseek/deepseek-v3.2', maxOutputTokens: 2500 }, fetchImpl: async () => {

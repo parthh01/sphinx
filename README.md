@@ -9,7 +9,7 @@
 <p align="center"><b>Works with</b> Claude Code · Codex · Cursor · OpenCode · Pi · or a plain <code>git push</code><br>
 <b>Reviews run on</b> your Claude Code or Codex plan · OpenRouter · any OpenAI-compatible endpoint</p>
 
-Sphinx adds an understanding check to agent-assisted development. When you push to a protected branch, Git waits while Sphinx asks you to predict what your change will do. If you miss something, it explains and gives you a new scenario to try. Once you pass, the same push continues. This works whether you or a coding agent ran `git push`.
+Sphinx adds an understanding check to agent-assisted development. When you push to a protected branch, Git waits while Sphinx asks you to predict what your change will do. If you miss something, it explains and gives you another try, usually with a new scenario. Once you pass, the same push continues. This works whether you or a coding agent ran `git push`.
 
 The questions come from a separate reviewer model. It reads the committed change through read-only Git tools and does not see the conversation that produced the code.
 
@@ -112,12 +112,12 @@ Git prints the questionnaire address and waits:
 
 ```text
 Sphinx: understanding check needed for refs/heads/main (medium change).
-Sphinx: Git is waiting for your answers in the local Sphinx questionnaire. It will continue automatically after you pass. Do not start another copy of this Git operation.
+Sphinx: Git is waiting for your answers in the local Sphinx questionnaire. After you pass, confirm whether this push should continue. Do not start another copy of this push.
 Sphinx questionnaire: http://127.0.0.1:56114/fSdZM7yg…
 Sphinx: questionnaire opened in a background browser tab. Your coding window stays in place.
 ```
 
-On macOS, the page opens in a background browser tab. On Linux, WSL, and over SSH, Git prints `open the local URL above to answer` instead, so open the printed address yourself. From a remote session, forward the same port and open the URL unchanged, or run `sphinx check`; see [remote machines](docs/integrations.md#remote-machines-ssh-and-ci). Questions can take a moment while the reviewer reads the change, and the page shows its progress as it works. Beside each question, the page shows the checkpoint's changed files, lines added and removed, a browsable diff, and the code locations the reviewer read for that question. Answer each question with a prediction and a short reason. When you pass:
+On macOS, the page opens in a background browser tab. On Linux, WSL, and over SSH, Git prints `open the local URL above` instead, so open the printed address yourself. From a remote session, forward the same port and open the URL unchanged, or run `sphinx check`; see [remote machines](docs/integrations.md#remote-machines-ssh-and-ci). Questions can take a moment while the reviewer reads the change, and the page shows its progress as it works. Beside each question, the page shows the checkpoint's changed files, lines added and removed, a browsable diff, and the code locations the reviewer read for that question. Answer each question with a prediction and a short reason. When you pass, or the reviewer finds nothing to ask, choose **Continue push** or **Stop push**. Continue lets the same push go through:
 
 ```text
 Sphinx: understanding check complete. Continuing this Git operation.
@@ -125,19 +125,20 @@ To github.com:you/your-repo.git
  * [new branch]      main -> main
 ```
 
-Pushing the same change again does not ask again. A pass lasts 24 hours, unless the code, destination, or policy changes.
+**Stop push** ends this push without sending it. Your pass is saved, so pushing the same change again asks only whether to continue, with no new questions. The same happens if Git stops waiting before you choose. A pass lasts 24 hours, unless the code, destination, or policy changes.
 
 ## During and after a check
 
-- **Wrong answer.** You get an explanation and a new scenario about the same concept. Disputes and errors never count as passing.
-- **Explain this.** Shows the concept and asks you a new question.
+- **Wrong answer.** You get an explanation and a new scenario about the same concept. If the grader can't supply a usable new scenario, you answer the same question again. Disputes and errors never count as passing.
+- **Explain this.** Shows the concept and asks you a new question, or the same one again if no usable new scenario comes back.
 - **Dispute question.** Use this if a question's premise is wrong or ambiguous. A bad question must be corrected before that concept can pass.
-- **Pause check.** Saves your progress and stops the push. Run the same `git push` later to pick up where you left off.
+- **Stop push.** Stops the waiting push at any point before you pass: it does not go through, and your progress is saved. Run the same `git push` later to pick up where you left off. For a commit it reads **Stop commit**; with no Git operation waiting, **Pause check**.
+- **Continue or stop.** After you pass, or when no questions are needed, Git still waits for your choice. **Continue push** lets it go through. **Stop push** ends it with your pass saved, so pushing the same change again asks only whether to continue, unless the code, destination, or policy changed.
 - **Closing the tab** doesn't stop anything. Git keeps waiting, and the same address works until the 25-minute deadline.
 - **Skip this time.** Lets the push through immediately, even while the review is still running. Skips never count as passing.
 - **`sphinx yolo`** turns checks off for the current repository, or globally when run outside one. Run it again to turn checks back on. A repository's own setting wins over the global one, so turning yolo off inside a repository keeps checks on there even while global yolo is on. `--reason "prod hotfix"` is optional.
 - **`sphinx check`** runs the same check in your terminal instead of the browser.
-- **Headless or terminal-first.** Over SSH, or anywhere Sphinx can't open the browser in the background, the questions appear right in the terminal where you ran `git push`. Type `/hint`, `/learn`, `/dispute <reason>`, `/skip`, or `/quit` there. To always use the terminal, run `sphinx config --interface terminal`; to always use the browser, use `--interface browser`.
+- **Headless or terminal-first.** Over SSH, or anywhere Sphinx can't open the browser in the background, the questions appear right in the terminal where you ran `git push`. Type `/hint`, `/learn`, `/dispute <reason>`, `/skip`, or `/stop` (`/quit` also works) there, and `continue` or `stop` after you pass. To always use the terminal, run `sphinx config --interface terminal`; to always use the browser, use `--interface browser`.
 - **On GitHub.** With the GitHub CLI (`gh`) signed in, a pass stamps the pushed commit. For a push to a pull request branch, the questionnaire offers "Post the Sphinx stamp to the pull request": a comment summarising the questions and first-try results. Add the Sphinx Action to a repository (`sphinx init --github-check`) and its pull requests show a **Sphinx** check: stamped with that summary, or neutral until the author passes. None of this ever blocks a push. See [GitHub stamps and the Sphinx check](docs/configuration.md#github-commit-status-and-pull-requests).
 - **Keep the questions.** After you pass, Sphinx saves those questions locally. `sphinx drill` poses due cards later: you answer, see the stored explanation, and mark **again** (due tomorrow) or **good** (1, 3, 7, 14, then 30 days). This does not call a model and does not block Git. `sphinx status` shows how many cards are due.
 
@@ -298,7 +299,7 @@ These live in `config.json`, and most can be set with `sphinx config`:
 | `allowPaid` | `--allow-paid` | Lets OpenRouter use paid models |
 | `cliBilling` | `--cli-billing` | `plan` (default) bills your Claude or Codex plan; `api` lets those CLIs use API keys |
 | `github` | edit the file | `status` (default on): mark pushed commits on GitHub. `comment`: keep a summary comment on the pull request. `answers`: include your answers in it. Needs a signed-in `gh` CLI and never blocks a push |
-| `audit` | edit the file | `large` (default): a second, independent model call checks the questions only for large changes, so small and medium checks are ready sooner. `all`: audit every change, slower but more thorough |
+| `audit` | edit the file | `large` (default): a second, independent model call checks the questions, and the new scenario after a wrong answer or explanation, only for large changes, so small and medium checks are ready sooner. `all`: audit every change, slower but more thorough |
 | `receiptHours` | edit the file | How long a pass stays valid for the same change (default 24) |
 
 `sphinx yolo` turns checks off and on again for the current repository, or globally when run outside one. The full reference, including routing thresholds and pricing, is in [configuration and cost](docs/configuration.md).

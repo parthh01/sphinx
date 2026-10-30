@@ -64,9 +64,9 @@ Each client controls how its own forms and dialogs look, and may keep its own in
 
 ## How a checkpoint reaches you
 
-1. **Browser (normal).** The blocked Git hook serves a questionnaire on `127.0.0.1` and prints its URL. On macOS it opens in a background browser tab without activating Terminal or moving your coding window; elsewhere, open the printed URL. One page handles every checkpoint in a Git operation. Git continues when you pass.
+1. **Browser (normal).** The blocked Git hook serves a questionnaire on `127.0.0.1` and prints its URL. On macOS it opens in a background browser tab without activating Terminal or moving your coding window; elsewhere, open the printed URL. One page handles every checkpoint in a Git operation. Git continues when you pass and choose Continue.
 2. **Native fallback.** If the browser page cannot be presented, Git stops and the check is queued. Codex and Claude Code show an MCP form after the shell command exits; Pi shows extension dialogs; Cursor and OpenCode point you to the browser page. Because Git has already exited, passing a fallback check does not resume it; run the Git command again once.
-3. **Terminal.** `sphinx check` runs the same check in your terminal at any time. It supports `/learn`, `/dispute <reason>`, and `/quit` (save and leave pending).
+3. **Terminal.** `sphinx check` runs the same check in your terminal at any time. It supports `/learn`, `/dispute <reason>`, and `/quit` (save and leave pending). When Git asks in its own terminal while it waits, `/stop` (or `/quit`) stops the operation, and after a pass you type `continue` or `stop`.
 
 All three share one assessment per change. **Your answers go directly to Sphinx; the coding model never sees questions, answers, or feedback.** It receives only status, assessment IDs, progress, and usage counts. It does not start the interview or relay answers, and there is no extra coding-model turn per answer. A paused or dismissed check does not reopen on unrelated shell commands; retrying the blocked Git command queues it again. The integration follows checks across `cd` and `git -C`.
 
@@ -115,10 +115,11 @@ These are for a person or a test harness. A coding agent must not answer on your
 | --- | --- |
 | Git is waiting and no page opened | Open the `Sphinx questionnaire:` URL that Git printed. |
 | You closed the tab | Git keeps waiting. Reopen the same URL until the 25-minute deadline. |
-| You paused, the deadline passed, or the host cancelled the shell | Progress is saved. Run the Git command once more, or `sphinx check` first. |
+| You chose Stop push (or Pause check), the deadline passed, or the host cancelled the shell | Progress is saved. Run the Git command once more, or `sphinx check` first. |
+| You passed and chose Stop push, or Git stopped waiting before you chose | The push or commit did not go through. Your pass is saved, so running the same Git command again asks only whether to continue, with no new questions. |
 | A native form was cancelled or never appeared | Run `sphinx check` in a terminal. In Codex, see the approval policy note above. |
 | The review failed before questions appeared | The page offers to continue from saved work. From a terminal: `sphinx check --id <id>`, or `--retry-review` for a failed, questionless review. See [limits](configuration.md#model-calls-tokens-and-limits). |
-| The check keeps coming back after you passed | Something changed: code, destination base, policy, ignore rules, context, or reviewer route. Completion also expires after 24 hours. |
+| The check keeps coming back after you passed | If it asks only Continue or Stop, the earlier push or commit stopped before you chose Continue; choose Continue to let it through. If it asks questions again, something changed: code, destination base, policy, ignore rules, or context. Completion also expires after 24 hours. |
 | Hooks do not run in one repository | `sphinx doctor`, then `sphinx install --repo` if it reports a hooks override. |
 | Missing remote history | `git fetch`, then push again. |
 

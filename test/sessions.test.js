@@ -154,6 +154,40 @@ test('policy changes and expired receipts require a new assessment',async t=>{
   assert.equal((await store.ensure(snapshot,config)).status,'pending');
 });
 
+test('lowering receiptHours also ends an earlier pass at the new lifetime',async t=>{
+  const {store,env,config}=await fixture(t);
+  const month={...config,receiptHours:720};
+  await store.ensure(snapshot,month);await store.start(snapshot.id,month);await store.answer(snapshot.id,'Yes.',month);
+  const record=await store.read(snapshot.id);record.passedAt=new Date(Date.now()-2*3600000).toISOString();
+  await writeJson(sessionFile(snapshot.id,env),record);
+  assert.equal(await store.approved(snapshot,month),true);
+  assert.equal(await store.approved(snapshot,{...config,receiptHours:3}),true);
+  assert.equal(await store.approved(snapshot,{...config,receiptHours:1}),false);
+  assert.equal((await store.ensure(snapshot,{...config,receiptHours:1})).status,'pending');
+});
+
+test('a check without questions takes the saved route when its review starts; a picked model and questions stay',async t=>{
+  const seen=[];let fail=true,resumed;
+  const {store,config}=await fixture(t,{generate:async(_s,c,options)=>{
+    seen.push(`${c.provider}:${c.model}`);resumed=await options.reviewerCheckpoint.load();
+    if(fail){await options.reviewerCheckpoint.save({version:1,snapshotId:snapshot.id,reads:['src/order.js']});throw new Error('Unavailable');}
+    return {questions:[q]};
+  }});
+  const models=model=>Object.fromEntries(['small','medium','large'].map(tier=>[tier,{provider:'claude',model}]));
+  await store.ensure(snapshot,config);
+  await assert.rejects(store.start(snapshot.id,config),/Unavailable/);
+  // Routes are not part of the policy: the failed check carries on under a newly saved default.
+  fail=false;
+  const moved=await store.start(snapshot.id,{...config,models:models('haiku')});
+  assert.deepEqual([moved.route.provider,moved.route.model],['claude','haiku']);
+  assert.equal(resumed,null,'investigation saved on the previous route is not resumed');
+  assert.equal((await store.start(snapshot.id,{...config,models:models('sonnet')})).route.model,'haiku','questions keep their route');
+  assert.deepEqual(seen,['openrouter:openrouter/free','claude:haiku']);
+  const picked={...snapshot,id:'c'.repeat(64)};
+  await store.ensure(picked,config);await store.switchRoute(picked.id,config,'codex');
+  assert.equal((await store.start(picked.id,{...config,models:models('haiku')})).route.provider,'codex','a model picked for the check stays');
+});
+
 test('stale snapshots fail before generation and again before recording completion',async t=>{
   let changed=false;
   const {store,config}=await fixture(t,{validate:async()=>{if(changed)throw new Error('Changed');},grade:async()=>{changed=true;return{verdict:'correct',feedback:'Correct.',followUp:null};}});
@@ -603,4 +637,166 @@ test('a saved draft is not offered for a different question', () => {
   const session={status:'active',index:0,questions:[{id:'next'}],draft:{questionId:'retry',kind:'answer',text:'Old.'}};
   assert.equal(savedDraft(session),null);
   assert.deepEqual(savedDraft({...session,questions:[{id:'retry'}]}),{kind:'answer',text:'Old.'});
+});
+
+test('a wrong answer or an explanation without a follow-up keeps the same question, records each attempt, and scores one miss', async t => {
+  const { readStats } = await import('../src/stats.js');
+  const grades = [{ verdict: 'incorrect', feedback: 'Nothing deduplicates the insert.' }, { verdict: 'incorrect', feedback: 'Here is how it works.' }, { verdict: 'correct', feedback: '' }];
+  const { store, config, env } = await fixture(t, { grade: async () => ({ ...grades.shift(), followUp: null }) });
+  await store.ensure(snapshot, config); await store.start(snapshot.id, config);
+  const missed = await store.answer(snapshot.id, 'No.', config, { expectedQuestionId: q.id });
+  assert.deepEqual([missed.status, missed.verdict, missed.question.id, missed.feedback], ['active', 'incorrect', q.id, 'Nothing deduplicates the insert.']);
+  const explained = await store.answer(snapshot.id, 'Teach me.', config, { learn: true, expectedQuestionId: q.id });
+  assert.deepEqual([explained.question.id, explained.feedback], [q.id, 'Here is how it works.']);
+  assert.equal((await store.answer(snapshot.id, 'Yes: it inserts every time.', config, { expectedQuestionId: q.id })).status, 'passed');
+  const saved = await store.read(snapshot.id);
+  assert.deepEqual(saved.attempts.map(item => [item.kind, item.verdict, item.questionId]), [['answer', 'incorrect', q.id], ['learn', 'incorrect', q.id], ['answer', 'correct', q.id]]);
+  const stats = await readStats(snapshot.repoRoot, env);
+  assert.deepEqual([stats.answered, stats.firstTry], [1, 0]);
+});
+
+test('a grader reply Sphinx cannot use is explained in plain words with the original text on detail; other failures are unchanged', async t => {
+  const plain = { answer: 'The grader\'s reply couldn\'t be used, so this wasn\'t graded. Your text is saved; sending it again makes another model call.', learn: 'The grader\'s reply couldn\'t be used, so no explanation is shown. Asking again makes another model call.' };
+  for (const code of ['INVALID_MODEL_OUTPUT', 'INSUFFICIENT_EVIDENCE', 'INVALID_REVIEW_ACTION']) {
+    const failure = Object.assign(new Error(`Return one complete JSON object (${code}). Retry the assessment.`), { code });
+    const { store, config } = await fixture(t, { grade: async () => { throw failure; } });
+    await store.ensure(snapshot, config); await store.start(snapshot.id, config);
+    for (const [options, message] of [[{}, plain.answer], [{ dispute: true }, plain.answer], [{ learn: true }, plain.learn]]) {
+      await assert.rejects(store.answer(snapshot.id, 'Yes: it inserts every time.', config, options), error => {
+        assert.deepEqual([error.message, error.detail, error.code], [message, failure.message, code], JSON.stringify(options));
+        return true;
+      });
+    }
+    const saved = await store.read(snapshot.id);
+    assert.deepEqual(savedDraft(saved), { kind: 'dispute', text: 'Yes: it inserts every time.' });
+    assert.deepEqual([saved.attempts.length, saved.index, saved.status], [0, 0, 'active']);
+  }
+  const outage = Object.assign(new Error('Provider unavailable.'), { code: 'OPENROUTER_PROVIDER_ERROR' });
+  const { store, config } = await fixture(t, { grade: async () => { throw outage; } });
+  await store.ensure(snapshot, config); await store.start(snapshot.id, config);
+  await assert.rejects(store.answer(snapshot.id, 'Teach me.', config, { learn: true }), error => error === outage);
+  await assert.rejects(store.answer(snapshot.id, 'Yes.', config), error => error.message === 'Provider unavailable. Your answer was saved and is offered again when you resume this question.' && error.detail === undefined);
+});
+
+test('a renamed replacement id skips every id the check has used and stays within 80 characters', async t => {
+  const later = { ...q, id: 'x'.repeat(80), prompt: 'Does a second worker share the guard? Why?' };
+  // The next question's id twice, then the id of the question the first replacement took over.
+  const proposed = [later.id, later.id, q.id];
+  const graded = [];
+  const { store, config } = await fixture(t, {
+    generate: async () => ({ questions: [q, later] }),
+    grade: async request => {
+      graded.push(request.question.id);
+      const id = proposed.shift();
+      return id ? { verdict: 'incorrect', feedback: 'No.', followUp: { ...q, id, prompt: `Scenario ${graded.length}: after a restart, can the request run again? Why?` } } : { verdict: 'correct', feedback: '', followUp: null };
+    },
+  });
+  const medium = { ...snapshot, id: '8'.repeat(64), stats: { additions: 200, deletions: 40, files: 6 } };
+  await store.ensure(medium, config); await store.start(medium.id, config);
+  const shown = [q.id];
+  for (let miss = 0; miss < 3; miss++) shown.push((await store.answer(medium.id, 'No.', config, { expectedQuestionId: shown.at(-1) })).question.id);
+  assert.deepEqual(shown, [q.id, `${'x'.repeat(70)}-2`, `${'x'.repeat(70)}-3`, `${q.id}-2`]);
+  for (const old of shown.slice(0, -1)) await assert.rejects(store.answer(medium.id, 'A late answer.', config, { expectedQuestionId: old }), { code: 'SPHINX_STALE_QUESTION' }, old);
+  assert.equal(graded.length, 3, 'A stale answer is never graded');
+});
+
+test('a held pass is reused and starts as passed with no model call, but approves no Git operation until it is confirmed', async t => {
+  let reviews = 0, grades = 0;
+  const { store, config } = await fixture(t, { generate: async () => { reviews++; return { questions: [q] }; }, grade: async () => { grades++; return { verdict: 'correct', feedback: 'Correct.', followUp: null }; } });
+  await store.ensure(snapshot, config); await store.start(snapshot.id, config);
+  assert.equal(await store.hold(snapshot.id, config), false, 'an unfinished check has no pass to hold');
+  assert.equal('held' in await store.read(snapshot.id), false);
+  await store.answer(snapshot.id, 'Yes: it inserts every time.', config);
+  assert.equal(await store.hold(snapshot.id, config), true);
+  const { held } = await store.read(snapshot.id);
+  assert.ok(Date.parse(held.at) > 0);
+  assert.equal(await store.approved(snapshot, config), false, 'Git does not take a held pass as approval');
+  assert.equal(await store.hold(snapshot.id, config), true);
+  assert.deepEqual((await store.read(snapshot.id)).held, held, 'holding again leaves the hold as it was');
+  const reused = await store.ensure(snapshot, config);
+  assert.equal(reused.status, 'passed', 'the pass is kept instead of starting a new check');
+  assert.deepEqual(reused.held, held);
+  const started = await store.start(snapshot.id, config);
+  assert.equal(started.status, 'passed'); assert.equal(started.held, true); assert.equal(started.question, undefined);
+  assert.equal((await store.answer(snapshot.id, 'A late answer.', config)).status, 'passed');
+  assert.deepEqual([reviews, grades], [1, 1], 'nothing is reviewed or graded again');
+  assert.deepEqual(await store.pending(snapshot.repoRoot), [], 'a held pass is not a pending check');
+  assert.equal(await store.confirm(snapshot.id, { ...config, level: 'thorough' }), false, 'only under the policy it passed with');
+  assert.equal(await store.approved(snapshot, config), false);
+  assert.equal(await store.confirm(snapshot.id, config), true);
+  assert.equal(await store.approved(snapshot, config), true);
+  assert.equal('held' in await store.read(snapshot.id), false);
+  assert.equal('held' in await store.start(snapshot.id, config), false);
+  assert.equal(await store.confirm(snapshot.id, config), false, 'nothing is left to confirm');
+});
+
+test('a session saved without a hold is approved as before, and a hold is added to what is on disk', async t => {
+  const { store, env, config } = await fixture(t);
+  await store.ensure(snapshot, config); await store.start(snapshot.id, config); await store.answer(snapshot.id, 'Yes.', config);
+  // Sessions written before holds existed look like this one: passed, with no held field.
+  const record = await store.read(snapshot.id);
+  assert.equal('held' in record, false);
+  assert.equal(await store.approved(snapshot, config), true);
+  assert.equal('held' in store.public(record), false);
+  assert.equal(await store.hold(snapshot.id, { ...config, level: 'thorough' }), false, 'not under another policy');
+  assert.equal(await store.approved(snapshot, config), true);
+  // Another process saved the session after this one last read it.
+  await writeJson(sessionFile(snapshot.id, env), { ...record, lastFeedback: 'Saved by another process.' });
+  assert.equal(await store.hold(snapshot.id, config), true);
+  const saved = await store.read(snapshot.id);
+  assert.equal(saved.lastFeedback, 'Saved by another process.', 'a hold never overwrites what it did not set');
+  assert.equal(saved.status, 'passed'); assert.equal(saved.expiresAt, record.expiresAt);
+  // The hold ends with the receipt: an expired one is not held or reused.
+  await writeJson(sessionFile(snapshot.id, env), { ...saved, expiresAt: '2000-01-01T00:00:00.000Z' });
+  assert.equal(await store.hold(snapshot.id, config), false);
+  assert.equal(await store.confirm(snapshot.id, config), false);
+  const fresh = await store.ensure(snapshot, config);
+  assert.equal(fresh.status, 'pending'); assert.equal('held' in fresh, false);
+});
+
+test('holding a pass waits briefly for another process to release the session lock instead of giving up', async t => {
+  const { store, env, config } = await fixture(t);
+  await store.ensure(snapshot, config); await store.start(snapshot.id, config); await store.answer(snapshot.id, 'Yes.', config);
+  const lock = `${sessionFile(snapshot.id, env)}.lock`;
+  await writeFile(lock, JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+  const holding = store.hold(snapshot.id, config);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal('held' in await store.read(snapshot.id), false, 'nothing is written while the lock is taken');
+  await rm(lock);
+  assert.equal(await holding, true);
+  assert.equal(await store.approved(snapshot, config), false);
+});
+
+test('a pass made for a waiting Git operation is saved held in the same write, by an answer or with no questions; without one it is a plain receipt', async t => {
+  const answered = await fixture(t);
+  await answered.store.ensure(snapshot, answered.config); await answered.store.start(snapshot.id, answered.config, { hold: true });
+  assert.equal('held' in await answered.store.read(snapshot.id), false, 'nothing is held before a pass exists');
+  const passed = await answered.store.answer(snapshot.id, 'Yes: it inserts every time.', answered.config, { hold: true });
+  assert.equal(passed.status, 'passed'); assert.equal(passed.held, true);
+  assert.ok(Date.parse((await answered.store.read(snapshot.id)).held.at) > 0);
+  assert.equal(await answered.store.approved(snapshot, answered.config), false);
+  assert.equal((await answered.store.ensure(snapshot, answered.config)).status, 'passed', 'and it is reused, not asked again');
+  assert.equal(await answered.store.confirm(snapshot.id, answered.config), true);
+  assert.equal(await answered.store.approved(snapshot, answered.config), true);
+  // No questions: decided while Git waits, or prepared in the background and passed when the check opens.
+  const review = { toolCalls: 1, compactions: 0 };
+  const none = await fixture(t, { generate: async (_s, _c, { beforeCall }) => { await beforeCall(); return { questions: [], noQuestionReason: 'Only renames a local variable; behavior is unchanged.', review }; } });
+  await none.store.ensure(snapshot, none.config);
+  assert.equal((await none.store.start(snapshot.id, none.config, { hold: true })).held, true);
+  assert.equal(await none.store.approved(snapshot, none.config), false);
+  const prepared = await fixture(t, { generate: async (_s, _c, { beforeCall }) => { await beforeCall(); return { questions: [], noQuestionReason: 'Only renames a local variable; behavior is unchanged.', review }; } });
+  await prepared.store.ensure(snapshot, prepared.config); await prepared.store.prepare(snapshot.id, prepared.config);
+  assert.equal((await prepared.store.start(snapshot.id, prepared.config, { hold: true })).held, true);
+  const docs = await fixture(t), readme = { ...snapshot, id: 'c'.repeat(64), files: ['README.md'] };
+  await docs.store.ensure(readme, docs.config);
+  assert.equal((await docs.store.start(readme.id, docs.config, { hold: true })).held, true);
+  // A manual check, sphinx answer, or a fallback form passes without a hold, as before.
+  const manual = await fixture(t);
+  await manual.store.ensure(snapshot, manual.config); await manual.store.start(snapshot.id, manual.config);
+  assert.equal('held' in await manual.store.answer(snapshot.id, 'Yes: it inserts every time.', manual.config), false);
+  assert.equal(await manual.store.approved(snapshot, manual.config), true);
+  const plain = await fixture(t, { generate: async (_s, _c, { beforeCall }) => { await beforeCall(); return { questions: [], noQuestionReason: 'Only renames a local variable; behavior is unchanged.', review }; } });
+  await plain.store.ensure(snapshot, plain.config);
+  assert.equal('held' in await plain.store.start(snapshot.id, plain.config), false);
+  assert.equal(await plain.store.approved(snapshot, plain.config), true);
 });

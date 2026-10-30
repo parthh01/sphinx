@@ -57,7 +57,7 @@ sphinx install --yes --preset claude-economy
 sphinx install --yes --preset openrouter-value --allow-paid
 ```
 
-Reinstalling keeps saved routes unless you choose a replacement. Updating Sphinx does not migrate saved routes. Changing a route invalidates prepared questions and completion records made under the previous route.
+Reinstalling keeps saved routes unless you choose a replacement. Updating Sphinx does not migrate saved routes. Changing a route applies to reviews that start afterwards, including a retry of one that failed, except on a check whose model you picked in its questionnaire. A check that already has questions keeps its model, questions, and progress, and completion records are kept.
 
 ### Codex and Claude routes
 
@@ -120,11 +120,11 @@ The tier and your chosen depth set the maximum number of initial questions:
 - `standard`: behavior, failure modes, and relevant system interactions.
 - `thorough`: also supported rollout, rollback, and compatibility assumptions.
 
-These are ceilings, not quotas: the reviewer asks fewer questions when the evidence supports fewer distinct behaviors, and never pads. A wrong answer adds a replacement question for the same concept, so a check can ask more than the initial count. Changing the model does not change the question count.
+These are ceilings, not quotas: the reviewer asks fewer questions when the evidence supports fewer distinct behaviors, and never pads. A wrong answer can replace a question with a new one for the same concept, so a check can ask more than the initial count. Changing the model does not change the question count.
 
 ## Question audit
 
-After the reviewer writes questions, an independent model call can audit them against the code before you see them: it fixes answer keys that don't match the code, and rewrites questions that ask for trivia or reveal their own answers. By default (`"audit": "large"` in `config.json`) only large changes get that call; small and medium ones check their own questions in the same request, which saves one long model call (often 10–20 seconds) per check. Set `"audit": "all"` to audit every change. A decision to ask no questions is always audited, at any size.
+After the reviewer writes questions, an independent model call can audit them against the code before you see them: it fixes answer keys that don't match the code, and rewrites questions that ask for trivia or reveal their own answers. By default (`"audit": "large"` in `config.json`) only large changes get that call; small and medium ones check their own questions in the same request, which saves one long model call (often 10–20 seconds) per check. Set `"audit": "all"` to audit every change. A decision to ask no questions is always audited, at any size. The same setting covers the new scenario after a wrong answer or explanation request: on a small or medium change the grader checks that scenario itself instead of a second call. A replacement after an unclear answer or a dispute, or for a question the grader found wrong, is always audited.
 
 ## Model calls, tokens, and limits
 
@@ -134,7 +134,7 @@ After the reviewer writes questions, an independent model call can audit them ag
 | --- | --- |
 | Investigation for a small / medium / large change | Aims for 5 / 7 / 8, including the question audit. These are planning targets, not stops. |
 | Each answer, learning request, or dispute | 1 |
-| A proposed replacement question | 1 more, for an independent source audit |
+| A proposed replacement question that passes Sphinx's format checks | 1 more, for an independent source audit (by default, a new scenario after a wrong answer or explanation gets it only on a large change) |
 | Status, help, config, pending, or pushing an already approved change | 0 |
 
 Set or clear an optional cap. This changes no routes and makes no model request:
@@ -249,13 +249,14 @@ Evidence comes from Git objects, not your working files: pre-commit reads the st
 
 ## Background preparation
 
-After commits, merges, rewrites, and checkouts, Sphinx schedules a detached reviewer for the expected destination so questions are ready before you push. It uses local remote-tracking refs and never fetches. It never opens a questionnaire or approves a push.
+After commits, merges, rewrites, and checkouts, Sphinx schedules a detached reviewer for the expected destination so questions are ready before you push. It uses local remote-tracking refs and never fetches. It never opens a questionnaire or approves a push, apart from documentation-only changes, which pass without questions anyway. When the reviewer finds nothing to ask, the push still opens the questionnaire, which says so and asks whether to continue.
 
 - `sphinx status` shows preparation progress; `sphinx prepare` schedules it explicitly; `sphinx prepare --retry` retries a failed job (failures never retry on their own).
 - Preparation and the push check share one assessment, lock, question set, and usage count. A change to source, destination, policy, ignore rules, or context discards prepared work.
 - Set `backgroundPreparation: false` in `config.json` or `.sphinxconfig` to opt out. A repository cannot re-enable preparation disabled machine-wide.
 - While yolo is on, preparation is paused: no new model request starts, although one already in progress may finish.
-- A first push, a branch without local tracking history, or a push to an unexpected destination needs a cold review at push time. Pre-commit checks always review on demand. Run `git fetch` if remote history is missing.
+- Preparation expects the push that `git push` makes, or that `git push -u <remote> HEAD` makes where `git push` needs a destination: the branch of the same name on the push remote, unless `remote.<name>.push` maps it elsewhere or `push.default` is `upstream`. A first push is prepared from where the branch left the remote, as the push check computes it.
+- A push to another destination, or to a remote that changed since your last fetch, needs a fresh review at push time. Pre-commit checks always review on demand. Run `git fetch` if remote history is missing.
 
 ## GitHub commit status and pull requests
 

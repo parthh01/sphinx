@@ -35,12 +35,16 @@ export async function runGitCheckpointTerminal({ request, env = process.env, sig
       } while (started?.status === 'busy');
     } catch { return stopped ? result('pending', stopped) : result('unavailable', 'launch-failed'); }
     if (started?.status === 'passed') return result('passed');
+    if (started?.status === 'stopped') return result('stopped');
     if (!['opened', 'already-open'].includes(started?.status)) return result(started?.status === 'suppressed' ? 'pending' : 'unavailable');
     try {
       controller.signal.throwIfAborted();
       const status = await waitForResult({ id: request.id, env, timeoutMs: Math.max(1, deadline - Date.now()), signal: controller.signal });
       controller.signal.throwIfAborted();
-      return result(['passed', 'skipped', 'pending', 'unavailable', 'interrupted'].includes(status) ? status : 'interrupted');
+      // A window opened for another Git attempt never asked this one whether to
+      // continue. Once it passes, this one's own window asks (see launch).
+      if (started.status === 'already-open' && status === 'passed' && request.delivery === 'hook' && !request.more) return await operation();
+      return result(['passed', 'skipped', 'stopped', 'pending', 'unavailable', 'interrupted'].includes(status) ? status : 'interrupted');
     } catch { return stopped ? result('pending', stopped) : result('interrupted'); }
   };
   try { return await Promise.race([operation(), interrupted]); }
@@ -78,13 +82,13 @@ export async function runGitTerminalCheck({ request, env = process.env, signal, 
   try {
     const code = await new Promise(resolve => {
       let child;
-      try { child = spawnImpl(process.execPath, [CLI, 'check', '--id', request.id], { cwd, env: { ...env, SPHINX_WAITING_GIT: '1' }, stdio: [tty, tty, tty] }); }
+      try { child = spawnImpl(process.execPath, [CLI, 'check', '--id', request.id], { cwd, env: { ...env, SPHINX_WAITING_GIT: '1', ...(request.more ? { SPHINX_MORE_CHECKS: '1' } : {}) }, stdio: [tty, tty, tty] }); }
       catch { resolve(null); return; }
       const onAbort = () => child.kill('SIGINT');
       signal?.addEventListener('abort', onAbort, { once: true });
       child.once('error', () => resolve(null));
       child.once('exit', exit => { signal?.removeEventListener('abort', onAbort); resolve(exit); });
     });
-    return { id: request.id, status: code === 0 ? 'passed' : code === 3 ? 'skipped' : code === null ? 'unavailable' : 'pending' };
+    return { id: request.id, status: code === 0 ? 'passed' : code === 3 ? 'skipped' : code === 4 ? 'stopped' : code === null ? 'unavailable' : 'pending' };
   } finally { try { closeSync(tty); } catch { /* Already closed. */ } }
 }

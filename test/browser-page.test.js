@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { browserPage } from '../src/browser-page.js';
 
-function page(fetchImpl = () => assert.fail('No request expected')) {
+function page(fetchImpl = () => assert.fail('No request expected'), { narrow = false } = {}) {
   const element = tag => ({ tag, textContent: '', hidden: false, value: '', disabled: false, children: [], style: {}, className: '', title: '', dataset: {}, attributes: {},
     scrollHeight: 0, scrollTop: 0, clientHeight: 0, placeholder: '', querySelectorAll() { return []; },
     setAttribute(name, value) { this.attributes[name] = String(value); }, getAttribute(name) { return this.attributes[name] ?? null; },
@@ -15,7 +15,7 @@ function page(fetchImpl = () => assert.fail('No request expected')) {
   const buttons = [nodes.pause, element(), { ...element(), dataset: { action: 'learn' } }, { ...element(), dataset: { action: 'dispute' } }];
   let events;
   const context = vm.createContext({ document: { visibilityState: 'visible', getElementById: id => nodes[id] ??= element('div'), createElement: element, querySelectorAll: selector => selector === '[data-action]' ? buttons.slice(2) : buttons }, fetch: fetchImpl,
-    EventSource: class { constructor() { events = this; this.closed = false; } close() { this.closed = true; } },
+    EventSource: class { constructor() { events = this; this.closed = false; } close() { this.closed = true; } }, matchMedia: () => ({ matches: narrow }),
   });
   const script = browserPage({ token: 'fixture-token', nonce: 'fixture-nonce' }).match(/<script[^>]*>([\s\S]*?)<\/script>/u)[1];
   vm.runInContext(script, context);
@@ -154,7 +154,7 @@ test('state line names follow-ups and finished checks stop describing a waiting 
   assert.equal(p.nodes.status.textContent, 'Question 1 of 1'); assert.match(p.nodes.status.className, /phase-question/);
   p.update({ ...question, sequence: 2, question: { id: 'q2', prompt: 'Again?' }, messages: [asked, { role: 'sphinx', kind: 'question', questionId: 'q2', number: 1, followUp: true, text: 'Again?' }] });
   assert.equal(p.nodes.status.textContent, 'Question 1 of 1 · Needs another answer'); assert.match(p.nodes.status.className, /retry/);
-  assert.match(p.nodes.waiting.textContent, /Git continues after you pass/);
+  assert.equal(p.nodes.waiting.textContent, 'After you pass, you choose whether the push goes through. Closing this tab leaves it waiting; Stop push stops it.');
   p.update({ ...question, sequence: 3, phase: 'passed' });
   assert.match(p.nodes.status.className, /phase-passed/);
   assert.equal(p.nodes.waiting.hidden, true);
@@ -327,6 +327,115 @@ test('passing shows a clear end state that says the tab can be closed', () => {
   p.update({ ...question, sequence: 2, phase: 'passed', message: 'You passed. You can close this tab; Git is finishing the push on its own.' });
   assert.equal(p.nodes.message.className, 'message passed');
   assert.match(p.nodes.message.textContent, /close this tab/);
+});
+
+const consent = { ...question, sequence: 2, phase: 'consent', question: undefined, message: 'You passed. Continue the push?', choices: [
+  { value: 'proceed', label: 'Continue push', description: 'Continue: the push goes through.' },
+  { value: 'stop', label: 'Stop push', description: 'Stop: it does not go through. Your pass is saved, so the next push of this change asks only whether to continue.' },
+] };
+
+test('consent after a waiting pass is one row, Continue in amber and Stop plain, explained in one line', async () => {
+  const bodies = [];
+  const p = page(async (_url, init) => { bodies.push(JSON.parse(init.body)); return { ok: true, json: async () => ({ ...question, sequence: 4, phase: 'passed', message: 'You passed. You can close this tab; Git is finishing the push on its own.' }) }; });
+  p.context.document.visibilityState = 'hidden';
+  p.update(consent);
+  assert.equal(p.nodes.message.textContent, 'You passed. Continue the push?'); assert.equal(p.nodes.message.className, 'message passed');
+  assert.equal(p.nodes.status.hidden, true, 'no chip repeating what the scope line says');
+  assert.equal(p.nodes['scope-progress'].textContent, 'Continue or stop');
+  assert.equal(p.nodes.recovery.hidden, true); assert.equal(p.nodes.consent.hidden, false);
+  const [row, note] = p.nodes.consent.children;
+  assert.equal(row.className, 'actions');
+  assert.deepEqual(row.children.map(button => [button.textContent, button.className]), [['Continue push', 'primary'], ['Stop push', '']], 'red stays reserved for skipping the check');
+  assert.equal(note.className, 'hint');
+  assert.equal(note.textContent, 'Continue: the push goes through. Stop: it does not go through. Your pass is saved, so the next push of this change asks only whether to continue.');
+  assert.equal(p.nodes.skip.hidden, true); assert.equal(p.nodes.pause.hidden, true); assert.equal(p.nodes.composer.hidden, true);
+  assert.equal(p.nodes.waiting.textContent, 'The push waits for your choice. Closing this tab leaves it waiting.');
+  assert.equal(p.context.document.title, '● Sphinx: continue the push?');
+  await row.children[0].onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(bodies.map(body => body.action), ['proceed']);
+  assert.equal(p.nodes.status.textContent, 'Passed'); assert.equal(p.nodes.consent.hidden, true);
+});
+
+const stopped = { ...question, sequence: 3, phase: 'stopped', question: undefined, resume: 'git push origin main', message: 'Push stopped. It did not go through. Your pass is saved, so the next push of this change asks only whether to continue. You can close this tab.' };
+
+test('on a phone, consent comes into view on the Question tab with its buttons last, and the outcome after a choice stays in view', () => {
+  const p = page(undefined, { narrow: true }), scrolled = [];
+  p.update({ ...question, messages: [{ id: 'm1', role: 'sphinx', kind: 'question', questionId: 'q1', number: 1, text: 'First?' }] });
+  p.context.setTab('diff');
+  for (const id of ['message', 'consent', 'status']) p.nodes[id].scrollIntoView = options => scrolled.push([id, options.block]);
+  p.update(consent);
+  assert.equal(p.nodes.workspace.className, 'workspace show-question', 'consent is never left behind the Diff tab');
+  assert.deepEqual(scrolled, [['message', 'nearest'], ['consent', 'nearest']], 'only as far as needed, and the buttons win over a long message');
+  scrolled.length = 0; p.update(stopped);
+  assert.deepEqual(scrolled, [['status', 'nearest'], ['message', 'nearest']], 'the result stays where it is instead of jumping back to the question');
+  const wide = page(); wide.update(question); wide.nodes.consent.scrollIntoView = () => assert.fail('wide screens scroll the conversation instead');
+  wide.update(consent);
+});
+
+test('the consent row is built once per step and takes focus as a group, so updates never drop focus and Enter confirms nothing', () => {
+  const html = browserPage({ token: 'fixture-token', nonce: 'fixture-nonce' });
+  assert.match(html, /<div id="consent" class="consent" role="group" aria-labelledby="message" aria-describedby="consent-hint" tabindex="-1" hidden><\/div>/);
+  const p = page(); let focused = 0; p.update(question);
+  p.nodes.consent.focus = () => { focused++; };
+  p.update(consent);
+  const [row, note] = p.nodes.consent.children;
+  assert.equal(focused, 1); assert.equal(note.id, 'consent-hint');
+  p.update({ ...consent, sequence: 3, distance: { current: 'mixed', next: 'low', scope: 'machine' } });
+  assert.equal(p.nodes.consent.children[0], row, 'a display-only update keeps the same buttons');
+  assert.equal(focused, 1, 'focus is taken once, on entering the step');
+  p.nodes.consent.querySelectorAll = () => row.children;
+  p.events.onerror();
+  assert.ok(row.children.every(button => button.disabled), 'no choice can be sent while disconnected');
+  p.update({ ...consent, sequence: 4 });
+  assert.ok(row.children.every(button => !button.disabled));
+});
+
+test('during consent, a refused choice or a lost connection is shown, and the footer stops saying the push waits', async () => {
+  const p = page(async () => ({ ok: false, json: async () => ({ error: 'This checkpoint changed. Use the current question.' }) }));
+  p.update(question); p.update(consent);
+  assert.equal(p.nodes.composer.hidden, true);
+  await p.nodes.consent.children[0].children[0].onclick();
+  assert.equal(p.nodes.error.textContent, 'This checkpoint changed. Use the current question.');
+  assert.equal(p.nodes.error.hidden, false); assert.equal(p.nodes.composer.hidden, false); assert.equal(p.nodes.form.hidden, true, 'only the error line shows');
+  p.events.onerror();
+  assert.match(p.nodes.error.textContent, /^Connection interrupted\. Reconnecting/);
+  assert.equal(p.nodes.waiting.hidden, true);
+  p.update({ ...consent, sequence: 3 });
+  assert.equal(p.nodes.error.hidden, true); assert.equal(p.nodes.composer.hidden, true);
+  assert.equal(p.nodes.waiting.textContent, 'The push waits for your choice. Closing this tab leaves it waiting.'); assert.equal(p.nodes.waiting.hidden, false);
+});
+
+test('stopping after a pass is a finished check that no longer describes a waiting Git operation', () => {
+  const p = page(); p.update(question);
+  p.update(stopped);
+  assert.match(p.nodes.message.textContent, /^Push stopped\. It did not go through\./);
+  assert.equal(p.nodes.status.textContent, 'Stopped'); assert.equal(p.nodes.status.className, 'status phase-stopped', 'the same ‖ Stopped mark as any other stop');
+  assert.equal(p.nodes.resume.hidden, false); assert.equal(p.nodes['resume-command'].textContent, 'git push origin main');
+  assert.equal(p.nodes['scope-progress'].textContent, 'Stopped');
+  assert.equal(p.nodes.waiting.hidden, true);
+  assert.equal(p.nodes.skip.hidden, true);
+  assert.equal(p.nodes.pause.hidden, true);
+  assert.ok(p.buttons.every(button => button.disabled));
+});
+
+test('the header button reads Stop push or Stop commit while Git waits, and Pause check when nothing waits', async () => {
+  const bodies = [];
+  const p = page(async (_url, init) => { bodies.push(JSON.parse(init.body)); return { ok: true, json: async () => ({ ...question, sequence: 3, phase: 'paused', message: 'Push stopped. It did not go through, and your progress is saved.', resume: 'git push origin main' }) }; });
+  p.update(question);
+  assert.equal(p.nodes.pause.textContent, 'Stop push');
+  await p.nodes.pause.onclick();
+  assert.deepEqual(bodies.map(body => body.action), ['pause'], 'the same pause, named for what it does');
+  assert.equal(p.nodes.status.textContent, 'Stopped'); assert.equal(p.nodes['scope-progress'].textContent, 'Stopped');
+  assert.equal(p.nodes['resume-command'].textContent, 'git push origin main');
+  const commit = page(); commit.update({ ...question, event: 'pre-commit' });
+  assert.equal(commit.nodes.pause.textContent, 'Stop commit');
+  assert.equal(commit.nodes.waiting.textContent, 'After you pass, you choose whether the commit goes through. Closing this tab leaves it waiting; Stop commit stops it.');
+  const manual = page(); manual.update({ ...question, waitingGit: false });
+  assert.equal(manual.nodes.pause.textContent, 'Pause check');
+  assert.equal(manual.nodes.waiting.textContent, 'Closing this tab leaves the check waiting. Use Pause check to stop.');
+  manual.update({ ...question, waitingGit: false, sequence: 2, phase: 'paused', message: 'Paused. Your progress is saved.' });
+  assert.equal(manual.nodes.status.textContent, 'Paused');
 });
 
 test('the context line names the model reviewing this check', () => {

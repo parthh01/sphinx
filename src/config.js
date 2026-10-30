@@ -187,14 +187,15 @@ export function stableStringify(value) {
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
   return JSON.stringify(value);
 }
-export function policyHash({ github, interface: _interface, ...config }) {
-  // GitHub stamps and where the questions appear are not part of the check.
-  // The call ceiling controls spending, not what the human must understand.
-  // Normalize it independently of DEFAULT_CONFIG so allowance edits preserve
-  // checkpoint identity within the same assessment contract.
-  // Version the contract when assessment semantics change: older questions and
-  // receipts must not stand in for an assessment under the new requirements.
-  return createHash('sha256').update(stableStringify({ ...config, maxModelCalls: 10, agentMaxTurns: 8, cliBilling: 'plan', workingContext: true, assessmentContract: 3 })).digest('hex');
+// What a check asks and which Git operations it covers: events, destinations,
+// exclusions, depth, distance, and the size tiers that set question ceilings.
+// Reviewer routes and run settings (limits, timeouts, spending, billing,
+// preparation, receipt lifetime, the question audit, where questions appear,
+// GitHub stamps) are left out, so changing them keeps prepared checks and passes.
+// Version the contract when assessment semantics change: older questions and
+// receipts must not stand in for an assessment under the new requirements.
+export function policyHash({ version, enabled, mode, events, branches, remotes, exclude, level, distance, routing }) {
+  return createHash('sha256').update(stableStringify({ version, enabled, mode, events, branches, remotes, exclude, level, distance, routing, assessmentContract: 3 })).digest('hex');
 }
 
 const isRecord = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
