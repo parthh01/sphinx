@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { getPaths, readJson, writeJson } from './config.js';
+import { withFileLock } from './lock.js';
 
 // Passed questions outlive the checkpoint files. Checks are garbage-collected
 // after a day; the deck keeps the prompts and stored explanations so the same
@@ -8,6 +9,7 @@ import { getPaths, readJson, writeJson } from './config.js';
 export const INTERVALS = Object.freeze([1, 3, 7, 14, 30]);
 export const MAX_CARDS = 200;
 const DAY = 24 * 3600 * 1000;
+const LOCK_WAIT = 10_000;
 const digest = value => createHash('sha256').update(value).digest('hex');
 export const cardId = (repoRoot, prompt) => digest(`${repoRoot}\0${String(prompt || '').trim()}`).slice(0, 32);
 export const deckFile = (repoRoot, env = process.env) => path.join(getPaths(env).home, 'decks', `${digest(repoRoot)}.json`);
@@ -41,20 +43,31 @@ function readCard(card, id) {
   };
 }
 
-export async function readDeck(repoRoot, env = process.env) {
-  const stored = await readJson(deckFile(repoRoot, env), null).catch(() => null);
+export async function readDeck(repoRoot, env = process.env, { strict = false } = {}) {
+  const stored = await readJson(deckFile(repoRoot, env), null).catch(error => {
+    if (strict) throw error;
+    return null;
+  });
   const cards = {};
   if (stored?.cards && typeof stored.cards === 'object' && !Array.isArray(stored.cards)) {
     for (const [id, value] of Object.entries(stored.cards)) {
       const card = readCard(value, id);
       if (card) cards[card.id] = card;
+      else if (strict) throw new Error(`Invalid card in deck: ${id}`);
     }
-  }
+  } else if (strict && stored !== null) throw new Error('Invalid deck file.');
   return { version: 1, repoRoot, cards };
 }
 
-async function saveDeck(repoRoot, deck, env) {
-  await writeJson(deckFile(repoRoot, env), { version: 1, repoRoot, cards: deck.cards });
+// Both writers replace the whole file, so the lock spans the read as well as the
+// save. The strict read refuses to save over cards this version cannot parse.
+async function updateDeck(repoRoot, env, update) {
+  return withFileLock(`${deckFile(repoRoot, env)}.lock`, async () => {
+    const deck = await readDeck(repoRoot, env, { strict: true });
+    const result = update(deck);
+    await writeJson(deckFile(repoRoot, env), { version: 1, repoRoot, cards: deck.cards });
+    return result;
+  }, { deadline: Date.now() + LOCK_WAIT, busy: () => new Error('Another Sphinx process is updating this deck. Try again.') });
 }
 
 /** JSON and CLI listings never include the stored explanation. */
@@ -117,30 +130,30 @@ export async function capturePassedCheck({ session, env = process.env, now = new
   const repoRoot = session.snapshot?.repoRoot;
   if (typeof repoRoot !== 'string' || !repoRoot) return 0;
   try {
-    const deck = await readDeck(repoRoot, env);
-    const at = now instanceof Date ? now : new Date(now);
-    let added = 0;
-    for (const [index, question] of session.questions.entries()) {
-      const prompt = text(question?.prompt);
-      if (!prompt) continue;
-      const id = cardId(repoRoot, prompt);
-      const existing = deck.cards[id];
-      const card = {
-        id, prompt, back: storedBack(session, index, question),
-        target: text(session.snapshot?.target?.ref) || undefined,
-        firstTry: firstTryFor(session, index, question),
-        capturedAt: existing?.capturedAt || at.toISOString(),
-        dueAt: existing?.dueAt || new Date(at.getTime() + DAY).toISOString(),
-        intervalDays: existing?.intervalDays || 1,
-        reviews: existing?.reviews || 0,
-        lastReviewedAt: existing?.lastReviewedAt || null,
-      };
-      deck.cards[id] = existing ? applyGood({ ...existing, ...card, intervalDays: existing.intervalDays, reviews: existing.reviews }, at) : card;
-      if (!existing) added += 1;
-    }
-    deck.cards = prune(deck.cards);
-    await saveDeck(repoRoot, deck, env);
-    return added;
+    return await updateDeck(repoRoot, env, deck => {
+      const at = now instanceof Date ? now : new Date(now);
+      let added = 0;
+      for (const [index, question] of session.questions.entries()) {
+        const prompt = text(question?.prompt);
+        if (!prompt) continue;
+        const id = cardId(repoRoot, prompt);
+        const existing = deck.cards[id];
+        const card = {
+          id, prompt, back: storedBack(session, index, question),
+          target: text(session.snapshot?.target?.ref) || undefined,
+          firstTry: firstTryFor(session, index, question),
+          capturedAt: existing?.capturedAt || at.toISOString(),
+          dueAt: existing?.dueAt || new Date(at.getTime() + DAY).toISOString(),
+          intervalDays: existing?.intervalDays || 1,
+          reviews: existing?.reviews || 0,
+          lastReviewedAt: existing?.lastReviewedAt || null,
+        };
+        deck.cards[id] = existing ? applyGood({ ...existing, ...card, intervalDays: existing.intervalDays, reviews: existing.reviews }, at) : card;
+        if (!existing) added += 1;
+      }
+      deck.cards = prune(deck.cards);
+      return added;
+    });
   } catch {
     return 0;
   }
@@ -148,17 +161,17 @@ export async function capturePassedCheck({ session, env = process.env, now = new
 
 export async function reviewCard({ repoRoot, id, rating, env = process.env, now = new Date() } = {}) {
   if (!['again', 'good'].includes(rating)) throw new Error('Rate a card as again or good.');
-  const deck = await readDeck(repoRoot, env);
-  const card = deck.cards[id];
-  if (!card) throw new Error('That card is not in this repository’s deck.');
-  const at = now instanceof Date ? now : new Date(now);
-  const intervalDays = nextInterval(card.intervalDays, rating);
-  deck.cards[id] = {
-    ...card, intervalDays,
-    dueAt: new Date(at.getTime() + intervalDays * DAY).toISOString(),
-    reviews: card.reviews + 1,
-    lastReviewedAt: at.toISOString(),
-  };
-  await saveDeck(repoRoot, deck, env);
-  return deck.cards[id];
+  return updateDeck(repoRoot, env, deck => {
+    const card = deck.cards[id];
+    if (!card) throw new Error('That card is not in this repository’s deck.');
+    const at = now instanceof Date ? now : new Date(now);
+    const intervalDays = nextInterval(card.intervalDays, rating);
+    deck.cards[id] = {
+      ...card, intervalDays,
+      dueAt: new Date(at.getTime() + intervalDays * DAY).toISOString(),
+      reviews: card.reviews + 1,
+      lastReviewedAt: at.toISOString(),
+    };
+    return deck.cards[id];
+  });
 }

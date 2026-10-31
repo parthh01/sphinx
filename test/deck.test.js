@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -128,4 +128,37 @@ test('the deck drops the oldest cards once it reaches the cap', async t => {
   assert.equal(Object.keys(deck.cards).length, MAX_CARDS);
   assert.equal(deck.cards[cardId('/work/billing', 'Prompt 0: what happens?')], undefined);
   assert.ok(deck.cards[cardId('/work/billing', `Prompt ${MAX_CARDS + 4}: what happens?`)]);
+});
+
+test('a capture keeps cards it cannot read instead of saving over them', async t => {
+  const env = await home(t);
+  await capturePassedCheck({ session: passedSession(), env, now: new Date('2026-10-23T12:00:00.000Z') });
+  const file = deckFile('/work/billing', env);
+  const stored = JSON.parse(await readFile(file, 'utf8'));
+  stored.cards.future = { kind: 'a card shape from a newer version' };
+  await writeFile(file, JSON.stringify(stored));
+  const other = { ...q, id: 'q2', prompt: 'What does the second retry do?' };
+  assert.equal(await capturePassedCheck({ session: passedSession({ questions: [other], attempts: [] }), env }), 0);
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), stored);
+  assert.equal(Object.keys((await readDeck('/work/billing', env)).cards).length, 1, 'Lenient readers still skip the card');
+  await assert.rejects(readDeck('/work/billing', env, { strict: true }), /Invalid card in deck: future/);
+  await assert.rejects(reviewCard({ repoRoot: '/work/billing', id: cardId('/work/billing', q.prompt), rating: 'good', env }), /Invalid card in deck/);
+  await writeFile(file, '{');
+  assert.equal(await capturePassedCheck({ session: passedSession(), env }), 0);
+  assert.equal(await readFile(file, 'utf8'), '{');
+});
+
+test('concurrent captures and reviews all reach the deck', async t => {
+  const env = await home(t);
+  const repoRoot = '/work/billing';
+  const at = new Date('2026-10-23T12:00:00.000Z');
+  await capturePassedCheck({ session: passedSession(), env, now: at });
+  const prompts = Array.from({ length: 4 }, (_, index) => `Concurrent prompt ${index}: what happens?`);
+  await Promise.all([
+    reviewCard({ repoRoot, id: cardId(repoRoot, q.prompt), rating: 'good', env, now: at }),
+    ...prompts.map((prompt, index) => capturePassedCheck({ session: passedSession({ questions: [{ ...q, id: `c${index}`, prompt }], attempts: [] }), env, now: at })),
+  ]);
+  const { cards } = await readDeck(repoRoot, env);
+  assert.equal(Object.keys(cards).length, 5);
+  assert.equal(cards[cardId(repoRoot, q.prompt)].reviews, 1);
 });

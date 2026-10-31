@@ -2,12 +2,12 @@ import path from 'node:path';
 import { REVIEWER_PRESETS } from './model-presets.js';
 import { recordAnswer, recordCheck } from './stats.js';
 import { capturePassedCheck } from './deck.js';
+import { withFileLock } from './lock.js';
 import { withUsageMeter, withUsagePurpose, addUsage } from './usage.js';
-import { mkdir, open, readdir, stat, unlink } from 'node:fs/promises';
+import { readdir, unlink } from 'node:fs/promises';
 import { DEFAULT_CONFIG, getPaths, readJson, writeJson, policyHash } from './config.js';
 import { selectRoute, evaluatorConfig, questionLimit } from './routing.js';
 import { generateAssessment, gradeAnswer, MODEL_OUTPUT_ERRORS } from './evaluator.js';
-import { setTimeout as delay } from 'node:timers/promises';
 import { hasPreferences } from './repo-context.js';
 
 const now = () => new Date().toISOString();
@@ -15,36 +15,11 @@ export function sessionFile(id, env = process.env) {
   if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('Invalid assessment ID. Run sphinx pending to find it.');
   return path.join(getPaths(env).sessions, `${id}.json`);
 }
-async function withLock(id, env, operation, { signal, deadline = 0 } = {}) {
-  signal?.throwIfAborted();
-  const file = `${sessionFile(id, env)}.lock`;
-  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  let handle;
-  try { handle = await open(file, 'wx', 0o600); }
-  catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-    // Another process may have created its lock but not yet written the PID.
-    const lock = await readJson(file, {}).catch(() => ({}));
-    // A process can die after exclusive creation but before writing its PID.
-    // Leave new partial locks alone; recover old orphaned ones on explicit retry.
-    let alive = await stat(file).then(info => Date.now() - info.mtimeMs < 30000).catch(error => { if (error.code === 'ENOENT') return false; throw error; });
-    if (Number.isInteger(lock.pid) && lock.pid > 0) {
-      try { process.kill(lock.pid, 0); alive = true; } catch (err) { alive = err.code !== 'ESRCH'; }
-    }
-    if (alive) {
-      if (deadline > Date.now()) {
-        await delay(Math.min(200, deadline - Date.now()), undefined, { signal });
-        return withLock(id, env, operation, { signal, deadline });
-      }
-      throw Object.assign(new Error('This assessment is already running. Wait for preparation to finish, then resume the check.'), { code: 'SPHINX_SESSION_BUSY' });
-    }
-    await unlink(file).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    return withLock(id, env, operation, { signal, deadline });
-  }
-  try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: now() }));
-    return await operation();
-  } finally { await handle.close(); await unlink(file).catch(() => {}); }
+function withLock(id, env, operation, { signal, deadline = 0 } = {}) {
+  return withFileLock(`${sessionFile(id, env)}.lock`, operation, {
+    signal, deadline,
+    busy: () => Object.assign(new Error('This assessment is already running. Wait for preparation to finish, then resume the check.'), { code: 'SPHINX_SESSION_BUSY' }),
+  });
 }
 // A held pass (session.held, see hold()) is still a valid receipt: it is reused
 // and starts as passed. Only approved() refuses it, so Git asks again first.

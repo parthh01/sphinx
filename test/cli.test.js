@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm, chmod, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, writeFile, rm, chmod, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -183,9 +183,11 @@ test('a passed check fills the local deck and sphinx drill lists it without mode
   const rejected = f.run(process.execPath, [CLI, 'drill', '--limit', '0']);
   assert.equal(rejected.status, 1);
   assert.match(rejected.stderr, /1 to 50/);
-  const file = deckFile(f.repo, f.env);
+  // Sphinx keys the deck by the resolved root; macOS temp paths run through a symlink.
+  const repoRoot = await realpath(f.repo);
+  const file = deckFile(repoRoot, f.env);
   const stored = JSON.parse(await readFile(file, 'utf8'));
-  const id = Object.keys((await readDeck(f.repo, f.env)).cards)[0];
+  const id = Object.keys((await readDeck(repoRoot, f.env)).cards)[0];
   stored.cards[id].dueAt = '2020-01-01T00:00:00.000Z';
   await writeFile(file, `${JSON.stringify(stored, null, 2)}\n`);
   const interactive = f.run(process.execPath, [CLI, 'drill']);
