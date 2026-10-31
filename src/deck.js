@@ -10,6 +10,8 @@ export const INTERVALS = Object.freeze([1, 3, 7, 14, 30]);
 export const MAX_CARDS = 200;
 const DAY = 24 * 3600 * 1000;
 const LOCK_WAIT = 10_000;
+// A capture runs while the session lock and a Git command wait on it, so it gives up early.
+const CAPTURE_WAIT = 2_000;
 const digest = value => createHash('sha256').update(value).digest('hex');
 export const cardId = (repoRoot, prompt) => digest(`${repoRoot}\0${String(prompt || '').trim()}`).slice(0, 32);
 export const deckFile = (repoRoot, env = process.env) => path.join(getPaths(env).home, 'decks', `${digest(repoRoot)}.json`);
@@ -61,13 +63,13 @@ export async function readDeck(repoRoot, env = process.env, { strict = false } =
 
 // Both writers replace the whole file, so the lock spans the read as well as the
 // save. The strict read refuses to save over cards this version cannot parse.
-async function updateDeck(repoRoot, env, update) {
+async function updateDeck(repoRoot, env, update, { wait = LOCK_WAIT, signal } = {}) {
   return withFileLock(`${deckFile(repoRoot, env)}.lock`, async () => {
     const deck = await readDeck(repoRoot, env, { strict: true });
     const result = update(deck);
     await writeJson(deckFile(repoRoot, env), { version: 1, repoRoot, cards: deck.cards });
     return result;
-  }, { deadline: Date.now() + LOCK_WAIT, busy: () => new Error('Another Sphinx process is updating this deck. Try again.') });
+  }, { signal, deadline: Date.now() + wait, busy: () => new Error('Another Sphinx process is updating this deck. Try again.') });
 }
 
 /** JSON and CLI listings never include the stored explanation. */
@@ -124,8 +126,8 @@ function applyGood(card, at) {
   return { ...card, intervalDays, dueAt: new Date(at.getTime() + intervalDays * DAY).toISOString(), reviews: card.reviews + 1, lastReviewedAt: at.toISOString() };
 }
 
-/** Copy the questions from a passed check into the local deck. Best-effort. */
-export async function capturePassedCheck({ session, env = process.env, now = new Date() } = {}) {
+/** Copy the questions from a passed check into the local deck. Best-effort: a busy deck or an aborted `signal` skips the capture. */
+export async function capturePassedCheck({ session, env = process.env, now = new Date(), signal } = {}) {
   if (!session || session.status !== 'passed' || session.noQuestionReason || !Array.isArray(session.questions) || !session.questions.length) return 0;
   const repoRoot = session.snapshot?.repoRoot;
   if (typeof repoRoot !== 'string' || !repoRoot) return 0;
@@ -153,7 +155,7 @@ export async function capturePassedCheck({ session, env = process.env, now = new
       }
       deck.cards = prune(deck.cards);
       return added;
-    });
+    }, { wait: CAPTURE_WAIT, signal });
   } catch {
     return 0;
   }

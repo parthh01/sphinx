@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   INTERVALS, MAX_CARDS, cardId, capturePassedCheck, deckFile, deckSummary, dueCards, nextInterval, publicCard, readDeck, reviewCard,
 } from '../src/deck.js';
@@ -146,6 +147,39 @@ test('a capture keeps cards it cannot read instead of saving over them', async t
   await writeFile(file, '{');
   assert.equal(await capturePassedCheck({ session: passedSession(), env }), 0);
   assert.equal(await readFile(file, 'utf8'), '{');
+});
+
+test('a passed answer does not wait out a busy deck', async t => {
+  const env = await home(t);
+  const store = createSessionStore({
+    env,
+    generate: async (_s, _c, options) => { await options.beforeCall(); return { questions: [structuredClone(q)] }; },
+    grade: async request => { await request.beforeCall(); return { verdict: 'correct', feedback: 'Correct: the repeated insert can duplicate it.', followUp: null }; },
+  });
+  await store.ensure(snapshot, DEFAULT_CONFIG);
+  await store.start(snapshot.id, DEFAULT_CONFIG);
+  const lock = `${deckFile(snapshot.repoRoot, env)}.lock`;
+  await mkdir(path.dirname(lock), { recursive: true });
+  await writeFile(lock, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+  const started = Date.now();
+  assert.equal((await store.answer(snapshot.id, 'Yes: it inserts every time.', DEFAULT_CONFIG)).status, 'passed');
+  assert.ok(Date.now() - started < 8000, 'The capture gives up well before the deck lock timeout');
+  await rm(lock);
+  assert.deepEqual((await readDeck(snapshot.repoRoot, env)).cards, {}, 'The skipped capture wrote nothing');
+});
+
+test('aborting stops a capture waiting on a busy deck', async t => {
+  const env = await home(t);
+  const lock = `${deckFile(snapshot.repoRoot, env)}.lock`;
+  await mkdir(path.dirname(lock), { recursive: true });
+  await writeFile(lock, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+  const controller = new AbortController();
+  const capture = capturePassedCheck({ session: passedSession(), env, signal: controller.signal });
+  await delay(50);
+  controller.abort();
+  const outcome = await Promise.race([capture, delay(1000, 'still waiting')]);
+  assert.equal(outcome, 0);
+  await rm(lock);
 });
 
 test('concurrent captures and reviews all reach the deck', async t => {

@@ -448,7 +448,7 @@ export function createSessionStore({ env = process.env, generate = generateAsses
       if (scoreThis) await recordAnswer({ repoRoot: session.snapshot.repoRoot, correct: result.verdict === 'correct' && !learn, env });
       if (session.status === 'passed') {
         await recordCheck({ repoRoot: session.snapshot.repoRoot, outcome: 'completed', env });
-        await capturePassedCheck({ session, env });
+        await capturePassedCheck({ session, env, signal });
       }
       return {...publicSession(session), verdict:result.verdict};
     });
