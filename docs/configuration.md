@@ -21,6 +21,7 @@ This page is the reference for reviewer models, usage limits, repository policy,
 | OpenRouter key and OpenAI-compatible endpoint | `~/.config/sphinx/credentials.json` (mode `0600`) |
 | Machine-wide ignore patterns | `~/.config/sphinx/ignore` |
 | Skip and yolo log | `~/.config/sphinx/overrides.jsonl` |
+| Retention deck | `~/.config/sphinx/decks/` (passed questions for `sphinx drill`) |
 | Repository policy | `.sphinxconfig` (legacy `.sphinx.json` is read when `.sphinxconfig` is absent) |
 | Repository exclusions | `.sphinxignore` |
 | Project context and question preferences | `.sphinxcontext.md` (kept out of Git by default) |
