@@ -17,7 +17,8 @@ async function fixture(t, { maxModelCalls = 10, generate, validate = async () =>
   t.after(() => rm(home, { recursive: true, force: true }));
   const config = { ...structuredClone(DEFAULT_CONFIG), maxModelCalls };
   let attempts = 0, authorizations = 0;
-  const store = createSessionStore({ env: { SPHINX_HOME: home }, validate,
+  const env = { SPHINX_HOME: home };
+  const store = createSessionStore({ env, validate,
     generate: async (_snapshot, _config, options) => {
       attempts++;
       if (generate) return generate(attempts, options);
@@ -36,7 +37,7 @@ async function fixture(t, { maxModelCalls = 10, generate, validate = async () =>
     validate: () => validate(change, config), config, ui,
     choose: async prompt => { prompts.push(prompt); return choose(prompt); }, ...extra,
   });
-  return { config, store, run, ui, messages, prompts, attempts: () => attempts, authorizations: () => authorizations };
+  return { env, config, store, run, ui, messages, prompts, attempts: () => attempts, authorizations: () => authorizations };
 }
 
 test('failed review waits for an explicit retry and keeps the same allowance and route', async t => {
@@ -255,6 +256,24 @@ test('an OpenRouter rate limit offers the installed coding-agent plans, and swit
   assert.equal(saved.routeChanges.length, 1);
   assert.equal(saved.routeChanges[0].from.provider, 'openrouter');
   assert.equal(f.config.models.small.provider, 'openrouter', 'Saved routes are untouched');
+});
+
+test('a plan switch, wired as the terminal check wires it, stops background preparation reviewing the check and reviews on the plan', async t => {
+  const f = await fixture(t, { generate: async (attempt, options) => { await options.beforeCall(); if (attempt === 1) throw rateLimit(); return { questions: [question] }; } });
+  // Background preparation, in another process, takes the check once the first review fails.
+  let reviewing; const started = new Promise(resolve => { reviewing = resolve; });
+  const worker = createSessionStore({ env: f.env, generate: async (_s, _c, options) => {
+    await options.beforeCall(); reviewing();
+    return new Promise((_, reject) => { options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true }); setTimeout(reject, 10000, new Error('Never stopped.')).unref(); });
+  } });
+  let stopped, waited;
+  const result = await f.run(async () => { stopped = worker.prepare(snapshot.id, f.config, { wait: true, stoppable: true }).then(() => null, error => error.code); await started; return 'switch-claude'; }, {
+    planProviders: ['claude'],
+    switchRoute: async provider => { const at = Date.now(); await f.store.switchRoute(snapshot.id, f.config, provider); waited = Date.now() - at; },
+  });
+  assert.ok(waited < 1500, `the switch waited ${waited} ms`);
+  assert.equal(await stopped, 'SPHINX_SWITCHED');
+  assert.deepEqual([result.status, result.route.provider, f.attempts()], ['active', 'claude', 2]);
 });
 
 test('no switch is offered for other failures, without installed plans, or when already on a plan', async t => {

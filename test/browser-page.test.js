@@ -446,6 +446,63 @@ test('the context line names the model reviewing this check', () => {
   assert.equal(p.nodes.usage.textContent, 'Claude Code haiku');
 });
 
+const pickerModels = { groups: [{ provider: 'claude', label: 'Claude Code', billing: 'your plan', models: [{ model: 'haiku', label: 'Haiku' }, { model: 'sonnet', label: 'Sonnet' }] },
+  { provider: 'openrouter', label: 'OpenRouter', billing: 'API key', custom: true, models: [{ model: 'qwen/qwen3-coder', label: 'qwen/qwen3-coder' }] }], reviewing: false, busy: false };
+const failedReview = { ...question, phase: 'recovery', question: undefined, route: { provider: 'openrouter', model: 'qwen/qwen3-coder', tier: 'large' }, models: pickerModels, choices: [{ value: 'retry', label: 'Continue the saved review', description: 'Reuse the evidence already saved.' }] };
+// The chip's text, a listed model by name, and the recovery prompt's Continue button.
+const picker = p => {
+  p.nodes.recovery.querySelectorAll = () => p.nodes.recovery.children.map(row => row.children[0]);
+  return { chip: () => p.nodes.model.children[0].textContent, option: label => p.nodes['model-menu'].children.find(item => item.children?.[1]?.textContent === label), retry: () => p.nodes.recovery.children[0].children[0] };
+};
+
+test('a model switch says what it is switching to, and the picker sends one pick at a time', async () => {
+  const bodies = []; let respond;
+  const p = page((_url, init) => { bodies.push(JSON.parse(init.body)); return new Promise(resolve => { respond = resolve; }); });
+  const { chip, option, retry } = picker(p);
+  p.update(failedReview);
+  p.nodes.model.onclick(); option('Sonnet').onclick();
+  assert.equal(chip(), 'Switching to Claude Code sonnet…', 'the switch may wait for the check, so the page says so');
+  assert.equal(p.nodes.model.disabled, true); assert.equal(p.nodes.status.textContent, 'Switching to Claude Code sonnet…');
+  assert.equal(p.nodes['model-menu'].children[1].textContent, 'Switching to Claude Code sonnet…');
+  // Nothing can race it: another model, a model ID, the default box, or the prompt's own choices.
+  const [input, use] = p.nodes['model-menu'].children.find(item => item.className === 'custom').children, save = p.nodes['model-menu'].children.at(-1).children[0];
+  assert.deepEqual([option('Haiku').disabled, input.disabled, use.disabled, save.disabled, retry().disabled], [true, true, true, true, true]);
+  option('Sonnet').onclick(); option('Haiku').onclick();
+  assert.equal(bodies.length, 1, 'repeat picks send nothing while the first waits');
+  respond({ ok: true, json: async () => ({ ok: true }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.nodes['model-menu'].hidden, true);
+  p.update({ ...failedReview, sequence: 2, route: { provider: 'claude', model: 'sonnet', tier: 'large' } });
+  assert.equal(chip(), 'Claude Code sonnet'); assert.equal(p.nodes.model.disabled, false);
+  // A switch asked for in another tab, or before a reload, shows the same.
+  p.update({ ...failedReview, sequence: 3, models: { ...pickerModels, switching: { provider: 'claude', model: 'haiku' } } });
+  assert.equal(chip(), 'Switching to Claude Code haiku…'); assert.equal(p.nodes.model.disabled, true); assert.equal(retry().disabled, true);
+});
+
+test('a refused switch says why in the menu, and frees the picker and the prompt', async () => {
+  let respond;
+  const p = page(() => new Promise(resolve => { respond = resolve; }));
+  const { chip, option, retry } = picker(p), busy = 'Another Sphinx process is still using this check. Try again once it finishes.';
+  p.update(failedReview);
+  p.nodes.model.onclick(); option('Sonnet').onclick();
+  respond({ ok: false, json: async () => ({ error: busy }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.nodes['model-menu'].children.find(item => item.className === 'menu-error').textContent, busy);
+  assert.deepEqual([chip(), p.nodes.model.disabled, option('Sonnet').disabled, retry().disabled, p.nodes.status.textContent], ['OpenRouter qwen/qwen3-coder', false, false, false, 'Review needs your decision']);
+});
+
+test('mid-review, the model already reviewing is sent without offering a restart, and another model asks first', async () => {
+  const bodies = [];
+  const p = page(async (_url, init) => { bodies.push(JSON.parse(init.body)); return { ok: true, json: async () => ({ ok: true }) }; });
+  const { option } = picker(p), confirm = () => p.nodes['model-menu'].children.find(item => item.className === 'confirm');
+  p.update({ ...question, phase: 'working', route: { provider: 'claude', model: 'sonnet', tier: 'large' }, models: { ...pickerModels, reviewing: true } });
+  p.nodes.model.onclick(); option('Haiku').onclick();
+  assert.equal(confirm().children[0].textContent, 'Restart the review with Claude Code Haiku?'); assert.equal(bodies.length, 0);
+  option('Sonnet').onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(confirm(), undefined); assert.deepEqual(bodies.map(body => body.model), ['sonnet']);
+});
+
 test('the score shows one dot per recent answer, empty slots while warming up, and the percentage once scored', () => {
   const p = page();
   p.update({ ...question, score: { calibrating: true, answered: 2, needed: 3, accuracy: null, streak: 2, skipRate: null, recent: [true, false] } });

@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DEFAULT_CONFIG, getPaths } from '../src/config.js';
 import { pushSnapshots, repository } from '../src/git.js';
 import { toggleYolo } from '../src/overrides.js';
@@ -129,6 +130,17 @@ test('failed preparation is recorded safely and only an explicit retry spends an
   await runPreparation({ ...f.options, store: f.store }); assert.equal(attempts, 1);
   assert.equal((await schedulePreparation({ ...f.options, retry: true })).status, 'scheduled');
   await runPreparation({ ...f.options, store: f.store }); assert.equal(attempts, 2);
+});
+
+test('a review stopped for a model switch is recorded as stopped, and only an explicit retry prepares it again', async t => {
+  const f = await fixture(t); let attempts = 0;
+  f.store.prepare = async () => { if (++attempts === 1) throw Object.assign(new Error('Stopped for a switch to another model.'), { code: 'SPHINX_SWITCHED' }); };
+  await schedulePreparation(f.options);
+  assert.equal((await runPreparation({ ...f.options, store: f.store })).status, 'stopped');
+  assert.equal((await preparationStatus(f.options)).status, 'stopped');
+  assert.equal((await schedulePreparation(f.options)).state, 'stopped');
+  assert.equal((await schedulePreparation({ ...f.options, retry: true })).status, 'scheduled');
+  assert.equal((await runPreparation({ ...f.options, store: f.store })).status, 'ready'); assert.equal(attempts, 2);
 });
 
 test('evaluator subprocesses, disabled policy, and detached HEAD never schedule', async t => {
@@ -391,4 +403,44 @@ test('the background worker curates the working context once before preparing, w
   assert.equal(curated.length, 1);
   assert.equal(curated[0].model, f.config.models.small.model);
   assert.match(curated[0].prompt, /count = 2/, 'The curator sees the unpushed change');
+});
+
+test('a model switch stops the worker\'s review within about a second: its CLI call is killed, the job is recorded as stopped, and the worker exits', { timeout: 30000 }, async t => {
+  const { createSessionStore } = await import('../src/sessions.js');
+  const { loadConfig, saveConfig } = await import('../src/config.js');
+  const f = await fixture(t), { root } = await repository(f.cwd);
+  const bin = path.join(f.directory, 'bin'), state = path.join(f.directory, 'cli-state');
+  await mkdir(bin); await mkdir(state);
+  // The only model process that runs: a stand-in for the claude CLI that holds the review's first call until it is stopped.
+  await writeFile(path.join(bin, 'claude'), `#!/usr/bin/env node
+const fs = require('node:fs'), path = require('node:path'), state = process.env.SPHINX_TEST_STATE;
+process.on('SIGTERM', () => { fs.writeFileSync(path.join(state, 'terminated'), 'yes'); process.exit(0); });
+fs.writeFileSync(path.join(state, 'ready'), String(process.pid));
+setTimeout(() => {}, 60000);
+`, { mode: 0o755 });
+  const claude = { provider: 'claude', model: null };
+  await saveConfig({ ...f.config, provider: 'claude', model: null, workingContext: false, models: { small: claude, medium: claude, large: claude } }, f.env);
+  const env = { ...f.env, PATH: `${bin}${path.delimiter}${f.env.PATH}`, SPHINX_TEST_STATE: state };
+  const { jobId } = await schedulePreparation({ ...f.options, env, config: undefined });
+  // The worker the scheduler would start: the real CLI, in its own process.
+  const worker = spawn(process.execPath, [fileURLToPath(new URL('../bin/sphinx.js', import.meta.url)), 'prepare', '--worker'], { cwd: f.cwd, env: { ...env, SPHINX_PREPARATION_JOB: jobId }, stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = ''; worker.stderr.on('data', chunk => { stderr += chunk; });
+  const exited = new Promise(resolve => worker.once('close', code => resolve(code)));
+  // The CLI runs in its own process group, which outlives a worker killed after a failure.
+  let cli = 0, stopped = false;
+  t.after(() => {
+    if (worker.exitCode === null && worker.signalCode === null) worker.kill('SIGKILL');
+    if (cli && !stopped) try { process.kill(-cli, 'SIGKILL'); } catch {}
+  });
+  for (let i = 0; i < 1500 && !cli; i++) { cli = Number(await readFile(path.join(state, 'ready'), 'utf8').catch(() => 0)); if (!cli) await new Promise(resolve => setTimeout(resolve, 10)); }
+  const store = createSessionStore({ env }), [session] = await store.pending(root);
+  const at = Date.now();
+  await store.switchRoute(session.id, await loadConfig(root, env), 'codex');
+  const waited = Date.now() - at;
+  assert.equal(await exited, 0, stderr);
+  assert.ok(waited < 2000, `the switch waited ${waited} ms`);
+  const after = await store.read(session.id);
+  stopped = await stat(path.join(state, 'terminated')).then(() => true, () => false);
+  assert.deepEqual({ cli: await readFile(path.join(state, 'terminated'), 'utf8').catch(() => 'still running'), job: (await preparationStatus({ cwd: f.cwd, env })).status, route: after.route.provider, calls: after.calls, investigation: after.reviewerCheckpoint ?? null },
+    { cli: 'yes', job: 'stopped', route: 'codex', calls: 1, investigation: null });
 });

@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { get } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createBrowserInterview, notifyDesktop, openQuestionnaireBrowser } from '../src/browser-interview.js';
-import { createSessionStore } from '../src/sessions.js';
+import { createSessionStore, sessionFile } from '../src/sessions.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
 import { claimCheckpointDialog, checkpointTerminalStatus, finishCheckpointDialog } from '../src/terminal-launch.js';
 import { recentOverrides } from '../src/overrides.js';
@@ -502,18 +502,22 @@ test('picking a model mid-review stops that run and restarts the review on the n
   assert.ok(state.messages.some(item => /Restarting the review on the new model/.test(item.text)));
 });
 
-test('a model picked while background preparation holds the check is applied once it finishes, and the push goes on', async t => {
-  // The worker writes questions, or decides a small change needs none; either way no review restarts.
+test('a model picked while another process reviews the check, one that does not stop for a switch, is applied once it finishes, and the push goes on', async t => {
+  // That review writes questions, or decides a small change needs none; either way no review restarts.
   for (const outcome of [{ questions: [q] }, { questions: [], noQuestionReason: 'Only renames a local variable.' }]) {
     let release; const held = new Promise(resolve => { release = resolve; });
     const f = await fixture(t, { plans: ['claude'] });
-    // Background preparation runs in another process; a second store takes the same lock file.
+    // Such as a terminal's review, in another process; a second store takes the same lock file.
     const worker = createSessionStore({ env: f.env, generate: async (_s, _c, options) => { await options.beforeCall(); await held; return outcome; } });
     const preparing = worker.prepare(f.snapshot.id, f.config, { wait: true });
     for (let i = 0; i < 300 && (await f.store.read(f.snapshot.id)).preparation?.status !== 'running'; i++) await delay(10);
     const done = f.present();
     for (let i = 0; i < 300 && !f.interview.state.models?.reviewing; i++) await delay(10);
     assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { ok: true, restarting: true });
+    // The switch waits for that review: the page says so, and another pick is refused rather than queued.
+    for (let i = 0; i < 300 && !f.interview.state.models?.switching; i++) await delay(10);
+    assert.deepEqual(f.interview.state.models.switching, { provider: 'claude', model: 'sonnet' });
+    assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'haiku' })).json(), { error: 'Already switching to Claude Code sonnet.' });
     release(); await preparing;
     const state = await f.waitFor(outcome.questions.length ? 'question' : 'consent');
     assert.deepEqual([state.route.provider, state.route.model], ['claude', 'sonnet']);
@@ -523,6 +527,215 @@ test('a model picked while background preparation holds the check is applied onc
     await f.confirm();
     assert.equal((await done).status, 'passed');
   }
+});
+
+const unavailable = () => Object.assign(new Error('OpenRouter reported a provider error (code: 503). Selected model is unavailable.'), { code: 'OPENROUTER_PROVIDER_ERROR', status: 503 });
+const switchedNotices = state => state.messages.filter(item => item.kind === 'notice' && item.text.startsWith('Switched this check')).length;
+// Background preparation's review as the worker runs it, in another process (a second store on the
+// same lock file): stoppable, and on a model call that lasts until it is stopped (or gives up after 10 s).
+const backgroundReview = f => {
+  let started; const reviewing = new Promise(resolve => { started = resolve; });
+  const worker = createSessionStore({ env: f.env, generate: async (_s, _c, options) => {
+    await options.beforeCall(); started();
+    return new Promise((_, reject) => { options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true }); setTimeout(reject, 10000, new Error('Never stopped.')).unref(); });
+  } });
+  return { reviewing, stopped: () => worker.prepare(f.snapshot.id, f.config, { wait: true, stoppable: true }).then(() => null, error => error.code) };
+};
+
+test('a model picked at the recovery prompt stops background preparation reviewing the check, and the review restarts on it within about a second', async t => {
+  // As reported: the page's review failed, then background preparation took the check and reviewed it again on the same route.
+  const reviewers = [];
+  const f = await fixture(t, { plans: ['claude'], generate: async (n, options) => {
+    await options.beforeCall(); reviewers.push((await f.store.read(f.snapshot.id)).route.model);
+    if (n === 1) throw unavailable(); return { questions: [q] };
+  } });
+  const done = f.present(); await f.waitFor('recovery');
+  const background = backgroundReview(f), stopped = background.stopped(); await background.reviewing;
+  const picked = Date.now();
+  assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { ok: true });
+  const landed = Date.now() - picked, state = await f.waitFor('question'), restarted = Date.now() - picked;
+  assert.ok(landed < 1500 && restarted < 2500, `the switch landed ${landed} ms and the question showed ${restarted} ms after the pick`);
+  assert.equal(await stopped, 'SPHINX_SWITCHED');
+  assert.deepEqual({ reviewers, route: `${state.route.provider} ${state.route.model}`, switched: switchedNotices(state), stopFile: await stat(`${sessionFile(f.snapshot.id, f.env)}.stop`).then(() => true, () => false) },
+    { reviewers: ['openrouter/free', 'sonnet'], route: 'claude sonnet', switched: 1, stopFile: false });
+  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+});
+
+test('a model picked while the page waits for background preparation\'s review stops that review, and the page reviews on the pick', async t => {
+  const reviewers = [];
+  const f = await fixture(t, { plans: ['claude'], generate: async (_n, options) => { await options.beforeCall(); reviewers.push((await f.store.read(f.snapshot.id)).route.model); return { questions: [q] }; } });
+  const background = backgroundReview(f), stopped = background.stopped(); await background.reviewing;
+  const done = f.present();
+  for (let i = 0; i < 300 && !f.interview.state.models?.reviewing; i++) await delay(10);
+  const picked = Date.now();
+  assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { ok: true, restarting: true });
+  const state = await f.waitFor('question'), restarted = Date.now() - picked;
+  assert.ok(restarted < 2500, `the question showed ${restarted} ms after the pick`);
+  assert.equal(await stopped, 'SPHINX_SWITCHED');
+  assert.deepEqual({ reviewers, route: `${state.route.provider} ${state.route.model}` }, { reviewers: ['sonnet'], route: 'claude sonnet' });
+  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+});
+
+test('the recovery prompt says what the waiting push does in the page\'s words, not the terminal\'s', async t => {
+  const f = await fixture(t, { generate: async (_n, options) => { await options.beforeCall(); throw unavailable(); } });
+  f.present(); const state = await f.waitFor('recovery');
+  assert.equal(state.error.split('\n')[0], 'The push waits for your choice, subject to its time limit.');
+  assert.doesNotMatch(state.error, /terminal/);
+});
+
+test('picks made while another process holds a failed review switch the check once, and none reaches the question that follows', async t => {
+  // As reported: the page's review failed, another process then took the check and reviewed
+  // it again, and Sonnet was picked four times while each pick waited for the lock. Here that process
+  // does not stop for a switch (background preparation does, below), and the picks arrive together, as from several tabs.
+  let release; const held = new Promise(resolve => { release = resolve; });
+  const second = { ...q, id: 'q2', prompt: 'Second question: what about a restart?' };
+  const f = await fixture(t, { plans: ['claude'], snapshotOverrides: { stats: { additions: 200, deletions: 40, files: 6 } },
+    generate: async (_n, options) => { await options.beforeCall(); throw unavailable(); } });
+  const done = f.present(); await f.waitFor('recovery');
+  const worker = createSessionStore({ env: f.env, generate: async (_s, _c, options) => { await options.beforeCall(); await held; return { questions: [q, second] }; } });
+  const preparing = worker.prepare(f.snapshot.id, f.config, { wait: true });
+  for (let i = 0; i < 300 && (await f.store.read(f.snapshot.id)).preparation?.status !== 'running'; i++) await delay(10);
+  const picks = Array.from({ length: 4 }, () => pickModel(f, { provider: 'claude', model: 'sonnet', saveDefault: true }));
+  for (let i = 0; i < 300 && !f.interview.state.models?.switching; i++) await delay(10);
+  await delay(50);
+  const shown = f.interview.state.models.switching ?? null;
+  release(); await preparing;
+  const answers = await Promise.all(picks.map(async pick => { const res = await pick; return [res.status, (await res.json()).error ?? 'ok']; }));
+  await f.waitFor('question'); await delay(100);
+  const state = f.interview.state;
+  assert.deepEqual({ shown, answers: answers.sort(([a], [b]) => a - b), switched: switchedNotices(state), routeChanges: (await f.store.read(f.snapshot.id)).routeChanges.length, error: state.error ?? null, busy: state.models.busy },
+    { shown: { provider: 'claude', model: 'sonnet' }, answers: [[200, 'ok'], ...Array(3).fill([409, 'Already switching to Claude Code sonnet.'])], switched: 1, routeChanges: 1, error: null, busy: false });
+  assert.deepEqual([state.route.provider, state.route.model], ['claude', 'sonnet']);
+  await f.post('answer', { response: 'Yes, the insert is repeated.' });
+  for (let i = 0; i < 300 && f.interview.state.question?.id !== 'q2'; i++) await delay(10);
+  await f.post('answer', { response: 'The set is recreated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+});
+
+test('a switch to the model another process already moved the check to records and says nothing, but still becomes the default asked for', async t => {
+  const f = await fixture(t, { plans: ['claude'] });
+  const done = f.present(); await f.waitFor('question');
+  // A terminal check moves the check to Sonnet after the page read its model, before the page's switch takes the lock.
+  const other = createSessionStore({ env: f.env }), switchRoute = f.store.switchRoute;
+  f.store.switchRoute = async (...args) => { await other.switchRoute(f.snapshot.id, f.config, 'claude', { model: 'sonnet' }); return switchRoute(...args); };
+  assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet', saveDefault: true })).json(), { ok: true });
+  assert.equal((await f.store.read(f.snapshot.id)).routeChanges.length, 1, 'only the terminal\'s switch');
+  assert.equal(switchedNotices(f.interview.state), 0);
+  assert.deepEqual([f.interview.state.route.provider, f.interview.state.route.model], ['claude', 'sonnet']);
+  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+  await f.interview.close();
+  const { readFile } = await import('node:fs/promises');
+  assert.deepEqual(JSON.parse(await readFile(path.join(f.env.SPHINX_HOME, 'config.json'), 'utf8')).models.large, { provider: 'claude', model: 'sonnet' });
+});
+
+test('while a model picked at a failed review waits for the check, the other choices wait too, and the review retries on that model', async t => {
+  const reviewers = [];
+  const f = await fixture(t, { plans: ['claude'], generate: async (n, options) => {
+    await options.beforeCall(); reviewers.push((await f.store.read(f.snapshot.id)).route.model);
+    if (n === 1) throw unavailable(); return { questions: [q] };
+  } });
+  // The switch waits, as it does for the check's lock while another process holds it.
+  let entered, land; const waiting = new Promise(resolve => { entered = resolve; }), lock = new Promise(resolve => { land = resolve; });
+  const switchRoute = f.store.switchRoute;
+  f.store.switchRoute = async (...args) => { entered(); await lock; return switchRoute(...args); };
+  const done = f.present(); await f.waitFor('recovery');
+  const picked = pickModel(f, { provider: 'claude', model: 'sonnet' }); await waiting;
+  // A retry now would race the switch for the check, and could review on the old model again.
+  const retry = await f.post('retry');
+  assert.deepEqual([retry.status, (await retry.json()).error], [409, 'Wait for the switch to Claude Code sonnet.']);
+  land(); assert.deepEqual(await (await picked).json(), { ok: true });
+  await f.waitFor('question');
+  assert.deepEqual(reviewers, ['openrouter/free', 'sonnet']);
+  assert.equal(switchedNotices(f.interview.state), 1);
+  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+});
+
+test('a switch that fails says why in the conversation, and the picker works again', async t => {
+  const f = await fixture(t, { plans: ['claude'], generate: async (n, options) => { await options.beforeCall(); if (n === 1) throw unavailable(); return { questions: [q] }; } });
+  // The lock wait gives up after timeoutSeconds + 5 while another process still holds the check.
+  // The store's words are for a terminal; the page says what is true for it.
+  const busy = 'This assessment is already running. Wait for preparation to finish, then resume the check.', said = 'Another Sphinx process is still using this check. Try again once it finishes.';
+  const switchRoute = f.store.switchRoute; let fails = 1;
+  f.store.switchRoute = async (...args) => { if (fails-- > 0) throw Object.assign(new Error(busy), { code: 'SPHINX_SESSION_BUSY' }); return switchRoute(...args); };
+  const done = f.present(); await f.waitFor('recovery');
+  const res = await pickModel(f, { provider: 'claude', model: 'sonnet' });
+  assert.deepEqual([res.status, (await res.json()).error], [409, said]);
+  const state = f.interview.state;
+  assert.deepEqual({ phase: state.phase, switching: state.models.switching ?? null, notice: state.messages.at(-1)?.text }, { phase: 'recovery', switching: null, notice: `Could not switch to Claude Code sonnet. ${said}` });
+  assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { ok: true });
+  await f.waitFor('question');
+  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+});
+
+test('an answer refused while another process holds the check says so in the page\'s words', async t => {
+  const f = await fixture(t);
+  const answer = f.store.answer; let fails = 1;
+  f.store.answer = async (...args) => { if (fails-- > 0) throw Object.assign(new Error('This assessment is already running. Wait for preparation to finish, then resume the check.'), { code: 'SPHINX_SESSION_BUSY' }); return answer(...args); };
+  const done = f.present(); await f.waitFor('question');
+  await f.post('answer', { response: 'Yes, the insert is repeated.' });
+  for (let i = 0; i < 300 && !f.interview.state.error; i++) await delay(10);
+  assert.deepEqual([f.interview.state.phase, f.interview.state.error], ['question', 'Another Sphinx process is still using this check. Try again once it finishes.']);
+  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+});
+
+test('Pause while a switch waits stops both, and the conversation says nothing about the switch', async t => {
+  const f = await fixture(t, { plans: ['claude'], generate: async (_n, options) => { await options.beforeCall(); throw unavailable(); } });
+  const switchRoute = f.store.switchRoute;
+  f.store.switchRoute = async (...args) => { await delay(60000, undefined, { signal: args[3].signal }); return switchRoute(...args); };
+  const done = f.present(); await f.waitFor('recovery');
+  const picked = pickModel(f, { provider: 'claude', model: 'sonnet' });
+  for (let i = 0; i < 300 && !f.interview.state.models?.switching; i++) await delay(10);
+  await f.post('pause');
+  assert.equal((await picked).status, 409); assert.equal((await done).status, 'pending');
+  assert.deepEqual(f.interview.state.messages.filter(item => item.kind === 'notice'), []);
+});
+
+test('a model picked just as the review finishes grades its questions', async t => {
+  const graders = [];
+  const f = await fixture(t, { plans: ['claude'], grade: async request => { graders.push(request.config.model); return { verdict: 'correct', feedback: 'Correct.', followUp: null }; } });
+  // The pick comes after the review's last check for a stop, as during its final save.
+  const start = f.store.start;
+  f.store.start = async (...args) => { const result = await start(...args); assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { ok: true, restarting: true }); return result; };
+  const done = f.present(); const state = await f.waitFor('question');
+  assert.deepEqual({ route: `${state.route.provider} ${state.route.model}`, switched: switchedNotices(state), reviews: f.generated() }, { route: 'claude sonnet', switched: 1, reviews: 1 });
+  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+  assert.deepEqual(graders, ['sonnet']);
+});
+
+test('a model picked while rate-limited grading waits goes back to the question, without the stale error', async t => {
+  const f = await fixture(t, { plans: ['claude'], grade: async (_request, count) => {
+    if (count === 1) throw Object.assign(new Error('OpenRouter HTTP 429 (code: 429; error_type: rate_limit_exceeded).'), { code: 'OPENROUTER_PROVIDER_ERROR', status: 429, errorType: 'rate_limit_exceeded' });
+    return { verdict: 'correct', feedback: 'Correct.', followUp: null };
+  } });
+  const done = f.present(); await f.waitFor('question');
+  await f.post('answer', { response: 'Yes, it inserts again.' }); await f.waitFor('recovery');
+  assert.deepEqual(await (await pickModel(f, { provider: 'claude', model: 'sonnet' })).json(), { ok: true });
+  const state = await f.waitFor('question');
+  assert.deepEqual({ error: state.error ?? null, route: `${state.route.provider} ${state.route.model}`, draft: state.draft?.text }, { error: null, route: 'claude sonnet', draft: 'Yes, it inserts again.' });
+  await f.post('answer', { response: 'Yes, it inserts again.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
+});
+
+test('grading that throws before its call starts still leaves the model picker usable', async t => {
+  const f = await fixture(t, { plans: ['claude'] });
+  const answer = f.store.answer; let thrown = false;
+  f.store.answer = (...args) => { if (thrown) return answer(...args); thrown = true; throw new TypeError('Grading could not start.'); };
+  const done = f.present(); await f.waitFor('question');
+  await f.post('answer', { response: 'Yes, the insert is repeated.' });
+  for (let i = 0; i < 300 && !f.interview.state.error; i++) await delay(10);
+  await delay(50);
+  assert.equal(f.interview.state.error, 'Grading could not start.');
+  assert.equal(f.interview.state.models.busy, false);
+  assert.equal((await pickModel(f, { provider: 'claude', model: 'sonnet' })).status, 200);
+  await f.post('answer', { response: 'Yes, the insert is repeated.' }); await f.confirm();
+  assert.equal((await done).status, 'passed');
 });
 
 test('the page shows the question distance and saves a repository change only when the check ends', async t => {

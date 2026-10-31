@@ -28,7 +28,7 @@ export const HELP = {
   prepare: {
     summary: 'Prepare questions in the background before the next push.', usage: 'sphinx prepare [--retry] [--json]',
     paragraphs: ['Installed post-commit, post-merge, post-rewrite, and post-checkout hooks schedule a debounced reviewer automatically. This command schedules the same preparation explicitly.', 'The reviewer investigates filtered Git evidence and project context, but never answers questions or approves a push. Preparation uses local remote-tracking refs; a different actual destination or remote base safely starts a fresh check.'],
-    groups: [['Preparation', [['--retry', 'Explicitly retry a failed preparation within the assessment’s optional call cap. Automatic hooks do not retry failures.']]], ['Output', common]],
+    groups: [['Preparation', [['--retry', 'Explicitly retry a failed or stopped preparation within the assessment’s optional call cap. Automatic hooks do not retry it.']]], ['Output', common]],
     examples: ['sphinx prepare', 'sphinx status', 'sphinx prepare --retry'],
     footer: 'Set backgroundPreparation: false in your global config or repository .sphinxconfig to disable preparation. Models and optional call caps remain machine-wide. Background work counts toward any explicitly configured assessment cap.',
   },

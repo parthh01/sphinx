@@ -168,22 +168,24 @@ function scoreView(sc){
 }
 // The reviewer model picker: a chip in the info line opening a small menu.
 // Mid-review it asks once first, because switching restarts the review.
-let menuOpen=false,pendingPick=null,menuError='';
+let menuOpen=false,pendingPick=null,menuError='',switchingTo='';
 const MODEL_NAMES={claude:'Claude Code',codex:'Codex',openrouter:'OpenRouter',openai:'Endpoint'};
 const node=(tag,cls,value)=>{const item=document.createElement(tag);if(cls)item.className=cls;if(value!==undefined)item.textContent=value;return item;};
+// A switch can wait minutes for the check to be free. Say so, whether this tab or another asked.
+const switchingText=state=>switchingTo||routeText(state.models?.switching);
 function modelView(state){
- const groups=state.models?.groups||[],chip=$('model'),route=routeText(state.route),usage=usageText(state.usage,state.tokens);
+ const groups=state.models?.groups||[],chip=$('model'),route=routeText(state.route),usage=usageText(state.usage,state.tokens),switching=switchingText(state);
  const offered=groups.length>0&&!finished&&!!route;
  chip.hidden=!offered;
- if(offered){chip.replaceChildren(node('span','',route),node('span','caret','▾'));chip.disabled=!!state.models.busy;
-  chip.title=state.models.busy?'You can switch models once this answer is checked.':'Change the reviewer model for this check';}
+ if(offered){chip.replaceChildren(node('span','',switching?'Switching to '+switching+'…':route),node('span','caret','▾'));chip.disabled=!!state.models.busy||!!switching;
+  chip.title=switching?'Switching to '+switching+' as soon as the check is free.':state.models.busy?'You can switch models once this answer is checked.':'Change the reviewer model for this check';}
  text('usage',offered?usage:[route,usage].filter(Boolean).join(' · '));
  if(!offered||state.models.busy)closeMenu();else if(menuOpen)buildMenu(state);
 }
 function closeMenu(){if(!menuOpen)return;menuOpen=false;pendingPick=null;menuError='';$('model-menu').hidden=true;$('model').setAttribute('aria-expanded','false');}
 function buildMenu(state){
- const route=state.route||{},reviewing=!!state.models?.reviewing,keep=document.getElementById('model-save')?.checked===true;
- const parts=[node('h3','','Model for this check'),node('p','menu-note',reviewing?'Switching restarts the review on the new model. Usage so far stays counted.':'Answers are checked with the new model from now on.')];
+ const route=state.route||{},reviewing=!!state.models?.reviewing,switching=switchingText(state),keep=document.getElementById('model-save')?.checked===true;
+ const parts=[node('h3','','Model for this check'),node('p','menu-note',switching?'Switching to '+switching+'…':reviewing?'Switching restarts the review on the new model. Usage so far stays counted.':'Answers are checked with the new model from now on.')];
  // The restart question goes at the top, where the eye already is.
  if(pendingPick){const box=node('div','confirm'),actions=node('div'),go=node('button','primary','Restart'),no=node('button','quiet','Cancel');go.type=no.type='button';
   go.onclick=()=>commit(pendingPick);no.onclick=()=>{pendingPick=null;buildMenu(current);};box.append(node('p','','Restart the review with '+pendingPick.label+'?'));actions.append(go,no);box.append(actions);parts.push(box);}
@@ -191,29 +193,33 @@ function buildMenu(state){
   parts.push(node('div','group',group.label+' · '+group.billing));
   for(const option of group.models){
    const selected=route.provider===group.provider&&route.model===option.model,button=node('button','option');button.type='button';
-   button.setAttribute('role','menuitemradio');button.setAttribute('aria-checked',String(selected));button.disabled=!!option.disabled;if(option.disabled)button.title=option.disabled;
+   button.setAttribute('role','menuitemradio');button.setAttribute('aria-checked',String(selected));button.disabled=!!option.disabled||!!switching;if(option.disabled)button.title=option.disabled;
    button.append(node('span','dot',selected?'●':''),node('span','name',option.label),node('span','tag',option.disabled?'off':option.note||''));
    button.onclick=()=>pick(state,{provider:group.provider,model:option.model,label:(MODEL_NAMES[group.provider]||group.label)+' '+option.label});
    parts.push(button);
   }
   if(group.custom){
-   const row=node('div','custom'),input=node('input'),use=node('button','quiet','Use');input.placeholder='Other model ID…';input.setAttribute('aria-label',group.label+' model ID');input.spellcheck=false;use.type='button';
+   const row=node('div','custom'),input=node('input'),use=node('button','quiet','Use');input.placeholder='Other model ID…';input.setAttribute('aria-label',group.label+' model ID');input.spellcheck=false;use.type='button';input.disabled=use.disabled=!!switching;
    use.onclick=()=>{const model=input.value.trim();if(model)pick(state,{provider:group.provider,model,label:(MODEL_NAMES[group.provider]||group.label)+' '+model});};
    input.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();use.onclick();}};
    row.append(input,use);parts.push(row);
   }
  }
  if(menuError)parts.push(node('p','menu-error',menuError));
- const foot=node('label','menu-foot'),save=node('input');save.type='checkbox';save.id='model-save';save.checked=keep;foot.append(save,node('span','','Also use for future checks'));parts.push(foot);
+ const foot=node('label','menu-foot'),save=node('input');save.type='checkbox';save.id='model-save';save.checked=keep;save.disabled=!!switching;foot.append(save,node('span','','Also use for future checks'));parts.push(foot);
  $('model-menu').replaceChildren(...parts);
  if(pendingPick)$('model-menu').scrollTop=0;
 }
-function pick(state,choice){menuError='';if(state.models?.reviewing){pendingPick=choice;buildMenu(state);return;}commit(choice);}
+// The model already reviewing restarts nothing, so it needs no asking.
+function pick(state,choice){menuError='';if(state.models?.reviewing&&!(state.route?.provider===choice.provider&&state.route?.model===choice.model)){pendingPick=choice;buildMenu(state);return;}commit(choice);}
 async function commit(choice){
- const save=document.getElementById('model-save')?.checked===true;pendingPick=null;
+ // One switch at a time: until Sphinx answers, the chip says what it is switching to and repeat picks do nothing.
+ if(switchingTo)return;
+ const save=document.getElementById('model-save')?.checked===true;pendingPick=null;switchingTo=routeText(choice);render(current);
  try{const res=await fetch(base+'/action?model=1',{method:'POST',headers:{'Content-Type':'application/json','X-Sphinx-Token':token},body:JSON.stringify({provider:choice.provider,model:choice.model,saveDefault:save})});
-  const data=await res.json().catch(()=>({}));if(!res.ok){menuError=data.error||'Could not switch models.';buildMenu(current);return;}closeMenu();}
- catch{menuError='Could not reach Sphinx. Try again.';buildMenu(current);}
+  const data=await res.json().catch(()=>({}));if(!res.ok)menuError=data.error||'Could not switch models.';else closeMenu();}
+ catch{menuError='Could not reach Sphinx. Try again.';}
+ finally{switchingTo='';render(current);}
 }
 $('model').onclick=()=>{if(menuOpen){closeMenu();return;}closeDistance();menuOpen=true;menuError='';$('model-menu').hidden=false;$('model-menu').style.left=$('model').offsetLeft+'px';$('model').setAttribute('aria-expanded','true');buildMenu(current);$('model-menu').querySelector?.('[aria-checked="true"]')?.focus?.();};
 document.onkeydown=event=>{if(event.key!=='Escape')return;if(menuOpen){closeMenu();$('model').focus();}if(distanceOpen){closeDistance();$('distance').focus();}};
@@ -277,7 +283,8 @@ function controls(){
  $('pause').disabled=!connected||submitting||finished;
  for(const id of ['skip','skipconfirm','skipcancel'])$(id).disabled=!connected||finished;
  $('hint').disabled=!canAnswer||hinted;$('hint').textContent=hinted?'Hint shown':'Show hint';
- for(const button of [...$('recovery').querySelectorAll('button'),...$('consent').querySelectorAll('button')])button.disabled=!connected||submitting||finished;
+ // A model switch waiting at a recovery prompt answers it once it lands, so no choice may race it.
+ for(const button of [...$('recovery').querySelectorAll('button'),...$('consent').querySelectorAll('button')])button.disabled=!connected||submitting||finished||(current.phase==='recovery'&&!!switchingText(current));
  $('response').disabled=current.phase!=='question'||current.operationClosed||submitting;
 }
 function history(messages){
@@ -322,7 +329,7 @@ function render(state){
  // While Git waits, pausing stops it, so the button says so in the scope line's words.
  const op=operation(state);$('pause').textContent=state.waitingGit?'Stop '+op:'Pause check';
  text('waiting',finished?'':state.phase==='consent'?'The '+op+' waits for your choice. Closing this tab leaves it waiting.':state.waitingGit?'After you pass, you choose whether the '+op+' goes through. Closing this tab leaves it waiting; Stop '+op+' stops it.':'Closing this tab leaves the check waiting. Use Pause check to stop.');
- const label=state.phase==='question'?'Question '+(state.progress.completed+1)+' of '+state.progress.total:state.phase==='working'?'Reviewing…':state.phase==='recovery'?'Review needs your decision':state.phase==='consent'?'Continue or stop':state.phase==='passed'?'Passed':state.phase==='paused'?(state.waitingGit?'Stopped':'Paused'):state.phase==='skipped'?'Skipped':state.phase==='stopped'?'Stopped':state.phase==='error'?'Check stopped':'Waiting…';
+ const label=state.phase==='question'?'Question '+(state.progress.completed+1)+' of '+state.progress.total:state.phase==='working'?'Reviewing…':state.phase==='recovery'?(switchingText(state)?'Switching to '+switchingText(state)+'…':'Review needs your decision'):state.phase==='consent'?'Continue or stop':state.phase==='passed'?'Passed':state.phase==='paused'?(state.waitingGit?'Stopped':'Paused'):state.phase==='skipped'?'Skipped':state.phase==='stopped'?'Stopped':state.phase==='error'?'Check stopped':'Waiting…';
  const retry=state.phase==='question'&&[...messages].reverse().find(item=>item.kind==='question')?.followUp;
  text('status',label+(retry?' · Needs another answer':''));$('message').className='message'+(['passed','consent'].includes(state.phase)?' passed':'');scope(state,branch,label);$('status').className='status phase-'+state.phase+(state.phase==='working'?' busy':'')+(retry?' retry':'');if((state.phase==='question'&&!retry)||state.phase==='consent')$('status').hidden=true;text('message',state.message);text('error',state.phase==='recovery'?'':state.error);text('recovery-reason',state.phase==='recovery'?state.error:''); if(['passed','stopped'].includes(state.phase)&&String(state.message||'').includes('\\n')){const [lead,...rest]=state.message.split('\\n');text('message',lead);text('status',rest.join(' '));$('status').className='status passed-note';}
  history(messages);

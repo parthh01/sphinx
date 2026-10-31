@@ -3,8 +3,8 @@ import { mkdir, open, stat, unlink } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readJson } from './config.js';
 
-/** Run `operation` while holding an exclusive lock file. `busy` builds the error thrown once `deadline` passes. */
-export async function withFileLock(file, operation, { signal, deadline = 0, busy } = {}) {
+/** Run `operation` with the lock record while holding an exclusive lock file. `busy` builds the error thrown once `deadline` passes; `onBusy` hears the holder's record on each wait. */
+export async function withFileLock(file, operation, { signal, deadline = 0, busy, onBusy } = {}) {
   signal?.throwIfAborted();
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   let handle;
@@ -21,16 +21,18 @@ export async function withFileLock(file, operation, { signal, deadline = 0, busy
     }
     if (alive) {
       if (deadline > Date.now()) {
+        await onBusy?.(lock);
         await delay(Math.min(200, deadline - Date.now()), undefined, { signal });
-        return withFileLock(file, operation, { signal, deadline, busy });
+        return withFileLock(file, operation, { signal, deadline, busy, onBusy });
       }
       throw busy();
     }
     await unlink(file).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    return withFileLock(file, operation, { signal, deadline, busy });
+    return withFileLock(file, operation, { signal, deadline, busy, onBusy });
   }
+  const held = { pid: process.pid, createdAt: new Date().toISOString() };
   try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
-    return await operation();
+    await handle.writeFile(JSON.stringify(held));
+    return await operation(held);
   } finally { await handle.close(); await unlink(file).catch(() => {}); }
 }
