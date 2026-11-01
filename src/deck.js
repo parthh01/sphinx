@@ -65,9 +65,10 @@ export async function readDeck(repoRoot, env = process.env, { strict = false } =
 // save. The strict read refuses to save over cards this version cannot parse.
 async function updateDeck(repoRoot, env, update, { wait = LOCK_WAIT, signal } = {}) {
   return withFileLock(`${deckFile(repoRoot, env)}.lock`, async () => {
+    signal?.throwIfAborted();
     const deck = await readDeck(repoRoot, env, { strict: true });
     const result = update(deck);
-    await writeJson(deckFile(repoRoot, env), { version: 1, repoRoot, cards: deck.cards });
+    await writeJson(deckFile(repoRoot, env), { version: 1, repoRoot, cards: deck.cards }, { signal });
     return result;
   }, { signal, deadline: Date.now() + wait, busy: () => new Error('Another Sphinx process is updating this deck. Try again.') });
 }

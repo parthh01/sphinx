@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -10,6 +11,7 @@ import {
 import { collectGarbage } from '../src/storage.js';
 import { createSessionStore } from '../src/sessions.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
+import { withFileLock } from '../src/lock.js';
 
 const q = {
   id: 'retry', concept: 'idempotency',
@@ -195,4 +197,29 @@ test('concurrent captures and reviews all reach the deck', async t => {
   const { cards } = await readDeck(repoRoot, env);
   assert.equal(Object.keys(cards).length, 5);
   assert.equal(cards[cardId(repoRoot, q.prompt)].reviews, 1);
+});
+
+test('waiters that find the same orphaned lock never run together', async t => {
+  const env = await home(t);
+  const lock = path.join(env.SPHINX_HOME, 'orphan.lock');
+  // A finished child's PID stands in for a process that died holding the lock.
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  for (let round = 0; round < 30; round += 1) {
+    await writeFile(lock, JSON.stringify({ pid: dead, createdAt: '2026-01-01T00:00:00.000Z' }));
+    const old = new Date(Date.now() - 60000);
+    await utimes(lock, old, old);
+    let inside = 0, most = 0;
+    // Staggered starts put one waiter's recovery after another has already retaken the lock.
+    // Waiters that find a live holder give up at once, so only overlap matters here.
+    await Promise.allSettled(Array.from({ length: 8 }, async (_, index) => {
+      await delay(index % 3);
+      return withFileLock(lock, async () => {
+        inside += 1; most = Math.max(most, inside);
+        await delay(30);
+        inside -= 1;
+      }, { busy: () => new Error('busy') });
+    }));
+    assert.equal(most, 1, `round ${round}: only one waiter holds the lock at a time`);
+  }
+  await assert.rejects(stat(`${lock}.recover`), { code: 'ENOENT' });
 });

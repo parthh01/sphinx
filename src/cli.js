@@ -509,7 +509,7 @@ async function drillCommand(values) {
   const summary = deckSummary(deck, now);
   const due = dueCards(deck, now);
   const listed = Object.values(deck.cards).sort((a, b) => a.dueAt.localeCompare(b.dueAt) || a.id.localeCompare(b.id));
-  const limit = values.limit !== undefined ? parseLimit(values.limit) : 10;
+  const limit = !values.list && values.limit !== undefined ? parseLimit(values.limit) : 10;
   const cards = values.list ? listed : due.slice(0, limit);
   if (values.json) {
     json({ repo: repo.root, ...summary, cards: cards.map(publicCard) });
@@ -524,7 +524,8 @@ async function drillCommand(values) {
     terminal.note('Makes no model calls.');
     return 0;
   }
-  if (!process.stdin.isTTY) throw new Error('Run sphinx drill in a terminal, or use --json. See sphinx drill --help.');
+  // A redirected stdout would hide the questions while the drill waits for answers.
+  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('Run sphinx drill in a terminal, or use --json. See sphinx drill --help.');
   return withReadline(async ask => {
     terminal.banner();
     terminal.section('Retention');

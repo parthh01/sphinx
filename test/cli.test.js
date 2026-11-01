@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, realpath, writeFile, rm, chmod, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -183,6 +183,7 @@ test('a passed check fills the local deck and sphinx drill lists it without mode
   const rejected = f.run(process.execPath, [CLI, 'drill', '--limit', '0']);
   assert.equal(rejected.status, 1);
   assert.match(rejected.stderr, /1 to 50/);
+  assert.equal(f.cliJson('drill', '--list', '--limit', '0').cards.length, 1, '--list ignores --limit');
   // Sphinx keys the deck by the resolved root; macOS temp paths run through a symlink.
   const repoRoot = await realpath(f.repo);
   const file = deckFile(repoRoot, f.env);
@@ -197,6 +198,40 @@ test('a passed check fills the local deck and sphinx drill lists it without mode
   assert.equal(dueNow.due, 1);
   assert.equal(dueNow.cards.length, 1);
   assert.equal(Object.hasOwn(dueNow.cards[0], 'back'), false);
+  // Run the drill as if from a terminal, answering through stdin.
+  // Each line goes in once its prompt is showing, as a person would type it.
+  const drillAs = (answers, { stdout = true } = {}) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e',
+      `Object.defineProperty(process.stdin,'isTTY',{value:true});${stdout ? "Object.defineProperty(process.stdout,'isTTY',{value:true});" : ''}const {main}=await import(${JSON.stringify(pathToFileURL(path.join(path.dirname(CLI), '../src/cli.js')).href)});try{process.exitCode=await main(['drill']);}catch(error){console.error(error.message);process.exitCode=1;}`,
+    ], { cwd: f.repo, env: { ...f.env, TERM: 'dumb' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const pending = [...answers];
+    let out = '', err = '';
+    child.stdout.on('data', chunk => {
+      out += chunk;
+      if (/(Your answer|again \(tomorrow\) or good[^:]*): $/.test(out) && pending.length) child.stdin.write(`${pending.shift()}\n`);
+    });
+    child.stderr.on('data', chunk => { err += chunk; });
+    child.on('error', reject);
+    child.on('close', status => { child.stdin.destroy(); resolve({ status, stdout: out, stderr: err }); });
+  });
+  const redirected = await drillAs(['my guess', 'good'], { stdout: false });
+  assert.equal(redirected.status, 1);
+  assert.match(redirected.stderr, /terminal|--json/);
+  assert.equal((await readDeck(repoRoot, f.env)).cards[id].reviews, 0, 'A redirected drill reviews nothing');
+  const again = await drillAs(['my guess', 'again']);
+  assert.equal(again.status, 0, again.stderr);
+  assert.match(again.stdout, /Membership is checked before insertion/, 'The stored explanation shows after the answer');
+  let card = (await readDeck(repoRoot, f.env)).cards[id];
+  assert.equal(card.reviews, 1);
+  assert.equal(card.intervalDays, 1);
+  assert.ok(Date.parse(card.dueAt) > Date.now(), 'again moves the card out of today');
+  stored.cards[id] = { ...card, dueAt: '2020-01-01T00:00:00.000Z' };
+  await writeFile(file, `${JSON.stringify(stored, null, 2)}\n`);
+  const good = await drillAs(['my guess', 'good']);
+  assert.equal(good.status, 0, good.stderr);
+  card = (await readDeck(repoRoot, f.env)).cards[id];
+  assert.equal(card.reviews, 2);
+  assert.ok(card.intervalDays > 1, 'good lengthens the interval');
   assert.equal((await f.calls()).length, before, 'drill makes no model calls');
 });
 
