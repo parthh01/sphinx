@@ -156,18 +156,84 @@ export async function repositoryConfigInfo(repoRoot) {
   };
 }
 
-export async function loadConfig(repoRoot, env = process.env) {
-  const global = await readJson(getPaths(env).config, {});
+// Through 0.1.19 the claude-economy preset used Haiku, and Claude Code ran Haiku 4.5 with long extended
+// thinking whatever --effort asked, so reviews took minutes or hit the reviewer deadline. Once per Sphinx
+// home, routes saved as claude:haiku follow the preset to claude:sonnet. migrations.json records that this
+// ran, so a later claude:haiku stays; a config key would make an older Sphinx reject the file after a
+// downgrade. Routes are not part of policyHash, so prepared checks and passes are kept.
+const HAIKU_TO_SONNET = 'claude-haiku-to-sonnet';
+const TIERS = ['small', 'medium', 'large'];
+const migrationsFile = env => path.join(getPaths(env).home, 'migrations.json');
+const isClaude = (route, model) => isRecord(route) && route.provider === 'claude' && route.model === model;
+
+async function readMigrations(env) {
+  const state = await readJson(migrationsFile(env), {});
+  if (!isRecord(state)) throw new Error('Sphinx migration state must be a JSON object.');
+  return state;
+}
+const recordMigration = (env, state, entry) => writeJson(migrationsFile(env), { ...state, [HAIKU_TO_SONNET]: entry });
+
+// loadConfig runs this on saved settings that passed its checks. Returns the rewritten settings, or null
+// when nothing moved or config.json could not be rewritten, so the routes stay as read.
+async function migrateHaikuRoutes(global, env) {
+  try {
+    const state = await readMigrations(env);
+    // Nothing saved yet: saveConfig records the move as done before the first save.
+    if (state[HAIKU_TO_SONNET] || !Object.keys(global).length) return null;
+    // Without models, the top-level provider and model are every size's route (see globalConfig).
+    const legacy = !Object.hasOwn(global, 'models');
+    const tiers = TIERS.filter(tier => isClaude(legacy ? global : global.models[tier], 'haiku'));
+    let moved = null;
+    if (tiers.length) {
+      // On a copy: loadConfig's settings share these route objects and must stay as read if the write fails.
+      moved = structuredClone(global);
+      if (!legacy) for (const tier of tiers) moved.models[tier].model = 'sonnet';
+      // Presets also save the small route at the top level.
+      if (isClaude(moved, 'haiku')) moved.model = 'sonnet';
+      // Unlocked, like concurrent saveConfig calls: a save from another process during the move is last-write-wins.
+      await writeJson(getPaths(env).config, moved);
+    }
+    // Recorded after the rewrite, so a failed write is retried by the next load. saveConfig records the move
+    // before any deliberate save, so a retry only moves routes left over from 0.1.19.
+    await recordMigration(env, state, { ranAt: new Date().toISOString(), tiers });
+    return moved;
+  } catch { return null; /* unreadable state or a failed write leaves the routes alone */ }
+}
+
+/** The one-line notice about routes moved off Haiku, until a terminal has shown it. Runs the move first. */
+export async function routeMigrationNotice(env = process.env) {
+  const { models } = await loadConfig(undefined, env);
+  const entry = (await readMigrations(env))[HAIKU_TO_SONNET];
+  if (!isRecord(entry) || entry.noticeShownAt || !Array.isArray(entry.tiers) || !entry.tiers.length) return null;
+  // Only routes still on Sonnet: one changed since then was chosen deliberately.
+  const tiers = TIERS.filter(tier => entry.tiers.includes(tier) && isClaude(models[tier], 'sonnet'));
+  return tiers.length ? `Sphinx moved your claude:haiku reviewer routes to claude:sonnet, because Haiku reviews through Claude Code were slow and could time out. To switch back, run: sphinx config ${tiers.map(tier => `--${tier} claude:haiku`).join(' ')}` : null;
+}
+
+export async function routeMigrationNoticeShown(env = process.env) {
+  const state = await readMigrations(env), entry = state[HAIKU_TO_SONNET];
+  if (isRecord(entry)) await recordMigration(env, state, { ...entry, noticeShownAt: new Date().toISOString() });
+}
+
+// The saved global settings as they apply before repository policy; throws if they are invalid.
+function globalConfig(global) {
   if (!global || typeof global !== 'object' || Array.isArray(global)) throw new Error('Global Sphinx configuration must be a JSON object.');
   for (const key of ['models','routing']) {
     if (Object.hasOwn(global,key) && (!global[key] || typeof global[key]!=='object' || Array.isArray(global[key]))) throw new Error(`Global ${key} must be a JSON object.`);
   }
-  let config = merged(structuredClone(DEFAULT_CONFIG), global);
+  const config = merged(structuredClone(DEFAULT_CONFIG), global);
   // A legacy/single-provider configuration applies to all tiers unless routes are explicit.
   if ((Object.hasOwn(global,'provider') || Object.hasOwn(global,'model')) && !global.models) {
     config.models = Object.fromEntries(['small','medium','large'].map(t => [t,{provider:config.provider,model:config.model}]));
   }
-  validateConfig(config);
+  return validateConfig(config);
+}
+
+export async function loadConfig(repoRoot, env = process.env) {
+  const global = await readJson(getPaths(env).config, {});
+  let config = globalConfig(global);
+  const moved = await migrateHaikuRoutes(global, env);
+  if (moved) config = globalConfig(moved);
   if (repoRoot) {
     const source = await repositoryConfigInfo(repoRoot);
     const local = source.exists ? await readJson(source.path) : {};
@@ -179,6 +245,9 @@ export async function loadConfig(repoRoot, env = process.env) {
 
 export async function saveConfig(config, env = process.env) {
   validateConfig(config);
+  // Routes saved from now on are deliberate, so the one-time move never revisits them. Unreadable state blocks it too.
+  const state = await readMigrations(env).catch(() => null);
+  if (state && !state[HAIKU_TO_SONNET]) await recordMigration(env, state, { ranAt: new Date().toISOString(), tiers: [] }).catch(() => {});
   await writeJson(getPaths(env).config, config);
 }
 

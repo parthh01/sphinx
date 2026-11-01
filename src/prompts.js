@@ -141,7 +141,7 @@ export async function askInstall(config, initial, prompts, { detectedAgents = []
       const custom = Object.fromEntries(explicitTiers.map(tier => [tier, initial[tier]]));
       for (const [tier, description] of [['small', 'At most 80 changed lines and 3 files, with no consequential paths, by default.'], ['medium', 'Changes between the small and large thresholds.'], ['large', 'At least 400 lines, 12 files, or a consequential path by default.']]) {
         if (initial[tier] !== undefined) continue;
-        custom[tier] = await prompts.text({ title: `Evaluator for ${tier} changes`, description: `${description} Enter provider:model, such as claude:haiku or an OpenRouter model ID prefixed with openrouter:.`, current: routeText(config.models[tier]), validate: parseRoute });
+        custom[tier] = await prompts.text({ title: `Evaluator for ${tier} changes`, description: `${description} Enter provider:model, such as claude:sonnet or an OpenRouter model ID prefixed with openrouter:.`, current: routeText(config.models[tier]), validate: parseRoute });
       }
       const paid = Object.values(custom).some(value => {
         const route = parseRoute(value);

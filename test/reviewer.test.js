@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runReviewer, reviewedData } from '../src/reviewer.js';
+import { runReviewer, reviewedData, REVIEWER_SYSTEM } from '../src/reviewer.js';
 import { QUESTION_SCHEMA, validateQuestion, createEvaluator } from '../src/evaluator.js';
 import { DEFAULT_CONFIG, saveConfig } from '../src/config.js';
 import { pushSnapshots } from '../src/git.js';
@@ -57,6 +57,14 @@ test('the first native or structured request can finish from exact seeded eviden
       const seen = nativeTools ? observations({ conversation: args.messages.filter(message => typeof message.content === 'string') }) : observations(decode(args));
       assert.equal(seen.length, 1);
       assert.equal(seen[0].id, 'e1'); assert.equal(seen[0].result.text, DIFF);
+      // Only a CLI turn, whose model has no workspace tools, is told to request reads in its structured action.
+      const system = nativeTools ? args.messages[0].content : args.systemPrompt;
+      assert.ok(system.startsWith(REVIEWER_SYSTEM));
+      if (nativeTools) assert.doesNotMatch(system, /no callable workspace tools/);
+      else {
+        assert.match(system, /no callable workspace tools/);
+        assert.doesNotMatch(system.slice(REVIEWER_SYSTEM.length), /read_evidence/, 'read_evidence is offered only after a resume or compaction');
+      }
       await args.beforeCall(); requests++;
       const action = finish(['e1'], seedQuestion);
       return nativeTools ? { calls: [{ id: 'finish', name: 'finish_review', arguments: { assessment: action.assessment, summary: action.summary, evidenceIds: action.evidenceIds } }] } : action;
@@ -171,6 +179,21 @@ test('investigative reviewer follows unchanged dependencies and saves exact evid
   assert.ok(requests.every(request => !request.prompt.includes('/private/checkout')));
 });
 
+test('a structured tool action runs its reads whatever summary or evidenceIds it carries, but cannot also finish', async () => {
+  // Haiku has written the summary as the two characters "" instead of an empty string.
+  for (const [extra, reads] of [[{ summary: '""' }, true], [{ summary: 'Reading the helper.', evidenceIds: ['e1'] }, true], [{ assessment: { questions: [question] } }, false]]) {
+    const space = workspace(); let requests = 0;
+    const result = await runReviewer({ ...options, workspace: space, runModel: async args => {
+      await args.beforeCall(); requests++;
+      if (requests === 1) return { ...toolAction([['read_file', { path: 'lib/once.js' }]]), ...extra };
+      assert.equal(args.prompt.includes('A tool action cannot also finish'), !reads, JSON.stringify(extra));
+      return reads ? finish(['e1', 'e2']) : finish(['e1'], seedQuestion);
+    } });
+    assert.deepEqual(space.history.map(item => item.name), reads ? ['read_diff', 'read_file'] : ['read_diff'], JSON.stringify(extra));
+    assert.equal(requests, 2); assert.deepEqual(result.questions, [reads ? question : seedQuestion]);
+  }
+});
+
 test('Pi sequentially executes bounded 3–8 read batches for native and structured transports', async () => {
   for (const nativeTools of [false, true]) for (const count of [3, 8]) {
     const space = workspace();
@@ -241,6 +264,7 @@ test('Pi native compaction preserves the exact evidence archive, project context
       summaryCalls++;
       assert.deepEqual(args.schema.required, ['summary']);
       assert.match(args.systemPrompt, /context summarization assistant/);
+      assert.doesNotMatch(args.systemPrompt, /no callable workspace tools/);
       assert.match(args.prompt, /\[Assistant tool calls\]|\[Tool result\]/);
       assert.match(args.prompt, /Workspace observation/);
       assert.ok(charges < limit, 'Compaction must leave a request to finish');
@@ -249,6 +273,7 @@ test('Pi native compaction preserves the exact evidence archive, project context
     turns++;
     const data = decode(args);
     assert.equal(data.remainingCalls, limit - charges + 1);
+    assert.equal(/read_evidence/.test(args.systemPrompt.slice(REVIEWER_SYSTEM.length)), summaryCalls > 0, 'The CLI note names read_evidence once compaction offers it');
     if (summaryCalls) {
       assert.match(JSON.stringify(data.conversation), /Exact observation e1/);
       return finish(['e1', 'e3']);
@@ -370,6 +395,7 @@ test('small and medium reviews reserve synthesis within their size caps for both
         if (final) {
           assert.ok(historicalCalls.some(call => call.function.name === 'read_diff'));
           assert.match(args.messages.at(-1).content, /Final synthesis: investigation is closed/);
+          assert.match(args.messages.at(-1).content, /Submit finish_review now/, 'A native model finishes by calling the finish_review tool');
           return { calls: [{ id: 'finish', name: 'finish_review', arguments: { assessment: { questions: [question] }, summary, evidenceIds: ['e1', 'e3'] } }] };
         }
         return { calls: [
@@ -385,8 +411,10 @@ test('small and medium reviews reserve synthesis within their size caps for both
         assert.deepEqual(data.tools, []);
         assert.deepEqual(args.schema.properties.assessment, schema);
         assert.match(args.prompt, /Final synthesis: investigation is closed/);
+        assert.doesNotMatch(args.prompt, /finish_review/, 'A CLI model has no finish_review tool to call');
         return finish();
       }
+      assert.match(args.prompt, /Sphinx returns their observations in your next request/, 'A CLI model is told its reads come back in the next request');
       return toolAction([['read_diff', { path: 'worker.js', offset: requests }], ['read_file', { path: 'lib/once.js', startLine: requests }]]);
     };
     const result = await runReviewer({ ...options, config: { ...config, changeTier: tier }, workspace: space, nativeTools,

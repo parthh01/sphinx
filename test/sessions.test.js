@@ -4,7 +4,7 @@ import fsPromises, { mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { DEFAULT_CONFIG, readJson, writeJson } from '../src/config.js';
+import { DEFAULT_CONFIG, loadConfig, policyHash, readJson, writeJson } from '../src/config.js';
 import { createSessionStore, savedDraft, sessionFile } from '../src/sessions.js';
 import { OpenRouterError } from '../src/openrouter.js';
 
@@ -186,6 +186,31 @@ test('a check without questions takes the saved route when its review starts; a 
   const picked={...snapshot,id:'c'.repeat(64)};
   await store.ensure(picked,config);await store.switchRoute(picked.id,config,'codex');
   assert.equal((await store.start(picked.id,{...config,models:models('haiku')})).route.provider,'codex','a model picked for the check stays');
+});
+
+test('the one-time move off claude:haiku keeps passes and prepared questions, and a check not yet reviewed uses Sonnet',async t=>{
+  const seen=[];
+  const {store,env}=await fixture(t,{generate:async(_s,c)=>{seen.push(`${c.provider}:${c.model}`);return{questions:[q]};}});
+  const haiku={provider:'claude',model:'haiku'};
+  // What 0.1.19 saved for the claude-economy preset, and the settings it loaded from that.
+  const saved={version:1,provider:'claude',model:'haiku',models:{small:haiku,medium:haiku,large:haiku}};
+  await writeJson(path.join(env.SPHINX_HOME,'config.json'),saved);
+  const before={...structuredClone(DEFAULT_CONFIG),...saved};
+  const passed={...snapshot,id:'d'.repeat(64)},prepared={...snapshot,id:'e'.repeat(64)},unreviewed={...snapshot,id:'f'.repeat(64)};
+  await store.ensure(passed,before);await store.start(passed.id,before);
+  assert.equal((await store.answer(passed.id,'Yes: it inserts every time.',before)).status,'passed');
+  await store.ensure(prepared,before);await store.prepare(prepared.id,before,{wait:true});
+  await store.ensure(unreviewed,before);
+  // The first load after the upgrade makes the move.
+  const after=await loadConfig(undefined,env);
+  assert.deepEqual(after.models.small,{provider:'claude',model:'sonnet'});
+  assert.equal(policyHash(after),policyHash(before));
+  assert.equal(await store.approved(passed,after),true,'the pass still approves the push');
+  assert.equal((await store.ensure(prepared,after)).status,'active','the prepared check is kept');
+  const resumed=await store.start(prepared.id,after);
+  assert.equal(resumed.question.id,q.id);assert.equal(resumed.route.model,'haiku','questions keep their route');
+  assert.equal((await store.start(unreviewed.id,after)).route.model,'sonnet');
+  assert.deepEqual(seen,['claude:haiku','claude:haiku','claude:sonnet'],'no prepared question was generated again');
 });
 
 test('stale snapshots fail before generation and again before recording completion',async t=>{

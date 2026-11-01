@@ -1,6 +1,7 @@
 // Reviewed against the linked provider documentation on 2026-10-15.
 // These are explicit starting models, not automatic fallbacks. Existing saved
-// routes are never migrated when this list changes. Prices are reference rates
+// routes are not migrated when this list changes, apart from the one-time move
+// of claude:haiku to claude:sonnet in config.js. Prices are reference rates
 // per million tokens; provider routing and future prices may differ.
 export const REVIEWER_PRESETS = Object.freeze([
   {
@@ -14,13 +15,15 @@ export const REVIEWER_PRESETS = Object.freeze([
     allowPaid: false,
     sources: ['https://learn.chatgpt.com/docs/models'],
   },
+  // Sonnet, not Haiku: Claude Code 2.1.292 ran Haiku 4.5 with extended thinking whatever --effort asked, so an
+  // investigating review took 144 s or hit the 180 s deadline. The id stays: install scripts and plan recovery use it.
   {
-    id: 'claude-economy', label: 'Claude Code · low usage',
-    description: 'Haiku for every change size. Uses your Claude CLI sign-in and allowance. The haiku alias follows your provider’s available Haiku model; no automatic Sonnet or Opus upgrade.',
+    id: 'claude-economy', label: 'Claude Code · Sonnet',
+    description: 'Sonnet for every change size. Uses your Claude CLI sign-in and allowance. Review size and reasoning effort still scale with the change. The sonnet alias follows your provider’s available Sonnet model; no automatic Opus upgrade.',
     models: {
-      small: { provider: 'claude', model: 'haiku' },
-      medium: { provider: 'claude', model: 'haiku' },
-      large: { provider: 'claude', model: 'haiku' },
+      small: { provider: 'claude', model: 'sonnet' },
+      medium: { provider: 'claude', model: 'sonnet' },
+      large: { provider: 'claude', model: 'sonnet' },
     },
     allowPaid: false,
     sources: ['https://code.claude.com/docs/en/model-config'],

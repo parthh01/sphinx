@@ -376,6 +376,31 @@ test('saving a new default model keeps a prepared check, and the push reuses its
   assert.equal(generations, 1, 'the prepared questions are reused');
 });
 
+test('the one-time move off claude:haiku keeps a prepared check, and the push reuses its questions', async t => {
+  const { createSessionStore } = await import('../src/sessions.js');
+  const { loadConfig } = await import('../src/config.js');
+  const f = await fixture(t), { root } = await repository(f.cwd); let generations = 0;
+  const store = createSessionStore({ env: f.env, generate: async (_snapshot, _config, { beforeCall }) => { await beforeCall(); generations++; return { questions: [QUESTION] }; } });
+  // Prepared under the routes 0.1.19 saved for claude-economy, with the settings it loaded from them.
+  // workingContext: false keeps background curation from calling a claude CLI on PATH.
+  const haiku = { provider: 'claude', model: 'haiku' };
+  const saved = { preparationDebounceMs: 0, workingContext: false, provider: 'claude', model: 'haiku', models: { small: haiku, medium: haiku, large: haiku } };
+  const options = { ...f.options, config: { ...f.config, ...saved } };
+  await schedulePreparation(options);
+  const [id] = (await runPreparation({ ...options, store })).prepared;
+  // After the upgrade, the first load makes the move.
+  const file = getPaths(f.env).config;
+  await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, JSON.stringify(saved));
+  const config = await loadConfig(root, f.env);
+  assert.deepEqual(config.models.small, { provider: 'claude', model: 'sonnet' });
+  assert.equal((await schedulePreparation({ ...f.options, config: undefined })).status, 'existing', 'no second background review');
+  const [push] = await pushSnapshots({ cwd: f.cwd, env: f.env, config, remote: 'origin', remoteUrl: f.remoteUrl, input: `refs/heads/main ${f.git('rev-parse', 'HEAD')} refs/heads/main ${f.base}\n` });
+  assert.equal(push.id, id, 'the push checkpoint has the prepared identity');
+  assert.equal((await store.ensure(push, config)).status, 'active');
+  assert.equal((await store.start(id, config)).question.id, QUESTION.id);
+  assert.equal(generations, 1, 'the prepared questions are reused');
+});
+
 test('a worker that finds nothing to ask records that without approval; only a started check passes, with no new review', async t => {
   const { createSessionStore } = await import('../src/sessions.js');
   const f = await fixture(t); let generations = 0;

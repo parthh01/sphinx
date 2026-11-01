@@ -46,7 +46,7 @@ npm install -g sphinx-understand
 sphinx install
 ```
 
-Guided setup asks which coding agents you use and which reviewer to use. It suggests Haiku through Claude Code or GPT-6 Luna through Codex. If you choose OpenRouter, it asks for an API key. It then offers the recommended checkpoints (pushes to `main` or `master` at standard depth) or **Customize** to pick events, branches, remotes, and depth. To install without prompts:
+Guided setup asks which coding agents you use and which reviewer to use. It suggests Sonnet through Claude Code or GPT-6 Luna through Codex. If you choose OpenRouter, it asks for an API key. It then offers the recommended checkpoints (pushes to `main` or `master` at standard depth) or **Customize** to pick events, branches, remotes, and depth. To install without prompts:
 
 ```sh
 sphinx install --yes --preset claude-economy --agents claude
@@ -214,7 +214,7 @@ sphinx config --preset openrouter-free                # free, slower, rate limit
 Or set each size yourself as `provider:model`:
 
 ```sh
-sphinx config --small claude:haiku --medium claude:haiku --large claude:sonnet
+sphinx config --small codex:gpt-6-luna --medium codex:gpt-6-luna --large claude:sonnet
 ```
 
 To use any OpenAI-compatible endpoint (OpenAI, Groq, Together, Ollama, LM Studio, vLLM, and others):
