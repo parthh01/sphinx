@@ -18,6 +18,7 @@ test('the picker lists only providers this machine is set up for, and keeps paid
   assert.ok(openrouter.models.find(model => model.model === 'qwen/qwen3-coder').disabled, 'paid model shown but off');
   assert.equal(openrouter.models.find(model => model.model === 'openrouter/free').disabled, undefined);
   assert.equal(validChoice(groups, 'claude', 'sonnet', config), null);
+  assert.match(validChoice(groups, 'claude', 'haiku', config), /from the list/, 'Claude Code offers Sonnet, not Haiku');
   assert.match(validChoice(groups, 'openrouter', 'some/paid-model', config), /Paid models are off/);
   assert.equal(validChoice(groups, 'openrouter', 'some/model:free', config), null, 'any free model ID is allowed');
   assert.match(validChoice(groups, 'claude', 'opus', config), /from the list/, 'plans take listed models only');

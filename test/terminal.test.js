@@ -276,7 +276,7 @@ test('partial tier flags preserve saved defaults but require a choice for fresh 
   assert.equal(choices, 1);
   const configured = applyInstallOptions(DEFAULT_CONFIG, values);
   assert.deepEqual(configured.models.small, { provider: 'codex', model: 'custom-small' });
-  for (const tier of ['medium', 'large']) assert.deepEqual(configured.models[tier], { provider: 'claude', model: 'haiku' });
+  for (const tier of ['medium', 'large']) assert.deepEqual(configured.models[tier], { provider: 'claude', model: 'sonnet' });
 });
 
 test('fresh partial tiers retain overrides when deliberately selecting a paid preset', async () => {

@@ -37,13 +37,13 @@ Sphinx picks one of three saved routes (small, medium, large) for each change. P
 ```sh
 sphinx config --preset claude-economy
 sphinx config --preset openrouter-value --allow-paid
-sphinx config --small claude:haiku --medium claude:haiku --large claude:sonnet
+sphinx config --small codex:gpt-6-luna --medium codex:gpt-6-luna --large claude:sonnet
 ```
 
 | Preset | Small and medium | Large | Usage source |
 | --- | --- | --- | --- |
 | `codex-economy` | `codex:gpt-6-luna` | `codex:gpt-6-luna` | Your Codex CLI account |
-| `claude-economy` | `claude:haiku` | `claude:haiku` | Your Claude CLI account |
+| `claude-economy` | `claude:sonnet` | `claude:sonnet` | Your Claude CLI account |
 | `openrouter-value` (experimental) | `openrouter:anthropic/claude-haiku-5.5` | `openrouter:anthropic/claude-haiku-5.5` | Paid OpenRouter credits |
 | `openrouter-deepseek` (experimental) | `openrouter:deepseek/deepseek-v3.2` | `openrouter:deepseek/deepseek-v3.2` | Paid OpenRouter credits |
 | `openrouter-free` | `openrouter:openrouter/free` | `openrouter:openrouter/free` | OpenRouter free availability and limits |
@@ -56,11 +56,17 @@ sphinx install --yes --preset claude-economy
 sphinx install --yes --preset openrouter-value --allow-paid
 ```
 
-Reinstalling keeps saved routes unless you choose a replacement. Updating Sphinx does not migrate saved routes. Changing a route applies to reviews that start afterwards, including a retry of one that failed, except on a check whose model you picked in its questionnaire. A check that already has questions keeps its model, questions, and progress, and completion records are kept.
+Reinstalling keeps saved routes unless you choose a replacement. Updating Sphinx keeps them too, with one exception. Through 0.1.19, `claude-economy` used Haiku, and reviews on Haiku through Claude Code were slow and could hit the reviewer timeout (180 seconds by default). So the first time a newer Sphinx reads your settings, it moves saved `claude:haiku` routes to `claude:sonnet`. Full model IDs such as `claude:claude-haiku-4-5`, other providers, and the OpenRouter Haiku preset are left alone. The next Sphinx command, push or commit that you run in a terminal prints a one-line notice saying so. `--json` output, coding-agent hooks, and background work never show it, so it waits until Sphinx runs in a terminal. To switch back, run the command the notice prints; it names only the sizes that moved. When all three moved, as with the old `claude-economy` preset, that command is:
+
+```sh
+sphinx config --small claude:haiku --medium claude:haiku --large claude:haiku
+```
+
+The move runs once for each Sphinx data directory (`SPHINX_HOME`, by default `~/.config/sphinx`), and `migrations.json` there records it, including which sizes moved, so choosing `claude:haiku` again sticks. Changing a route, by hand or by this move, applies to reviews that start afterwards, including a retry of one that failed, except on a check whose model you picked in its questionnaire. A check that already has questions keeps its model, questions, and progress, and completion records are kept.
 
 ### Codex and Claude routes
 
-These use your signed-in Codex or Claude CLI and consume that account's allowance. You need a recent CLI with access to the selected model; see [Codex models](https://learn.chatgpt.com/docs/models) and [Claude model configuration](https://code.claude.com/docs/en/model-config). The economy presets keep the same economical model for all tiers; investigation effort and question count still scale with change size. The Claude `haiku` alias follows the available Haiku model. Neither preset upgrades to a more expensive model.
+These use your signed-in Codex or Claude CLI and consume that account's allowance. You need a recent CLI with access to the selected model; see [Codex models](https://learn.chatgpt.com/docs/models) and [Claude model configuration](https://code.claude.com/docs/en/model-config). Each economy preset uses one model for all tiers (GPT-6 Luna or Sonnet); investigation effort and question count still scale with change size. The Claude `sonnet` alias follows the available Sonnet model. Neither preset upgrades to a more expensive model.
 
 **These routes bill your signed-in plan by default.** Sphinx removes `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`, and similar variables from the reviewer CLI's environment, so a key in your shell cannot silently switch reviews to API credits. If the CLI is not signed in with a Claude or ChatGPT plan, the check stops with instructions. To let the CLIs use API keys instead, run `sphinx config --cli-billing api`.
 
