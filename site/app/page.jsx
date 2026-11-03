@@ -3,6 +3,10 @@ import Logo from './logo';
 
 const REPO = 'https://github.com/parthh01/sphinx';
 const NPM = 'https://www.npmjs.com/package/sphinx-understand';
+// Live counts, rendered by shields.io from GitHub (cached up to 30 minutes), in the site's light and dark colors.
+const badge = (kind, [label, value]) => `https://img.shields.io/github/${kind}/parthh01/sphinx?style=flat&label=${kind}&labelColor=${label}&color=${value}`;
+const BADGES = [['stars', 'stargazers'], ['forks', 'forks']];
+
 const QUOTE = 'https://x.com/yacineMTB/status/2018886083120153046?s=20';
 
 const steps = [
@@ -19,6 +23,16 @@ export default function Home() {
         <nav>
           <a href="#start">Install</a>
           <a href={REPO}>GitHub</a>
+          <span className="badges">
+            {BADGES.map(([kind, page]) => (
+              <a key={kind} href={`${REPO}/${page}`}>
+                <picture>
+                  <source media="(prefers-color-scheme: dark)" srcSet={badge(kind, ['2a251f', '3a332b'])} />
+                  <img src={badge(kind, ['ddd5c9', 'ebe4d8'])} alt={`GitHub ${kind}`} height="20" />
+                </picture>
+              </a>
+            ))}
+          </span>
         </nav>
       </header>
 
