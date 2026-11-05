@@ -236,6 +236,27 @@ test('repository override is diagnosed and explicitly chained without replacing 
   assert.match(await readFile(path.join(f.repo, 'custom-hooks/pre-push'), 'utf8'), /exit 12/);
 });
 
+test('repository installation works with linked worktrees whether or not extensions.worktreeConfig is on (#35)', async t => {
+  const f = await fixture(t);
+  await executable(path.join(f.repo, 'custom-hooks/pre-push'), '#!/bin/sh\nexit 12\n');
+  f.git('config', '--local', 'core.hooksPath', 'custom-hooks');
+  f.git('commit', '-q', '--allow-empty', '-m', 'base');
+  f.git('worktree', 'add', '-q', path.join(f.repo, '..', 'linked'));
+  // Off: Git refuses --worktree here, so the repository's own setting is chained.
+  await install({ ...f.options, repo: true });
+  assert.equal(await dispatchHook({ event: 'pre-push', input: '', cwd: f.repo, env: f.env, gate: async () => 0 }), 12);
+  await uninstall({ ...f.options, repo: true });
+  assert.equal(f.git('config', '--local', '--get', 'core.hooksPath'), 'custom-hooks');
+  // On, with this worktree's own override: that one is chained instead.
+  f.git('config', 'extensions.worktreeConfig', 'true');
+  await executable(path.join(f.repo, 'own-hooks/pre-push'), '#!/bin/sh\nexit 13\n');
+  f.git('config', '--worktree', 'core.hooksPath', 'own-hooks');
+  await install({ ...f.options, repo: true });
+  assert.equal(await dispatchHook({ event: 'pre-push', input: '', cwd: f.repo, env: f.env, gate: async () => 0 }), 13);
+  await uninstall({ ...f.options, repo: true });
+  assert.equal(f.git('config', '--worktree', '--get', 'core.hooksPath'), 'own-hooks');
+});
+
 test('uninstall preserves subsequent Git, generated-hook, and agent settings edits', async t => {
   const f = await fixture(t);
   await install({ ...f.options, agents: 'codex' });
