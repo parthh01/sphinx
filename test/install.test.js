@@ -240,7 +240,7 @@ test('repository installation works with linked worktrees whether or not extensi
   const f = await fixture(t);
   await executable(path.join(f.repo, 'custom-hooks/pre-push'), '#!/bin/sh\nexit 12\n');
   f.git('config', '--local', 'core.hooksPath', 'custom-hooks');
-  f.git('commit', '-q', '--allow-empty', '-m', 'base');
+  f.git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '--allow-empty', '-m', 'base');
   f.git('worktree', 'add', '-q', path.join(f.repo, '..', 'linked'));
   // Off: Git refuses --worktree here, so the repository's own setting is chained.
   await install({ ...f.options, repo: true });
