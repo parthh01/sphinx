@@ -351,3 +351,16 @@ test('setup recommends an installed coding plan even when the user works in anot
   assert.equal(values.preset, 'claude-economy');
   assert.ok(seen.choices.some(choice => /free router \(slow, best effort\)/.test(choice.label)));
 });
+
+test('--context-model sets or clears the working-context route without touching size routes', () => {
+  const config = structuredClone(DEFAULT_CONFIG);
+  const set = applyInstallOptions(config, { 'context-model': 'claude:haiku' });
+  assert.deepEqual(set.models.context, { provider: 'claude', model: 'haiku' });
+  for (const tier of ['small', 'medium', 'large']) assert.deepEqual(set.models[tier], config.models[tier]);
+  const preset = applyInstallOptions(set, { preset: 'claude-economy' });
+  assert.deepEqual(preset.models.context, { provider: 'claude', model: 'haiku' }, 'A preset leaves the context route alone');
+  const cleared = applyInstallOptions(set, { 'context-model': 'small' });
+  assert.equal(Object.hasOwn(cleared.models, 'context'), false, 'small returns curation to the small route');
+  assert.throws(() => applyInstallOptions(config, { 'context-model': 'openrouter:paid-model' }), /allow-paid/, 'Paid OpenRouter context routes need permission');
+  assert.throws(() => applyInstallOptions(config, { 'context-model': 'nope' }), /provider:model/);
+});

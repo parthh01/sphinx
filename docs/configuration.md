@@ -264,6 +264,19 @@ After commits, merges, rewrites, and checkouts, Sphinx schedules a detached revi
 - Preparation expects the push that `git push` makes, or that `git push -u <remote> HEAD` makes where `git push` needs a destination: the branch of the same name on the push remote, unless `remote.<name>.push` maps it elsewhere or `push.default` is `upstream`. A first push is prepared from where the branch left the remote, as the push check computes it.
 - A push to another destination, or to a remote that changed since your last fetch, needs a fresh review at push time. Pre-commit checks always review on demand. Run `git fetch` if remote history is missing.
 
+### Working context
+
+Before each background review, one short call updates the branch's working context: an overview and a few notes on where the unpushed work lives and what to check. The push-time reviewer starts from it instead of exploring the repository, verifies it against the code, and never cites it as evidence. Only the diff the curator has not seen yet is sent, and ignored files are never read. The context is removed once the push goes through.
+
+The call runs on the small route by default. To give it a cheaper model without changing how small changes are checked, set a dedicated route; `small` returns to the default:
+
+```sh
+sphinx config --context-model claude:haiku
+sphinx config --context-model small
+```
+
+Presets and `--provider` leave this route unchanged. Set `workingContext: false` in `config.json` to turn the call off. Its usage appears under `context` in `sphinx usage`.
+
 ## GitHub commit status and pull requests
 
 When you push to GitHub and a check passes, Sphinx marks the pushed commit with a `sphinx/understanding` commit status, for example "Sphinx stamped · 3 questions, 2 first try". It shows next to the commit and in the pull request's checks. A skipped check is marked as a failure ("Understanding check skipped"). Yolo pushes and commit checkpoints are not marked.
