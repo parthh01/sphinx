@@ -376,3 +376,11 @@ test('understanding distance defaults to mixed, accepts high and low, and a repo
   await writeFile(join(dir, '.sphinxconfig'), JSON.stringify({ version: 1, distance: 'low' }));
   assert.equal((await loadConfig(dir, { SPHINX_HOME: join(dir, 'home') })).distance, 'low');
 });
+
+test('models.context is optional and validated like a size route', () => {
+  const base = structuredClone(DEFAULT_CONFIG);
+  assert.doesNotThrow(() => validateConfig({ ...base, models: { ...base.models, context: { provider: 'claude', model: 'haiku' } } }));
+  assert.throws(() => validateConfig({ ...base, models: { ...base.models, context: { provider: 'nope', model: 'x' } } }), /models\.context\.provider is invalid/);
+  assert.throws(() => validateConfig({ ...base, models: { ...base.models, context: null } }), /models\.context\.provider is invalid/);
+  assert.throws(() => validateConfig({ ...base, models: { ...base.models, tiny: { provider: 'claude', model: 'haiku' } } }), /unknown model route/);
+});
