@@ -55,9 +55,10 @@ async function blobs(root, rev, files, env) {
 const isAncestor = async (root, ancestor, rev, env) => ancestor && (await git(root, ['merge-base', '--is-ancestor', ancestor, rev], env, true)) !== null;
 
 /**
- * Bring the branch's working context up to date with head in one free-model
- * call. Only the diff the curator has not seen is sent (base..head after a
- * rewrite). Ignored paths are never read. Requires an OpenRouter key.
+ * Bring the branch's working context up to date with head in one call on the
+ * user's small-change route. Only the diff the curator has not seen is sent
+ * (base..head after a rewrite). Ignored paths are never read. Unavailable when
+ * no small-change route is configured.
  */
 export async function curateContext({ repoRoot, sourceRef, base, head, config, env = process.env, call }) {
   if (config.workingContext === false || !config.models?.small?.provider) return { status: 'unavailable' };
