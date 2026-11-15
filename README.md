@@ -285,6 +285,7 @@ These live in `config.json`, and most can be set with `sphinx config`:
 | Setting | Flag | What it means |
 | --- | --- | --- |
 | `models` | `--preset`, `--small`, `--medium`, `--large` | The reviewer for each change size |
+| `models.context` | `--context-model` | The model that keeps the working context, the short brief updated after each commit. Follows the small route unless set; `--context-model small` clears it |
 | `interface` | `--interface` | Where questions appear. `auto` (default): the browser on a local Mac, otherwise the terminal you pushed from. Or `browser` / `terminal` |
 | `maxModelCalls` | `--max-model-calls` | Optional cap on model requests per check (1–100, or `unlimited`, the default) |
 | `maxOutputTokens` | `--max-output-tokens` | Output allowance per request, including reasoning (default 4096) |

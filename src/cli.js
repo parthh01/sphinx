@@ -30,7 +30,7 @@ import { runTerminalCheck } from './terminal-check.js';
 
 const CLI_PATH = fileURLToPath(new URL('../bin/sphinx.js', import.meta.url));
 const POLICY_FLAGS = ['branches', 'events', 'level', 'distance', 'remotes'];
-const MODEL_FLAGS = ['preset', 'provider', 'model', 'small', 'medium', 'large', 'allow-paid', 'max-model-calls', 'max-output-tokens', 'cli-billing'];
+const MODEL_FLAGS = ['preset', 'provider', 'model', 'small', 'medium', 'large', 'context-model', 'allow-paid', 'max-model-calls', 'max-output-tokens', 'cli-billing'];
 const OPTIONS = {
   install: ['yes', 'repo', 'agents', ...MODEL_FLAGS, 'launch', 'no-launch', ...POLICY_FLAGS],
   activate: ['agents', 'json'],
@@ -145,6 +145,11 @@ export function applyInstallOptions(current, values) {
     for (const tier of ['small', 'medium', 'large']) config.models[tier] = { provider: config.provider, model: config.model };
   }
   for (const tier of ['small', 'medium', 'large']) if (values[tier] !== undefined) config.models[tier] = parseRoute(values[tier]);
+  // small clears the dedicated route, so curation follows the small route again.
+  if (values['context-model'] !== undefined) {
+    if (values['context-model'] === 'small') delete config.models.context;
+    else config.models.context = parseRoute(values['context-model']);
+  }
   if (values['allow-paid']) config.allowPaid = true;
   if (values['cli-billing'] !== undefined) config.cliBilling = values['cli-billing'];
   validateConfig(config);
@@ -157,6 +162,12 @@ export function applyInstallOptions(current, values) {
   }
   return config;
 }
+
+// The three size routes, then the working-context curator's route.
+const routeRows = config => [
+  ...['small', 'medium', 'large'].map(tier => [tier[0].toUpperCase() + tier.slice(1), routeText(config.models[tier])]),
+  ['Working context', config.models.context ? routeText(config.models.context) : `Same as small (${routeText(config.models.small)})`],
+];
 
 function policyRows(config) {
   const enabled = config.enabled;
@@ -174,7 +185,7 @@ function printConfiguration(terminal, config, { routes = true } = {}) {
   terminal.rows(policyRows(config));
   if (routes) {
     terminal.section('Evaluator routes');
-    terminal.rows(['small', 'medium', 'large'].map(tier => [tier[0].toUpperCase() + tier.slice(1), routeText(config.models[tier])]));
+    terminal.rows(routeRows(config));
     if (Object.values(config.models).some(route => ['codex', 'claude'].includes(route.provider))) terminal.rows([['Codex/Claude billing', config.cliBilling === 'api' ? 'API keys from your environment, when set' : 'Your signed-in plan; API keys in your environment are ignored']]);
     terminal.blank(); terminal.note(`Model calls: ${modelLimitText(config.maxModelCalls)}. Review, compaction, grading, learning, and failed requests stay counted. Completion lasts ${config.receiptHours} hours unless code, destination, or policy changes.`);
     terminal.note(`Review planning targets: ${reviewCapsText(config)} calls. These are soft targets; only explicitly configured request limits stop further calls. Context limits and deadlines still apply.`);
@@ -498,7 +509,7 @@ async function showRouteNotice() {
 export function parseCommandLine(argv) {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
     help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' }, json: { type: 'boolean' }, yes: { type: 'boolean' }, repo: { type: 'boolean' }, staged: { type: 'boolean' },
-    preset: { type: 'string' }, provider: { type: 'string' }, model: { type: 'string' }, small: { type: 'string' }, medium: { type: 'string' }, large: { type: 'string' }, level: { type: 'string' }, distance: { type: 'string' }, interface: { type: 'string' }, branches: { type: 'string' }, events: { type: 'string' }, agents: { type: 'string' }, remotes: { type: 'string' },
+    preset: { type: 'string' }, provider: { type: 'string' }, model: { type: 'string' }, small: { type: 'string' }, medium: { type: 'string' }, large: { type: 'string' }, 'context-model': { type: 'string' }, level: { type: 'string' }, distance: { type: 'string' }, interface: { type: 'string' }, branches: { type: 'string' }, events: { type: 'string' }, agents: { type: 'string' }, remotes: { type: 'string' },
     remote: { type: 'string' }, branch: { type: 'string' }, id: { type: 'string' }, text: { type: 'string' }, 'allow-paid': { type: 'boolean' },
     context: { type: 'string' }, 'github-check': { type: 'boolean' }, suggest: { type: 'boolean' }, apply: { type: 'string' }, worker: { type: 'boolean' }, retry: { type: 'boolean' }, reason: { type: 'string' }, 'base-url': { type: 'string' }, 'cli-billing': { type: 'string' },
     launch: { type: 'boolean' }, 'no-launch': { type: 'boolean' }, 'retry-review': { type: 'boolean' }, 'max-model-calls': { type: 'string' }, 'max-output-tokens': { type: 'string' },
@@ -586,7 +597,7 @@ export async function main(argv) {
       if (values['max-output-tokens'] !== undefined) terminal.success(`Saved output allowance: ${config.maxOutputTokens} tokens per request, including model reasoning. Model calls: ${modelLimitText(maxModelCalls)}.`);
       if (MODEL_FLAGS.some(key => !['max-model-calls', 'max-output-tokens'].includes(key) && values[key] !== undefined)) {
         terminal.success('Saved machine-wide evaluator settings.');
-        terminal.rows(['small', 'medium', 'large'].map(tier => [tier[0].toUpperCase() + tier.slice(1), routeText(config.models[tier])]));
+        terminal.rows(routeRows(config));
         terminal.note('Changing evaluator routes applies to reviews that start from now on, including retries. Checks that already have questions keep their route, questions, and progress.');
       }
       terminal.note(result.path);
