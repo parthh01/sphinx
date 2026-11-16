@@ -208,10 +208,7 @@ export async function revalidateSnapshot(snapshot, config, { env = process.env }
 // the default branch. Only branches the policy also checks count; otherwise code
 // that reached them unchecked would be skipped, so the whole tree is assessed.
 async function branchPoint(root, remote, head, config) {
-  if (!remote || remote === '.' || !/^[\w.-]+$/.test(remote)) return null;
-  const prefix = `refs/remotes/${remote}/`;
-  const checked = (await git(root, ['for-each-ref', '--format=%(refname)', prefix], { allowFailure: true }) || '')
-    .split('\n').filter(ref => ref && ref !== `${prefix}HEAD` && triggered(config, 'pre-push', ref.slice(prefix.length), remote));
+  const checked = await checkedRemoteBranches(root, remote, config);
   if (!checked.length) return null;
   // One walk, however many branches the remote has: the commits only on this
   // branch, and the already-pushed commits they start from (marked "-").
@@ -230,6 +227,60 @@ async function branchPoint(root, remote, head, config) {
   return nearest.base;
 }
 
+// The remote-tracking branches the policy checks: work on them was already assessed
+// when it was pushed.
+async function checkedRemoteBranches(root, remote, config) {
+  if (!remote || remote === '.' || !/^[\w.-]+$/.test(remote)) return [];
+  const prefix = `refs/remotes/${remote}/`;
+  return (await git(root, ['for-each-ref', '--format=%(refname)', prefix], { allowFailure: true }) || '')
+    .split('\n').filter(ref => ref && ref !== `${prefix}HEAD` && triggered(config, 'pre-push', ref.slice(prefix.length), remote));
+}
+
+// Whether a push updates the source branch's own copy on the remote: the branch of the
+// same name, or the one it tracks (git push origin local-name:feature, with
+// origin/feature as its upstream). A detached HEAD has no branch to tie it to.
+async function pushesOwnBranch(root, remote, sourceRef, ref) {
+  if (sourceRef === ref) return true;
+  if (!sourceRef.startsWith('refs/heads/')) return false;
+  const name = sourceRef.slice('refs/heads/'.length);
+  const [upstreamRemote, upstreamRef] = await Promise.all(['remote', 'merge']
+    .map(key => git(root, ['config', '--get', `branch.${name}.${key}`], { allowFailure: true })));
+  return upstreamRemote?.trim() === remote && upstreamRef?.trim() === ref;
+}
+
+// git push <remote> HEAD (or @) names its source HEAD. Record the branch it points at,
+// as background preparation does, so that branch's working context is found and dropped.
+async function pushSource(root, localRef) {
+  return localRef === 'HEAD' ? (await git(root, ['symbolic-ref', '--quiet', 'HEAD'], { allowFailure: true }))?.trim() || localRef : localRef;
+}
+
+// A branch rebased onto work that reached the remote since it was last pushed (git
+// pull --rebase, git rebase origin/main) is checked like its first push: from where
+// it now leaves the branches already on the remote, the range its pull request
+// shows. Its replaced tip still sits on the old base, so diffing from it would count
+// every commit the rebase brought in as part of this change. Only the branch's own
+// history counts: a push to another branch (feature:main) overwrites that branch,
+// and a rewind, an amend, or a rebase that brings nothing in is still checked
+// against the tip it replaces.
+async function rebasedOntoPushedWork(root, remote, config, sourceRef, ref, old, head) {
+  if (!await pushesOwnBranch(root, remote, sourceRef, ref)) return false;
+  await ensureCommit(root, old, remote, true);
+  for (const [ancestor, descendant] of [[old, head], [head, old]]) {
+    if (await git(root, ['merge-base', '--is-ancestor', ancestor, descendant], { allowFailure: true }) !== null) return false;
+  }
+  const own = `refs/remotes/${remote}/${ref.slice('refs/heads/'.length)}`;
+  const others = (await checkedRemoteBranches(root, remote, config)).filter(branch => branch !== own);
+  if (!others.length) return false;
+  // Brought in: commits the push adds that another checked branch already has. Reachable
+  // from it, not only its tip: that branch may have moved on, and been fetched (an IDE's
+  // auto-fetch), between the rebase and the push. An amend adds just the one commit, and
+  // stays an amend even when that commit is already on another checked branch (pushed to a
+  // review branch first); a rebase onto a branch that moved on adds that branch's commits too.
+  const count = async input => Number((await git(root, ['rev-list', '--count', head, `^${old}`, '--stdin'], { input })).trim());
+  const added = await count('');
+  return added > 1 && await count(`${others.map(branch => `^${branch}`).join('\n')}\n`) < added;
+}
+
 export async function pushSnapshots({ cwd = process.cwd(), remote, remoteUrl, input, config, env = process.env }) {
   if (!config.enabled || !config.events.includes('pre-push')) return [];
   const repo = await repository(cwd);
@@ -242,12 +293,11 @@ export async function pushSnapshots({ cwd = process.cwd(), remote, remoteUrl, in
     if (ZERO.test(head) || head === old || !ref.startsWith('refs/heads/')) continue;
     if (!triggered(config, 'pre-push', ref.slice('refs/heads/'.length), remote)) continue;
     await ensureCommit(repo.root, head, remote);
-    const base = ZERO.test(old) ? await branchPoint(repo.root, remote, head, config) : old;
+    const sourceRef = await pushSource(repo.root, localRef);
+    const rebased = !ZERO.test(old) && await rebasedOntoPushedWork(repo.root, remote, config, sourceRef, ref, old, head);
+    const base = ZERO.test(old) || rebased ? await branchPoint(repo.root, remote, head, config) : old;
     if (base) await ensureCommit(repo.root, base, remote, true);
     const tree = (await git(repo.root, ['rev-parse', `${head}^{tree}`])).trim();
-    // git push <remote> HEAD (or @) names its source HEAD. Record the branch it points at,
-    // as background preparation does, so that branch's working context is found and dropped.
-    const sourceRef = localRef === 'HEAD' ? (await git(repo.root, ['symbolic-ref', '--quiet', 'HEAD'], { allowFailure: true }))?.trim() || localRef : localRef;
     const snapshot = await buildSnapshot({ repo, event: 'pre-push', target: { remote, url: remoteUrl || '', ref }, base, head, tree, sourceRef, config, env });
     if (snapshot) snapshots.push(snapshot);
   }

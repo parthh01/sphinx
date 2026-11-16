@@ -418,6 +418,114 @@ test('a new branch is checked from where it left the remote default branch', asy
   assert.deepEqual(release.files, ['base.js', 'feature.js']);
 });
 
+// A pushed feature branch, then main moves on with someone else's work.
+async function rebaseFixture(t) {
+  const cwd = await fixture(t);
+  const start = await commit(cwd, { 'base.js': 'export const base = 1;\n' });
+  await command(cwd, 'checkout', '-b', 'feature');
+  const pushed = await commit(cwd, { 'feature.js': 'export const feature = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/feature', pushed);
+  await command(cwd, 'checkout', 'main');
+  const main = await commit(cwd, { 'theirs.js': 'export const theirs = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/main', main);
+  await command(cwd, 'checkout', 'feature');
+  return { cwd, start, pushed, main };
+}
+const config = { ...defaults, branches: ['*'] };
+const remoteUrl = 'https://example.invalid/sphinx.git';
+
+test('a force push after a rebase checks the branch\'s own commits, not the ones the rebase brought in', async t => {
+  const { cwd, pushed, main } = await rebaseFixture(t);
+  await command(cwd, 'rebase', '-q', 'main');
+  const head = await command(cwd, 'rev-parse', 'HEAD');
+  const [snapshot] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${head} refs/heads/feature ${pushed}\n` });
+  assert.equal(snapshot.base, main);
+  assert.deepEqual(snapshot.files, ['feature.js']);
+  // git push origin HEAD names the same branch.
+  const [viaHead] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `HEAD ${head} refs/heads/feature ${pushed}\n` });
+  assert.equal(viaHead.base, main);
+  // The replaced tip is still needed to tell a rebase apart.
+  await assert.rejects(pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${head} refs/heads/feature ${'f'.repeat(40)}\n` }), /Fetch the destination history with git fetch/);
+});
+
+test('a rebase is still recognised when the branch it went onto moved on and was fetched before the push', async t => {
+  const { cwd, pushed, main } = await rebaseFixture(t);
+  await command(cwd, 'rebase', '-q', 'main');
+  const head = await command(cwd, 'rev-parse', 'HEAD');
+  // An IDE's auto-fetch, or a manual git fetch, between the rebase and the push.
+  await command(cwd, 'checkout', '-q', 'main');
+  const later = await commit(cwd, { 'later.js': 'export const later = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/main', later);
+  await command(cwd, 'checkout', '-q', 'feature');
+  const [snapshot] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${head} refs/heads/feature ${pushed}\n` });
+  assert.equal(snapshot.base, main);
+  assert.deepEqual(snapshot.files, ['feature.js']);
+});
+
+test('a rebased branch pushed under another name is recognised when that remote branch is its upstream', async t => {
+  const { cwd, pushed, main } = await rebaseFixture(t);
+  await command(cwd, 'branch', '-m', 'feature', 'local-feature');
+  await command(cwd, 'rebase', '-q', 'main');
+  const head = await command(cwd, 'rev-parse', 'HEAD');
+  const input = `refs/heads/local-feature ${head} refs/heads/feature ${pushed}\n`;
+  // Without an upstream, nothing ties local-feature to origin/feature: it may be replacing someone else's branch.
+  const [untracked] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
+  assert.equal(untracked.base, pushed);
+  await command(cwd, 'config', 'branch.local-feature.remote', 'origin');
+  await command(cwd, 'config', 'branch.local-feature.merge', 'refs/heads/feature');
+  const [tracked] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
+  assert.equal(tracked.base, main);
+  assert.deepEqual(tracked.files, ['feature.js']);
+  // git push origin HEAD:feature resolves HEAD to the same branch.
+  const [viaHead] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `HEAD ${head} refs/heads/feature ${pushed}\n` });
+  assert.equal(viaHead.base, main);
+});
+
+test('a rebase that leaves nothing of the branch\'s own is not a change', async t => {
+  const { cwd, pushed } = await rebaseFixture(t);
+  // main took the branch's change (a squash merge), then moved on; the rebase drops the branch's commit.
+  await command(cwd, 'checkout', '-q', 'main');
+  await commit(cwd, { 'feature.js': 'export const feature = 1;\n' }, 'squash feature');
+  const tip = await commit(cwd, { 'later.js': 'export const later = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/main', tip);
+  await command(cwd, 'checkout', '-q', 'feature');
+  await command(cwd, 'rebase', '-q', 'main');
+  const head = await command(cwd, 'rev-parse', 'HEAD');
+  assert.equal(head, tip);
+  assert.deepEqual(await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${head} refs/heads/feature ${pushed}\n` }), []);
+});
+
+test('a rewrite that brings nothing in, a rewind, or replacing another branch is checked against the tip it overwrites', async t => {
+  const { cwd, start, pushed, main } = await rebaseFixture(t);
+  // An amend: only what changed since the pushed commit.
+  const kept = await commit(cwd, { 'kept.js': 'export const kept = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/feature', kept);
+  await writeFile(join(cwd, 'kept.js'), 'export const kept = 2;\n');
+  await command(cwd, 'commit', '-q', '--all', '--amend', '--no-edit');
+  const amended = await command(cwd, 'rev-parse', 'HEAD');
+  const [amend] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${amended} refs/heads/feature ${kept}\n` });
+  assert.equal(amend.base, kept);
+  assert.deepEqual(amend.stats, { additions: 1, deletions: 1, files: 1 });
+  // The same amend already pushed to another checked branch is still an amend, not a rebase onto that branch.
+  await command(cwd, 'update-ref', 'refs/remotes/origin/review', amended);
+  const [shared] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${amended} refs/heads/feature ${kept}\n` });
+  assert.equal(shared?.base, kept);
+  assert.deepEqual(shared.stats, { additions: 1, deletions: 1, files: 1 });
+  await command(cwd, 'update-ref', '-d', 'refs/remotes/origin/review');
+  // A rewind: what it drops is the change.
+  const [rewind] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${start} refs/heads/feature ${pushed}\n` });
+  assert.equal(rewind.base, pushed);
+  assert.deepEqual(rewind.files, ['feature.js']);
+  // feature:main overwrites main's history, so the commits main loses are part of the change.
+  const [overwrite] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${pushed} refs/heads/main ${main}\n` });
+  assert.equal(overwrite.base, main);
+  assert.deepEqual(overwrite.files, ['feature.js', 'theirs.js']);
+  // A fast-forward checks only the new commits.
+  const [forward] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${kept} refs/heads/feature ${pushed}\n` });
+  assert.equal(forward.base, pushed);
+  assert.deepEqual(forward.files, ['kept.js']);
+});
+
 test('a branch that merged other pushed work starts from one of them, and many remote branches stay fast', async t => {
   const cwd = await fixture(t);
   const main = await commit(cwd, { 'base.js': 'export const base = 1;\n' });

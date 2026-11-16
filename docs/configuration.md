@@ -207,7 +207,7 @@ If both `.sphinxconfig` and legacy `.sphinx.json` exist, `.sphinxconfig` wins an
 
 **Manual push checks.** `sphinx check --remote origin --branch main` selects the destination; otherwise Sphinx uses the upstream. Multiple destination refs are assessed separately. Tag-only pushes and deletions do not trigger checks in v0.1.
 
-**Pull request branches.** Set `"branches": ["*"]` to check pushes to every branch. The first push of a new branch is checked from where it left the remote's default branch (the same range the pull request shows), using local remote-tracking refs; later pushes check only the new commits.
+**Pull request branches.** Set `"branches": ["*"]` to check pushes to every branch. The first push of a new branch is checked from where it left the remote's default branch (the same range the pull request shows), using local remote-tracking refs; later pushes check only the new commits. A force push after rebasing the branch onto work already on the remote (`git pull --rebase`, `git rebase origin/main`) is checked the same way as a first push, from where the branch now leaves the remote's checked branches, so the commits the rebase brought in don't count as the branch's change. This holds when the branch it went onto has moved on again since, and for a local branch pushed under another name when the remote branch is its upstream. Other rewrites are checked against the tip they overwrite: an amend, a rewind, or a push that replaces another branch (`feature:main`).
 
 ## Project context
 
