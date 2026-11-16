@@ -448,6 +448,20 @@ test('a force push after a rebase checks the branch\'s own commits, not the ones
   await assert.rejects(pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${head} refs/heads/feature ${'f'.repeat(40)}\n` }), /Fetch the destination history with git fetch/);
 });
 
+test('a rebase that leaves nothing of the branch\'s own is not a change', async t => {
+  const { cwd, pushed } = await rebaseFixture(t);
+  // main took the branch's change (a squash merge), then moved on; the rebase drops the branch's commit.
+  await command(cwd, 'checkout', '-q', 'main');
+  await commit(cwd, { 'feature.js': 'export const feature = 1;\n' }, 'squash feature');
+  const tip = await commit(cwd, { 'later.js': 'export const later = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/main', tip);
+  await command(cwd, 'checkout', '-q', 'feature');
+  await command(cwd, 'rebase', '-q', 'main');
+  const head = await command(cwd, 'rev-parse', 'HEAD');
+  assert.equal(head, tip);
+  assert.deepEqual(await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${head} refs/heads/feature ${pushed}\n` }), []);
+});
+
 test('a rewrite that brings nothing in, a rewind, or replacing another branch is checked against the tip it overwrites', async t => {
   const { cwd, start, pushed, main } = await rebaseFixture(t);
   // An amend: only what changed since the pushed commit.
@@ -459,6 +473,12 @@ test('a rewrite that brings nothing in, a rewind, or replacing another branch is
   const [amend] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${amended} refs/heads/feature ${kept}\n` });
   assert.equal(amend.base, kept);
   assert.deepEqual(amend.stats, { additions: 1, deletions: 1, files: 1 });
+  // The same amend already pushed to another checked branch is still an amend, not a rebase onto that branch.
+  await command(cwd, 'update-ref', 'refs/remotes/origin/review', amended);
+  const [shared] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${amended} refs/heads/feature ${kept}\n` });
+  assert.equal(shared?.base, kept);
+  assert.deepEqual(shared.stats, { additions: 1, deletions: 1, files: 1 });
+  await command(cwd, 'update-ref', '-d', 'refs/remotes/origin/review');
   // A rewind: what it drops is the change.
   const [rewind] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${start} refs/heads/feature ${pushed}\n` });
   assert.equal(rewind.base, pushed);

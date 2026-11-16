@@ -261,7 +261,11 @@ async function rebasedOntoPushedWork(root, remote, config, sourceRef, ref, old, 
   const tips = new Set((await checkedRemoteBranches(root, remote, config)).filter(branch => branch.ref !== own).map(({ oid }) => oid));
   if (!tips.size) return false;
   // Brought in: the tip of another checked branch is now in the branch's history, and was not before.
-  return (await git(root, ['rev-list', head, `^${old}`])).split('\n').some(oid => tips.has(oid));
+  // The new head itself being such a tip proves nothing alone: an amend also pushed to another
+  // branch looks the same. It counts only when the push adds commits beneath it too, as a rebase
+  // onto a branch that moved on does; an amend adds just the one commit.
+  const added = (await git(root, ['rev-list', head, `^${old}`])).split('\n').filter(Boolean);
+  return added.some(oid => tips.has(oid) && (oid !== head || added.length > 1));
 }
 
 export async function pushSnapshots({ cwd = process.cwd(), remote, remoteUrl, input, config, env = process.env }) {
