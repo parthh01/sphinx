@@ -24,6 +24,6 @@ jobs:
     if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     steps:
-      - uses: parthh01/sphinx/action@v0.1.16
+      - uses: parthh01/sphinx/action@v0.1.26
         with:
-          require: false
+          require: true

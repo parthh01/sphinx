@@ -2,7 +2,7 @@
 
 Use Node.js 22.19+, install the pinned dependencies with `npm ci`, and run `npm test`. Tests must not call real models, change real agent settings, or modify a developer's global Git configuration. The test runner blocks outbound Node requests while permitting local fixtures.
 
-Pull requests show a **Sphinx** check, which does not block merging: stamped once you pass Sphinx for the latest commit, neutral until then, and failed if you skip the check. For the stamp, [install Sphinx](README.md#1-install-required) (this repository's `.sphinxconfig` checks pushes of every branch), sign in to the GitHub CLI (`gh`), and open the pull request within about 15 minutes of pushing; otherwise the check stays neutral until your next checked push.
+**A pull request needs a Sphinx stamp to merge.** Opening one and pushing to it are never blocked, but its **Sphinx** check fails until you pass Sphinx for its latest commit, and `main` requires that check. To get the stamp, [install Sphinx](README.md#1-install-required) (this repository's `.sphinxconfig` checks pushes of every branch), sign in to the GitHub CLI (`gh`), and open the pull request within about 15 minutes of pushing; otherwise the stamp waits for your next checked push. A pull request whose latest commit was pushed without passing, or after skipping the check, cannot merge until you push again and pass.
 
 Keep trigger policy deterministic and separate from model judgment. Preserve existing hooks. Filter paths before reading code. New integrations need isolated install/uninstall tests and clear coverage limitations.
 
@@ -44,6 +44,8 @@ A release commit never starts another release:
 Never connect an integration that commits to `main` whenever `main` changes, such as a badge, changelog or formatting bot, unless its commits say `[skip ci]`. Each of its commits would release a version, and each release commit would set it off again. Your own commit whose message contains `[skip ci]` starts no run either, and neither does a squash merge whose pull request's commit messages quote it. It is released with the next commit, or with **Run workflow** below.
 
 If publishing fails, or the job is cancelled, after the push, `main` ends at a tagged commit whose version npm does not have, and no run starts for a release commit. Fix the cause, then open **Actions**, **Test**, **Run workflow** on `main`. That run publishes the version from that commit, reusing its tag, with no new commit. Re-running the failed job does nothing, and its log says to use **Run workflow**. If another commit reaches `main` first, its release skips the unpublished version and publishes the next patch.
+
+The ruleset on `main` that requires the **Sphinx** check lets the GitHub Actions app bypass it, because release commits are pushed straight to `main` and never get a stamp. Repository admins can bypass it too, and GitHub shows when they do. Removing that bypass stops releases.
 
 Installed copies pin the Action that `sphinx init --github-check` sets up to their version's tag, so never move or delete release tags. `main` and `v*` tags must stay pushable by `github-actions`: branch protection, or a ruleset on `main` or on tags, that blocks its push stops releases, and each release job then fails without publishing.
 
