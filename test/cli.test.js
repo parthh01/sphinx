@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm, chmod, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, writeFile, rm, chmod, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
+import { deckFile, readDeck } from '../src/deck.js';
 
 const CLI = fileURLToPath(new URL('../bin/sphinx.js', import.meta.url));
 
@@ -152,6 +153,86 @@ test('CLI blocks a push, conducts the learning loop, reuses completion, and reje
   }
   f.cli('uninstall');
   assert.notEqual(f.run('git', ['config', '--global', '--get', 'core.hooksPath']).status, 0);
+});
+
+test('a passed check fills the local deck and sphinx drill lists it without model calls or answer keys', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  assert.notEqual(f.run('git', ['push', 'origin', 'main']).status, 0);
+  const pending = f.cliJson('pending')[0];
+  f.cliJson('check');
+  f.cliJson('answer', pending.id, '--text', 'Yes. Restart recreates the set, so it cannot remember the previous process\'s IDs.');
+  const before = (await f.calls()).length;
+  const empty = f.cliJson('drill');
+  assert.equal(empty.due, 0);
+  assert.equal(empty.upcoming, 1);
+  assert.equal(empty.cards.length, 0);
+  const listed = f.cliJson('drill', '--list');
+  assert.equal(listed.cards.length, 1);
+  assert.match(listed.cards[0].prompt, /same ID twice/);
+  assert.equal(Object.hasOwn(listed.cards[0], 'back'), false);
+  assert.equal(Object.hasOwn(listed.cards[0], 'expectedAnswer'), false);
+  assert.equal(Object.hasOwn(listed.cards[0], 'rationale'), false);
+  assert.doesNotMatch(JSON.stringify(listed), /recreated on restart|in-memory set/i);
+  const status = f.cliJson('status');
+  assert.equal(status.drill.total, 1);
+  assert.equal(status.drill.due, 0);
+  const human = f.cli('drill', '--list');
+  assert.match(human, /same ID twice/);
+  assert.doesNotMatch(human, /recreated on restart|in-memory set/i);
+  const rejected = f.run(process.execPath, [CLI, 'drill', '--limit', '0']);
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /1 to 50/);
+  assert.equal(f.cliJson('drill', '--list', '--limit', '0').cards.length, 1, '--list ignores --limit');
+  // Sphinx keys the deck by the resolved root; macOS temp paths run through a symlink.
+  const repoRoot = await realpath(f.repo);
+  const file = deckFile(repoRoot, f.env);
+  const stored = JSON.parse(await readFile(file, 'utf8'));
+  const id = Object.keys((await readDeck(repoRoot, f.env)).cards)[0];
+  stored.cards[id].dueAt = '2020-01-01T00:00:00.000Z';
+  await writeFile(file, `${JSON.stringify(stored, null, 2)}\n`);
+  const interactive = f.run(process.execPath, [CLI, 'drill']);
+  assert.equal(interactive.status, 1);
+  assert.match(interactive.stderr, /terminal|--json/);
+  const dueNow = f.cliJson('drill');
+  assert.equal(dueNow.due, 1);
+  assert.equal(dueNow.cards.length, 1);
+  assert.equal(Object.hasOwn(dueNow.cards[0], 'back'), false);
+  // Run the drill as if from a terminal, answering through stdin.
+  // Each line goes in once its prompt is showing, as a person would type it.
+  const drillAs = (answers, { stdout = true } = {}) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e',
+      `Object.defineProperty(process.stdin,'isTTY',{value:true});${stdout ? "Object.defineProperty(process.stdout,'isTTY',{value:true});" : ''}const {main}=await import(${JSON.stringify(pathToFileURL(path.join(path.dirname(CLI), '../src/cli.js')).href)});try{process.exitCode=await main(['drill']);}catch(error){console.error(error.message);process.exitCode=1;}`,
+    ], { cwd: f.repo, env: { ...f.env, TERM: 'dumb' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const pending = [...answers];
+    let out = '', err = '';
+    child.stdout.on('data', chunk => {
+      out += chunk;
+      if (/(Your answer|again \(tomorrow\) or good[^:]*): $/.test(out) && pending.length) child.stdin.write(`${pending.shift()}\n`);
+    });
+    child.stderr.on('data', chunk => { err += chunk; });
+    child.on('error', reject);
+    child.on('close', status => { child.stdin.destroy(); resolve({ status, stdout: out, stderr: err }); });
+  });
+  const redirected = await drillAs(['my guess', 'good'], { stdout: false });
+  assert.equal(redirected.status, 1);
+  assert.match(redirected.stderr, /terminal|--json/);
+  assert.equal((await readDeck(repoRoot, f.env)).cards[id].reviews, 0, 'A redirected drill reviews nothing');
+  const again = await drillAs(['my guess', 'again']);
+  assert.equal(again.status, 0, again.stderr);
+  assert.match(again.stdout, /Membership is checked before insertion/, 'The stored explanation shows after the answer');
+  let card = (await readDeck(repoRoot, f.env)).cards[id];
+  assert.equal(card.reviews, 1);
+  assert.equal(card.intervalDays, 1);
+  assert.ok(Date.parse(card.dueAt) > Date.now(), 'again moves the card out of today');
+  stored.cards[id] = { ...card, dueAt: '2020-01-01T00:00:00.000Z' };
+  await writeFile(file, `${JSON.stringify(stored, null, 2)}\n`);
+  const good = await drillAs(['my guess', 'good']);
+  assert.equal(good.status, 0, good.stderr);
+  card = (await readDeck(repoRoot, f.env)).cards[id];
+  assert.equal(card.reviews, 2);
+  assert.ok(card.intervalDays > 1, 'good lengthens the interval');
+  assert.equal((await f.calls()).length, before, 'drill makes no model calls');
 });
 
 test('CLI keeps a failed evaluator pending and enforces the checkpoint on retry', { timeout: 30000 }, async t => {
@@ -322,7 +403,7 @@ test('canonical repository policy controls actual destination pushes through exi
 
 test('each public CLI command provides contextual help without setup or model calls', { timeout: 30000 }, async t => {
   const f = await fixture(t);
-  const commands = ['install', 'activate', 'init', 'auth', 'check', 'pending', 'answer', 'explain', 'dispute', 'status', 'config', 'doctor', 'uninstall'];
+  const commands = ['install', 'activate', 'init', 'auth', 'check', 'pending', 'answer', 'explain', 'dispute', 'status', 'config', 'doctor', 'uninstall', 'drill'];
   const generalHelp = f.cli('--help');
   for (const command of commands) {
     const optionHelp = f.cli(command, '--help');
