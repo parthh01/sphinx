@@ -45,6 +45,8 @@ Never connect an integration that commits to `main` whenever `main` changes, suc
 
 If publishing fails, or the job is cancelled, after the push, `main` ends at a tagged commit whose version npm does not have, and no run starts for a release commit. Fix the cause, then open **Actions**, **Test**, **Run workflow** on `main`. That run publishes the version from that commit, reusing its tag, with no new commit. Re-running the failed job does nothing, and its log says to use **Run workflow**. If another commit reaches `main` first, its release skips the unpublished version and publishes the next patch.
 
+Pull requests to `main` need a passing **Sphinx** check: a ruleset on `main` requires it, and the workflow in `.github/workflows/sphinx.yml` fails it until the pull request's latest commit is stamped. To stamp it, install Sphinx, check pull request branches (`"branches": ["*"]`), and push with the GitHub CLI signed in. The ruleset lets the GitHub Actions app bypass it, because release commits are pushed straight to `main` and never get a stamp; repository admins can bypass it too, and GitHub shows when they do.
+
 Installed copies pin the Action that `sphinx init --github-check` sets up to their version's tag, so never move or delete release tags. `main` and `v*` tags must stay pushable by `github-actions`: branch protection, or a ruleset on `main` or on tags, that blocks its push stops releases, and each release job then fails without publishing.
 
 Publishing uses npm trusted publishing, with no token or secret. It needs a one-time setup:
