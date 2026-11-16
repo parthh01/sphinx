@@ -208,7 +208,7 @@ export async function revalidateSnapshot(snapshot, config, { env = process.env }
 // the default branch. Only branches the policy also checks count; otherwise code
 // that reached them unchecked would be skipped, so the whole tree is assessed.
 async function branchPoint(root, remote, head, config) {
-  const checked = (await checkedRemoteBranches(root, remote, config)).map(({ ref }) => ref);
+  const checked = await checkedRemoteBranches(root, remote, config);
   if (!checked.length) return null;
   // One walk, however many branches the remote has: the commits only on this
   // branch, and the already-pushed commits they start from (marked "-").
@@ -227,14 +227,25 @@ async function branchPoint(root, remote, head, config) {
   return nearest.base;
 }
 
-// The remote-tracking branches the policy checks, with their tips: work on them was
-// already assessed when it was pushed.
+// The remote-tracking branches the policy checks: work on them was already assessed
+// when it was pushed.
 async function checkedRemoteBranches(root, remote, config) {
   if (!remote || remote === '.' || !/^[\w.-]+$/.test(remote)) return [];
   const prefix = `refs/remotes/${remote}/`;
-  return (await git(root, ['for-each-ref', '--format=%(objectname) %(refname)', prefix], { allowFailure: true }) || '')
-    .split('\n').filter(Boolean).map(line => { const [oid, ref] = line.split(' '); return { oid, ref }; })
-    .filter(({ ref }) => ref !== `${prefix}HEAD` && triggered(config, 'pre-push', ref.slice(prefix.length), remote));
+  return (await git(root, ['for-each-ref', '--format=%(refname)', prefix], { allowFailure: true }) || '')
+    .split('\n').filter(ref => ref && ref !== `${prefix}HEAD` && triggered(config, 'pre-push', ref.slice(prefix.length), remote));
+}
+
+// Whether a push updates the source branch's own copy on the remote: the branch of the
+// same name, or the one it tracks (git push origin local-name:feature, with
+// origin/feature as its upstream). A detached HEAD has no branch to tie it to.
+async function pushesOwnBranch(root, remote, sourceRef, ref) {
+  if (sourceRef === ref) return true;
+  if (!sourceRef.startsWith('refs/heads/')) return false;
+  const name = sourceRef.slice('refs/heads/'.length);
+  const [upstreamRemote, upstreamRef] = await Promise.all(['remote', 'merge']
+    .map(key => git(root, ['config', '--get', `branch.${name}.${key}`], { allowFailure: true })));
+  return upstreamRemote?.trim() === remote && upstreamRef?.trim() === ref;
 }
 
 // git push <remote> HEAD (or @) names its source HEAD. Record the branch it points at,
@@ -252,20 +263,22 @@ async function pushSource(root, localRef) {
 // and a rewind, an amend, or a rebase that brings nothing in is still checked
 // against the tip it replaces.
 async function rebasedOntoPushedWork(root, remote, config, sourceRef, ref, old, head) {
-  if (sourceRef !== ref) return false;
+  if (!await pushesOwnBranch(root, remote, sourceRef, ref)) return false;
   await ensureCommit(root, old, remote, true);
   for (const [ancestor, descendant] of [[old, head], [head, old]]) {
     if (await git(root, ['merge-base', '--is-ancestor', ancestor, descendant], { allowFailure: true }) !== null) return false;
   }
   const own = `refs/remotes/${remote}/${ref.slice('refs/heads/'.length)}`;
-  const tips = new Set((await checkedRemoteBranches(root, remote, config)).filter(branch => branch.ref !== own).map(({ oid }) => oid));
-  if (!tips.size) return false;
-  // Brought in: the tip of another checked branch is now in the branch's history, and was not before.
-  // The new head itself being such a tip proves nothing alone: an amend also pushed to another
-  // branch looks the same. It counts only when the push adds commits beneath it too, as a rebase
-  // onto a branch that moved on does; an amend adds just the one commit.
-  const added = (await git(root, ['rev-list', head, `^${old}`])).split('\n').filter(Boolean);
-  return added.some(oid => tips.has(oid) && (oid !== head || added.length > 1));
+  const others = (await checkedRemoteBranches(root, remote, config)).filter(branch => branch !== own);
+  if (!others.length) return false;
+  // Brought in: commits the push adds that another checked branch already has. Reachable
+  // from it, not only its tip: that branch may have moved on, and been fetched (an IDE's
+  // auto-fetch), between the rebase and the push. An amend adds just the one commit, and
+  // stays an amend even when that commit is already on another checked branch (pushed to a
+  // review branch first); a rebase onto a branch that moved on adds that branch's commits too.
+  const count = async input => Number((await git(root, ['rev-list', '--count', head, `^${old}`, '--stdin'], { input })).trim());
+  const added = await count('');
+  return added > 1 && await count(`${others.map(branch => `^${branch}`).join('\n')}\n`) < added;
 }
 
 export async function pushSnapshots({ cwd = process.cwd(), remote, remoteUrl, input, config, env = process.env }) {

@@ -448,6 +448,39 @@ test('a force push after a rebase checks the branch\'s own commits, not the ones
   await assert.rejects(pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${head} refs/heads/feature ${'f'.repeat(40)}\n` }), /Fetch the destination history with git fetch/);
 });
 
+test('a rebase is still recognised when the branch it went onto moved on and was fetched before the push', async t => {
+  const { cwd, pushed, main } = await rebaseFixture(t);
+  await command(cwd, 'rebase', '-q', 'main');
+  const head = await command(cwd, 'rev-parse', 'HEAD');
+  // An IDE's auto-fetch, or a manual git fetch, between the rebase and the push.
+  await command(cwd, 'checkout', '-q', 'main');
+  const later = await commit(cwd, { 'later.js': 'export const later = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/main', later);
+  await command(cwd, 'checkout', '-q', 'feature');
+  const [snapshot] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `refs/heads/feature ${head} refs/heads/feature ${pushed}\n` });
+  assert.equal(snapshot.base, main);
+  assert.deepEqual(snapshot.files, ['feature.js']);
+});
+
+test('a rebased branch pushed under another name is recognised when that remote branch is its upstream', async t => {
+  const { cwd, pushed, main } = await rebaseFixture(t);
+  await command(cwd, 'branch', '-m', 'feature', 'local-feature');
+  await command(cwd, 'rebase', '-q', 'main');
+  const head = await command(cwd, 'rev-parse', 'HEAD');
+  const input = `refs/heads/local-feature ${head} refs/heads/feature ${pushed}\n`;
+  // Without an upstream, nothing ties local-feature to origin/feature: it may be replacing someone else's branch.
+  const [untracked] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
+  assert.equal(untracked.base, pushed);
+  await command(cwd, 'config', 'branch.local-feature.remote', 'origin');
+  await command(cwd, 'config', 'branch.local-feature.merge', 'refs/heads/feature');
+  const [tracked] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
+  assert.equal(tracked.base, main);
+  assert.deepEqual(tracked.files, ['feature.js']);
+  // git push origin HEAD:feature resolves HEAD to the same branch.
+  const [viaHead] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `HEAD ${head} refs/heads/feature ${pushed}\n` });
+  assert.equal(viaHead.base, main);
+});
+
 test('a rebase that leaves nothing of the branch\'s own is not a change', async t => {
   const { cwd, pushed } = await rebaseFixture(t);
   // main took the branch's change (a squash merge), then moved on; the rebase drops the branch's commit.
