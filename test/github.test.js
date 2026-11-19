@@ -117,7 +117,7 @@ test('a pass from sphinx check stamps only the pull request from the checked bra
   const scheduled = JSON.parse(await readFile(calls[0][1][1], 'utf8'));
   assert.deepEqual([scheduled.branch, scheduled.latest], ['feature', true]);
   assert.equal(JSON.parse(await readFile(scheduled.branchFile, 'utf8')).ref, 'refs/heads/feature');
-  const responses = head => [[/^auth/, ok()], [/commits\//, ok('sha')], [/^api user/, ok('me\n')], [/repos\/acme\/widgets --jq/, ok('')], [/pulls\?state=open&head=acme%3Afeature/, ok(JSON.stringify([{ number: 7, head }]))], [/issues\/7\/comments --paginate/, ok('')], [/issues\/7\/comments --method POST/, ok('https://github.com/c/new\n')]];
+  const responses = head => [[/^auth/, ok()], [/commits\//, ok('sha')], [/^api user/, ok('me\n')], [/repos\/acme\/widgets --jq/, ok('')], [/pulls\?state=open&head=acme%3Afeature/, ok(JSON.stringify([{ number: 7, head }]))], [/issues\/7\/comments --paginate/, ok('')], [/issues\/7\/comments --method POST/, ok('https://github.com/c/new\n')], [/pulls\/7 --jq/, ok(`${snapshot.head}\n`)]];
   const moved = fakeGh(responses('c'.repeat(40)));
   assert.equal(await runStampJob(await job(t, { comment: true, status: false, latest: true }), { gh: moved.gh, wait: async () => {} }), 'not-latest');
   assert.ok(!moved.calls.some(call => /--method POST/.test(call.args.join(' '))), 'nothing is posted for an older commit');
@@ -132,6 +132,14 @@ test('a pass from sphinx check stamps only the pull request from the checked bra
   const current = fakeGh([[/statuses\//, ok()], ...responses(snapshot.head)]);
   assert.equal(await runStampJob(await job(t, { comment: false, status: true, latest: true }), { gh: current.gh, wait: async () => {} }), 'done');
   assert.ok(current.calls.some(call => /statuses\//.test(call.args.join(' '))), 'the latest commit gets its status');
+  // The pull request moves on after the first look: the comment is not written, and the status is not updated with its link.
+  const later = fakeGh([[/statuses\//, ok()], [/pulls\/7 --jq/, ok(`${'c'.repeat(40)}\n`)], ...responses(snapshot.head)]);
+  assert.equal(await runStampJob(await job(t, { comment: true, status: false, latest: true }), { gh: later.gh, wait: async () => {} }), 'not-latest');
+  assert.ok(!later.calls.some(call => /issues\/7\/comments --method POST/.test(call.args.join(' '))), 'no comment for a commit that is no longer the latest');
+  let heads = 0;
+  const between = fakeGh([[/statuses\//, ok()], [/pulls\/7 --jq/, () => ok(`${++heads > 1 ? 'c'.repeat(40) : snapshot.head}\n`)], ...responses(snapshot.head)]);
+  assert.equal(await runStampJob(await job(t, { comment: true, status: true, latest: true }), { gh: between.gh, wait: async () => {} }), 'not-latest');
+  assert.ok(!between.calls.some(call => call.input?.target_url), 'no linked status once the pull request moved on');
 });
 
 test('github settings validate, merge from .sphinxconfig, and stay out of the policy hash', () => {

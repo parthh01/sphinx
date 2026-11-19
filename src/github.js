@@ -242,6 +242,8 @@ export async function runStampJob(job, { gh = ghCli, env = process.env, wait = s
     if (!pull) return 'no-pull-request';
     if (pull.head !== job.sha) return 'not-latest';
   }
+  // The pull request can move on while the requests below run, so a latest-only job asks again right before each later write.
+  const moved = async () => job.latest && (await api([`repos/${where}/pulls/${pull.number}`, '--jq', '.head.sha'])).stdout?.trim() !== job.sha;
   if (job.status) await postStatus();
   if (!job.comment) return 'done';
   if (!job.latest) await findPull();
@@ -251,10 +253,14 @@ export async function runStampJob(job, { gh = ghCli, env = process.env, wait = s
   const me = (await api(['user', '--jq', '.login'])).stdout?.trim();
   const existing = await api([`repos/${where}/issues/${pull.number}/comments`, '--paginate', '--jq', `.[] | select((.body | startswith("${COMMENT_MARKER}")) and .user.login == ${JSON.stringify(me || '')}) | .id`]);
   const id = existing.ok ? existing.stdout.split('\n').find(Boolean) : null;
+  if (await moved()) return 'not-latest';
   const written = id
     ? await api([`repos/${where}/issues/comments/${id}`, '--method', 'PATCH', '--jq', '.html_url'], { body })
     : await api([`repos/${where}/issues/${pull.number}/comments`, '--method', 'POST', '--jq', '.html_url'], { body });
-  if (written.ok && job.status) await postStatus(written.stdout.trim());
+  if (written.ok && job.status) {
+    if (await moved()) return 'not-latest';
+    await postStatus(written.stdout.trim());
+  }
   return written.ok ? 'done' : 'comment-failed';
 }
 
