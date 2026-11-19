@@ -110,6 +110,21 @@ test('a branch without a pull request gives up quietly', async t => {
   assert.equal(await runStampJob(await job(t, { comment: true, status: false }), { gh, wait: async () => {}, prTries: 3 }), 'no-pull-request');
 });
 
+test('a pass from sphinx check stamps only the pull request from the checked branch while the commit is its latest', async t => {
+  const env = await home(t), calls = [];
+  const checked = { ...snapshot, target: { ...snapshot.target, ref: 'refs/heads/main' } };
+  assert.equal(await scheduleStamp({ snapshot: checked, session, outcome: 'passed', config: config({ comment: true, status: false }), env, spawnImpl: fakeSpawn(calls), pullRequest: 'feature' }), true);
+  const scheduled = JSON.parse(await readFile(calls[0][1][1], 'utf8'));
+  assert.deepEqual([scheduled.branch, scheduled.latest], ['feature', true]);
+  assert.equal(JSON.parse(await readFile(scheduled.branchFile, 'utf8')).ref, 'refs/heads/feature');
+  const responses = head => [[/^auth/, ok()], [/commits\//, ok('sha')], [/^api user/, ok('me\n')], [/repos\/acme\/widgets --jq/, ok('')], [/pulls\?state=open&head=acme%3Afeature/, ok(JSON.stringify([{ number: 7, head }]))], [/issues\/7\/comments --paginate/, ok('')], [/issues\/7\/comments --method POST/, ok('https://github.com/c/new\n')]];
+  const moved = fakeGh(responses('c'.repeat(40)));
+  assert.equal(await runStampJob(await job(t, { comment: true, status: false, latest: true }), { gh: moved.gh, wait: async () => {} }), 'not-latest');
+  assert.ok(!moved.calls.some(call => /--method POST/.test(call.args.join(' '))), 'nothing is posted for an older commit');
+  const latest = fakeGh(responses(snapshot.head));
+  assert.equal(await runStampJob(await job(t, { comment: true, status: false, latest: true }), { gh: latest.gh, wait: async () => {} }), 'done');
+});
+
 test('github settings validate, merge from .sphinxconfig, and stay out of the policy hash', () => {
   assert.throws(() => validateConfig({ ...structuredClone(DEFAULT_CONFIG), github: { status: 'yes' } }), /github/);
   assert.throws(() => validateConfig({ ...structuredClone(DEFAULT_CONFIG), github: { extra: true } }), /github/);

@@ -380,7 +380,7 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       distance = { current: session.config?.distance ?? config.distance, next: null, scope: repoSets ? 'repository' : 'machine' };
       const target = session.snapshot.target || {}, branch = name => String(name || '').replace(/^refs\/heads\//, '');
       const source = branch(session.snapshot.sourceRef), destination = branch(target.ref);
-      resumeCommand = !waitingGit ? `sphinx check --id ${request.id}`
+      resumeCommand = !waitingGit ? `sphinx check --id ${request.id} --browser`
         : session.snapshot.event === 'pre-commit' ? 'git commit'
         : target.remote && destination ? `git push ${target.remote} ${source && source !== destination ? `${source}:${destination}` : destination}` : 'git push';
       stamp = null;

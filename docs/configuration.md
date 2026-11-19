@@ -305,7 +305,7 @@ sphinx init --github-check     # writes .github/workflows/sphinx.yml; commit and
 
 How it fits together:
 
-- **On the contributor's machine:** after a pass, Sphinx comments on the branch's pull request with a summary and an encoded stamp for that exact commit. For a pull request from a fork, the comment goes on the upstream pull request. The questionnaire shows "Post the Sphinx stamp to the pull request" for pushes that look like a pull request (a GitHub remote, not its default branch). It is on by default when the repository has the Sphinx workflow, and otherwise follows `github.comment`.
+- **On the contributor's machine:** after a pass, Sphinx comments on the branch's pull request with a summary and an encoded stamp for that exact commit. For a pull request from a fork, the comment goes on the upstream pull request. The questionnaire shows "Post the Sphinx stamp to the pull request" for pushes that look like a pull request (a GitHub remote, not its default branch). It is on by default when the repository has the Sphinx workflow, and otherwise follows `github.comment`. A pass from `sphinx check` stamps too: the pull request from the checked destination, or for a check against the default branch (`--branch main`), the one from your checked local branch, and only while the checked commit is that pull request's latest.
 - **In the repository:** the Action runs when a pull request is opened or updated and when a comment is posted or edited. It reads the newest stamp for the pull request's latest commit, from the author or someone with write access, and writes the **Sphinx** check: stamped, with the number of questions, first-try results, depth, distance, and reviewer; failed if the check was skipped; or neutral ("No Sphinx stamp for this commit") until the author passes. With `require: true` in the workflow, a missing stamp fails the check instead.
 - **Safety:** the workflow uses `pull_request_target` and `issue_comment` so it can write checks for fork pull requests, and it never checks out or runs pull request code. It reads comments through the API only. It needs `checks: write` and read access to pull requests and issues.
 - When a repository runs the Action, Sphinx skips the separate commit status, since the check replaces it.
@@ -316,7 +316,7 @@ The workflow pins the Action to a Sphinx release tag (`parthh01/sphinx/action@v0
 
 ## Browser or terminal
 
-`interface` in `config.json` chooses where a push's questions appear. Set it with `sphinx config --interface <auto|browser|terminal>`.
+`interface` in `config.json` chooses where a push's questions appear, and where `sphinx check` asks. Set it with `sphinx config --interface <auto|browser|terminal>`. `sphinx check --browser` or `--terminal` overrides it for one run; with no Git operation waiting, the page ends on the pass, and a paused page names `sphinx check --id <id> --browser` to reopen it.
 
 | Value | Behavior |
 | --- | --- |

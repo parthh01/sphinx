@@ -104,7 +104,7 @@ export function commentBody(records, { stampHead } = {}) {
  * Record the check and hand GitHub work to a detached worker so Git never
  * waits on the network. Never throws.
  */
-export async function scheduleStamp({ snapshot, session, outcome, config, env = process.env, spawnImpl = spawn, post }) {
+export async function scheduleStamp({ snapshot, session, outcome, config, env = process.env, spawnImpl = spawn, post, pullRequest }) {
   try {
     const settings = config.github || {};
     const repo = githubRepository(snapshot.target.url);
@@ -114,13 +114,15 @@ export async function scheduleStamp({ snapshot, session, outcome, config, env = 
     const comment = typeof post === 'boolean' ? post : action || !!settings.comment;
     const status = !!settings.status && !action;
     if (!status && !comment) return false;
-    const file = branchFile(snapshot.repoRoot, snapshot.target.ref, env);
+    // From sphinx check: only the open pull request from this branch, and only while the checked commit is its latest.
+    const ref = pullRequest ? `refs/heads/${pullRequest}` : snapshot.target.ref;
+    const file = branchFile(snapshot.repoRoot, ref, env);
     const stored = await readJson(file, null).catch(() => null);
     const record = checkRecord({ session, snapshot, outcome, includeAnswers: !!settings.answers });
     const records = [...(Array.isArray(stored?.records) ? stored.records : []).filter(item => item.head !== record.head), record].slice(-RECORDS_KEPT);
-    await writeJson(file, { version: 1, repoRoot: snapshot.repoRoot, ref: snapshot.target.ref, records });
+    await writeJson(file, { version: 1, repoRoot: snapshot.repoRoot, ref, records });
     const job = path.join(githubDirectory(env), 'jobs', `${randomUUID()}.json`);
-    await writeJson(job, { version: 1, repo, sha: snapshot.head, branch: snapshot.target.ref.replace(/^refs\/heads\//, ''), branchFile: file, status, comment });
+    await writeJson(job, { version: 1, repo, sha: snapshot.head, branch: ref.replace(/^refs\/heads\//, ''), branchFile: file, status, comment, ...(pullRequest ? { latest: true } : {}) });
     const child = spawnImpl(process.execPath, [WORKER, job], { env, detached: true, stdio: 'ignore' });
     await new Promise((resolve, reject) => { child.once('error', reject); child.once('spawn', resolve); });
     child.unref();
@@ -230,12 +232,13 @@ export async function runStampJob(job, { gh = ghCli, env = process.env, wait = s
   for (let attempt = 0; attempt < prTries && !pull; attempt++) {
     if (attempt) await wait(prEveryMs);
     for (const place of places) {
-      const listed = await api([`repos/${place}/pulls?state=open&head=${encodeURIComponent(`${owner}:${job.branch}`)}&per_page=1`, '--jq', '[.[] | {number}]']);
+      const listed = await api([`repos/${place}/pulls?state=open&head=${encodeURIComponent(`${owner}:${job.branch}`)}&per_page=1`, '--jq', '[.[] | {number, head: .head.sha}]']);
       try { pull = listed.ok ? JSON.parse(listed.stdout || '[]')[0] || null : null; } catch { pull = null; }
       if (pull) { where = place; break; }
     }
   }
   if (!pull) return 'no-pull-request';
+  if (job.latest && pull.head !== job.sha) return 'not-latest';
   const body = commentBody((await readJson(job.branchFile, null).catch(() => null))?.records || records, { stampHead: job.sha });
   // Only ever edit this person's own Sphinx comment; others on the PR keep theirs.
   const me = (await api(['user', '--jq', '.login'])).stdout?.trim();
