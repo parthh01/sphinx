@@ -123,6 +123,15 @@ test('a pass from sphinx check stamps only the pull request from the checked bra
   assert.ok(!moved.calls.some(call => /--method POST/.test(call.args.join(' '))), 'nothing is posted for an older commit');
   const latest = fakeGh(responses(snapshot.head));
   assert.equal(await runStampJob(await job(t, { comment: true, status: false, latest: true }), { gh: latest.gh, wait: async () => {} }), 'done');
+  // With the commit status on, an older commit gets no status either, with or without the comment.
+  for (const comment of [false, true]) {
+    const stale = fakeGh([[/statuses\//, ok()], ...responses('c'.repeat(40))]);
+    assert.equal(await runStampJob(await job(t, { comment, status: true, latest: true }), { gh: stale.gh, wait: async () => {} }), 'not-latest');
+    assert.ok(!stale.calls.some(call => /statuses\/|--method POST/.test(call.args.join(' '))), 'nothing is posted for an older commit');
+  }
+  const current = fakeGh([[/statuses\//, ok()], ...responses(snapshot.head)]);
+  assert.equal(await runStampJob(await job(t, { comment: false, status: true, latest: true }), { gh: current.gh, wait: async () => {} }), 'done');
+  assert.ok(current.calls.some(call => /statuses\//.test(call.args.join(' '))), 'the latest commit gets its status');
 });
 
 test('github settings validate, merge from .sphinxconfig, and stay out of the policy hash', () => {

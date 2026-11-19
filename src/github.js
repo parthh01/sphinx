@@ -221,24 +221,31 @@ export async function runStampJob(job, { gh = ghCli, env = process.env, wait = s
   if (!record) return 'no-record';
   const status = statusFor(record);
   const postStatus = targetUrl => api([`repos/${owner}/${repo}/statuses/${job.sha}`, '--method', 'POST'], { state: status.state, context: STATUS_CONTEXT, description: status.description, ...(targetUrl ? { target_url: targetUrl } : {}) });
-  if (job.status) await postStatus();
-  if (!job.comment) return 'done';
-
   // A pull request is usually opened right after the first push of a branch. From a
   // fork it lives in the upstream repository, with this fork's owner in its head.
-  const parent = (await api([`repos/${owner}/${repo}`, '--jq', '.parent.full_name // ""'])).stdout?.trim();
-  const places = [`${owner}/${repo}`, ...(parent ? [parent] : [])];
   let pull = null, where = null;
-  for (let attempt = 0; attempt < prTries && !pull; attempt++) {
-    if (attempt) await wait(prEveryMs);
-    for (const place of places) {
-      const listed = await api([`repos/${place}/pulls?state=open&head=${encodeURIComponent(`${owner}:${job.branch}`)}&per_page=1`, '--jq', '[.[] | {number, head: .head.sha}]']);
-      try { pull = listed.ok ? JSON.parse(listed.stdout || '[]')[0] || null : null; } catch { pull = null; }
-      if (pull) { where = place; break; }
+  const findPull = async () => {
+    const parent = (await api([`repos/${owner}/${repo}`, '--jq', '.parent.full_name // ""'])).stdout?.trim();
+    const places = [`${owner}/${repo}`, ...(parent ? [parent] : [])];
+    for (let attempt = 0; attempt < prTries && !pull; attempt++) {
+      if (attempt) await wait(prEveryMs);
+      for (const place of places) {
+        const listed = await api([`repos/${place}/pulls?state=open&head=${encodeURIComponent(`${owner}:${job.branch}`)}&per_page=1`, '--jq', '[.[] | {number, head: .head.sha}]']);
+        try { pull = listed.ok ? JSON.parse(listed.stdout || '[]')[0] || null : null; } catch { pull = null; }
+        if (pull) { where = place; break; }
+      }
     }
+  };
+  // A latest-only job (from sphinx check) posts nothing, status included, unless the commit is the pull request's head.
+  if (job.latest) {
+    await findPull();
+    if (!pull) return 'no-pull-request';
+    if (pull.head !== job.sha) return 'not-latest';
   }
+  if (job.status) await postStatus();
+  if (!job.comment) return 'done';
+  if (!job.latest) await findPull();
   if (!pull) return 'no-pull-request';
-  if (job.latest && pull.head !== job.sha) return 'not-latest';
   const body = commentBody((await readJson(job.branchFile, null).catch(() => null))?.records || records, { stampHead: job.sha });
   // Only ever edit this person's own Sphinx comment; others on the PR keep theirs.
   const me = (await api(['user', '--jq', '.login'])).stdout?.trim();

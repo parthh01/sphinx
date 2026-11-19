@@ -371,7 +371,8 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       await refreshScore(request.repoRoot, operationEnv).catch(() => {});
       let visible = store.public(session);
       publish({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'working', message: 'Preparing your understanding check…' });
-      await ensureServer(operationEnv);
+      // No page can be served (loopback binding failed): the caller asks another way.
+      try { await ensureServer(operationEnv); } catch { return { status: 'unavailable', reason: 'server', id: request.id }; }
       const notes = [];
       const recoveryUI = { warning: text => notes.push(text), note: text => notes.push(text), command: () => {} };
       const plans = await findPlans(operationEnv).catch(() => []);

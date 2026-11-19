@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { get } from 'node:http';
+import { Server, get } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -1038,4 +1038,12 @@ test('a held pass at an earlier destination of the push moves on without asking 
   assert.equal(f.interview.state.phase, 'passed');
   assert.match(f.interview.state.message, /^You passed\. This push has another destination to check next\./);
   assert.deepEqual([f.generated(), f.graded()], calls);
+});
+
+test('a questionnaire server that cannot bind reports the browser unavailable, so the caller asks another way', async t => {
+  t.mock.method(Server.prototype, 'listen', function () { process.nextTick(() => this.emit('error', Object.assign(new Error('listen EACCES'), { code: 'EACCES' }))); return this; });
+  const f = await fixture(t);
+  assert.equal((await f.present({ ...f.request, delivery: undefined })).status, 'unavailable');
+  assert.equal(f.opened(), 0);
+  assert.equal((await f.store.read(f.snapshot.id)).status, 'pending');
 });

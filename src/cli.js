@@ -444,14 +444,17 @@ async function checkCommand(values) {
   // More checks may follow in the same push; only the last one asks whether to continue.
   const waitingGit = process.env.SPHINX_WAITING_GIT === '1', more = waitingGit && process.env.SPHINX_MORE_CHECKS === '1';
   // A check started by hand follows interface like the Git hook. A waiting Git operation keeps its own terminal.
+  // --retry-review authorizes one more attempt, whichever interface ends up asking.
+  let retried = false;
   if (!waitingGit && (values.browser || (!values.terminal && !prefersTerminal(config)))) {
-    const code = await browserCheck(session, config, values);
+    if (values['retry-review']) { await store.retryReview(session.id, config); retried = true; }
+    const code = await browserCheck(session, config);
     if (code !== null) return code;
   }
   const code = await withReadline(async ask => {
     const terminal = ui();
     if (values['retry-review']) {
-      await store.retryReview(session.id, config, { signal });
+      if (!retried) await store.retryReview(session.id, config, { signal });
       signal.throwIfAborted();
       terminal.note(config.maxModelCalls === null
         ? 'Resuming the review with no model-call limit. Previous usage remains counted.'
@@ -474,8 +477,7 @@ async function checkCommand(values) {
 }
 
 // The local browser questionnaire, with no Git operation waiting. Null when it is unavailable here (CI), so the terminal asks instead.
-async function browserCheck(session, config, values) {
-  if (values['retry-review']) await store.retryReview(session.id, config);
+async function browserCheck(session, config) {
   const controller = new AbortController(), interrupt = () => controller.abort();
   const interview = createBrowserInterview({ signal: controller.signal });
   process.once('SIGINT', interrupt);
