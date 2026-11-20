@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, githubRepository, runStampJob, scheduleStamp, statusFor, workflowTemplate } from '../src/github.js';
+import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, checkedPullRequestBranch, githubRepository, pullRequestPush, runStampJob, scheduleStamp, statusFor, workflowTemplate } from '../src/github.js';
 import { DEFAULT_CONFIG, policyHash, validateConfig, validateRepositoryConfig } from '../src/config.js';
 
 const snapshot = { event: 'pre-push', repoRoot: '/repo', head: 'b'.repeat(40), base: 'a'.repeat(40), stats: { files: 2, additions: 10, deletions: 1 }, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/feature' } };
@@ -191,4 +191,21 @@ test('the workflow template pins the Action to the release tag, never runs pull 
   assert.match(text, /\npermissions:\n {2}checks: write\n {2}pull-requests: read\n {2}issues: read\n(?! )/);
   assert.match(text, /\n {2}cancel-in-progress: false\n/, 'a comment must not cancel a run that has already started');
   assert.doesNotMatch(text, /checkout|\brun:/, 'it never checks out or runs pull request code');
+});
+
+test('a check against a base branch is for the checked branch pull request into that base, whatever the base is', async () => {
+  const checked = (ref, sourceRef) => ({ ...snapshot, sourceRef, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, mergeBase: true } });
+  assert.equal(await pullRequestPush(checked('refs/heads/main', 'refs/heads/feature')), true, 'the page offers the stamp although main is the default branch');
+  assert.equal(await pullRequestPush(checked('refs/heads/release', 'refs/heads/feature')), true);
+  assert.equal(await pullRequestPush(checked('refs/heads/main', 'refs/heads/main')), false, 'main against itself has no pull request');
+  assert.equal(await pullRequestPush(checked('refs/heads/main', 'HEAD')), false, 'a detached HEAD names no branch');
+  assert.equal(await pullRequestPush({ ...checked('refs/heads/main', 'refs/heads/feature'), target: { remote: 'origin', url: 'https://gitlab.com/acme/widgets.git', ref: 'refs/heads/main', mergeBase: true } }), false, 'no stamp outside GitHub');
+});
+
+test('a pass from sphinx check stamps the destination pull request, or the checked branch one against the default branch or a --base', async () => {
+  const at = (ref, sourceRef, extra = {}) => ({ ...snapshot, sourceRef, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, ...extra } });
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/feature', 'refs/heads/feature')), 'refs/heads/feature', 'a check of a push to feature');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', 'refs/heads/feature')), 'refs/heads/feature', '--branch main from feature');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/release', 'refs/heads/feature', { mergeBase: true })), 'refs/heads/feature', '--base release: the pull request from feature, not one from release');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', 'refs/heads/main', { mergeBase: true })), null);
 });
