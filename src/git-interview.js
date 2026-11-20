@@ -82,7 +82,7 @@ export async function runGitTerminalCheck({ request, env = process.env, signal, 
   try {
     const code = await new Promise(resolve => {
       let child;
-      try { child = spawnImpl(process.execPath, [CLI, 'check', '--id', request.id], { cwd, env: { ...env, SPHINX_WAITING_GIT: '1', ...(request.more ? { SPHINX_MORE_CHECKS: '1' } : {}) }, stdio: [tty, tty, tty] }); }
+      try { child = spawnImpl(process.execPath, [CLI, 'check', '--id', request.id, '--terminal'], { cwd, env: { ...env, SPHINX_WAITING_GIT: '1', ...(request.more ? { SPHINX_MORE_CHECKS: '1' } : {}) }, stdio: [tty, tty, tty] }); }
       catch { resolve(null); return; }
       const onAbort = () => child.kill('SIGINT');
       signal?.addEventListener('abort', onAbort, { once: true });
