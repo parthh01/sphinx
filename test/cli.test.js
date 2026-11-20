@@ -257,6 +257,115 @@ test('interactive CLI stays open after review failure until the human pauses or 
   assert.equal(record.callLimit, undefined, 'ordinary interactive retries never extend the allowance');
 });
 
+// sphinx check opens the browser questionnaire with no Git operation waiting. SSH_TTY keeps a real browser from opening.
+function launchBrowserCheck(t, f, args, env = {}) {
+  const script = `Object.defineProperty(process.stdin,'isTTY',{value:true});
+    const {main}=await import(${JSON.stringify(new URL('../src/cli.js', import.meta.url).href)});
+    try { process.exitCode=await main(${JSON.stringify(['check', ...args])}); }
+    catch(error) { console.error(error.message); process.exitCode=error.exitCode||1; }`;
+  const childEnv = { ...f.env, TERM: 'dumb', NO_COLOR: '1', SSH_TTY: '/dev/null', ...env };
+  delete childEnv.CI;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { cwd: f.repo, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', data => { output += data; });
+  child.stderr.on('data', data => { output += data; });
+  const done = new Promise(resolve => child.once('close', code => resolve(code)));
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  const page = async () => {
+    const deadline = Date.now() + 8000;
+    while (!/Sphinx questionnaire: (\S+)/.test(output) && child.exitCode === null && Date.now() < deadline) await delay(20);
+    const url = output.match(/Sphinx questionnaire: (\S+)/)?.[1];
+    assert.ok(url, `No questionnaire URL:\n${output}`);
+    return url;
+  };
+  const waitForPhase = async (url, phase) => {
+    let state;
+    for (let i = 0; i < 400; i++) { state = await (await fetch(`${url}/state`)).json(); if (state.phase === phase) return state; await delay(20); }
+    assert.fail(`Phase ${state?.phase}, expected ${phase}:\n${output}`);
+  };
+  // The CLI closes the page soon after a pass or pause, so a final phase is read from the event stream opened before the action.
+  const watchPhase = async (url, phase) => {
+    const reader = (await fetch(`${url}/events`)).body.pipeThrough(new TextDecoderStream()).getReader();
+    // Wrapped, so awaiting the subscription does not also wait for the phase.
+    return { event: (async () => {
+      let buffer = '';
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) assert.fail(`Events ended before ${phase}:\n${output}`);
+          buffer += value;
+          const lines = buffer.split('\n'); buffer = lines.pop();
+          for (const line of lines) if (line.startsWith('data: ') && JSON.parse(line.slice(6)).phase === phase) return JSON.parse(line.slice(6));
+        }
+      } finally { reader.cancel().catch(() => {}); }
+    })() };
+  };
+  const post = (url, state, action, extra = {}) => fetch(`${url}/action`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: new URL(url).origin, 'X-Sphinx-Token': new URL(url).pathname.slice(1) },
+    body: JSON.stringify({ id: state.id, revision: state.revision, action, ...(action === 'answer' ? { questionId: state.question.id } : {}), ...extra }) });
+  return { done, page, waitForPhase, watchPhase, post, output: () => output };
+}
+
+test('sphinx check --browser answers a pending checkpoint in the local browser questionnaire', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  assert.notEqual(f.run('git', ['push', 'origin', 'main']).status, 0);
+  const id = f.cliJson('pending')[0].id;
+  const check = launchBrowserCheck(t, f, ['--browser']);
+  const url = await check.page();
+  const state = await check.waitForPhase(url, 'question');
+  assert.equal(state.id, id);
+  assert.equal(state.waitingGit, false, 'no Git operation waits on this page');
+  const passed = await check.watchPhase(url, 'passed');
+  assert.ok((await check.post(url, state, 'answer', { response: 'No. The existing ID is rejected before insertion.' })).ok);
+  assert.equal((await passed.event).id, id);
+  assert.equal(await check.done, 0);
+  assert.match(check.output(), /Understanding check complete/);
+  assert.doesNotMatch(check.output(), /continue \/ stop|› /, 'the terminal questionnaire never ran');
+  assert.equal(JSON.parse(await readFile(path.join(f.env.SPHINX_HOME, 'sessions', `${id}.json`), 'utf8')).status, 'passed');
+});
+
+test('sphinx check follows interface browser, and a paused page resumes in the browser', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  f.cli('config', '--interface', 'browser');
+  assert.notEqual(f.run('git', ['push', 'origin', 'main']).status, 0);
+  const id = f.cliJson('pending')[0].id;
+  const check = launchBrowserCheck(t, f, []);
+  const url = await check.page();
+  const state = await check.waitForPhase(url, 'question');
+  const paused = await check.watchPhase(url, 'paused');
+  assert.ok((await check.post(url, state, 'pause')).ok);
+  assert.equal((await paused.event).resume, `sphinx check --id ${id} --browser`);
+  assert.equal(await check.done, 1);
+  assert.match(check.output(), new RegExp(`sphinx check --id\\s+${id} --browser`));
+  assert.equal(f.cliJson('pending')[0].id, id, 'progress stays pending');
+  const both = f.run(process.execPath, [CLI, 'check', '--browser', '--terminal']);
+  assert.notEqual(both.status, 0);
+  assert.match(both.stderr + both.stdout, /one of --browser and --terminal/);
+});
+
+test('sphinx check --retry-review authorizes one retry when the browser is unavailable and the terminal asks instead', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  f.cli('config', '--max-model-calls', '20');
+  f.cli('config', '--interface', 'browser');
+  assert.notEqual(f.run('git', ['push', 'origin', 'main']).status, 0);
+  assert.equal(f.run(process.execPath, [CLI, 'check', '--json'], { env: { ...f.env, SPHINX_TEST_FAILURE: '1' } }).status, 1);
+  const before = f.cliJson('pending')[0];
+  // CI keeps the browser page from starting, so the terminal asks; its stdin is empty, so it is cancelled there.
+  const script = `Object.defineProperty(process.stdin,'isTTY',{value:true});
+    const {main}=await import(${JSON.stringify(new URL('../src/cli.js', import.meta.url).href)});
+    try { process.exitCode=await main(${JSON.stringify(['check', '--id', before.id, '--retry-review'])}); }
+    catch(error) { console.error(error.message); process.exitCode=error.exitCode||1; }`;
+  const retried = f.run(process.execPath, ['--input-type=module', '-e', script], { env: { ...f.env, TERM: 'dumb', NO_COLOR: '1' } });
+  assert.doesNotMatch(retried.stderr + retried.stdout, /Only a failed review/);
+  assert.match(retried.stdout, /Starting a new review attempt with up to 20 additional model calls/);
+  const after = f.cliJson('pending')[0];
+  assert.equal(after.usage.limit, before.usage.calls + before.usage.limit, 'the allowance is extended once');
+  assert.equal(after.reviewAttempts, 2, 'the failed attempt and one retry');
+  assert.equal(after.preparation.status, 'pending');
+});
+
 test('CLI pre-commit gate assesses staged content without waiting for terminal input', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none', '--events', 'pre-commit');
@@ -663,4 +772,64 @@ test('a documentation-only push goes through with no questionnaire and no model 
   assert.equal(pushed.status, 0, pushed.stderr);
   assert.match(pushed.stderr, /documentation-only change to refs\/heads\/main; no questions needed/);
   assert.equal((await f.calls()).length, before, 'No model was called');
+});
+
+// A pushed feature branch that main moved past afterwards (in another clone, not fetched
+// here). The remote is a plain local repository: a check against a base branch is Git only.
+async function baseFixture(t) {
+  const f = await fixture(t);
+  f.git('push', '-q', 'origin', 'main');
+  f.git('switch', '-qc', 'feature');
+  await writeFile(path.join(f.repo, 'app.js'), `${f.app}export const size = () => seen.size;\n`);
+  f.git('commit', '-qam', 'Count queued IDs'); f.git('push', '-q', '--set-upstream', 'origin', 'feature');
+  const head = f.git('rev-parse', 'HEAD');
+  const other = path.join(f.base, 'other');
+  f.ok('git', ['clone', '-q', '-b', 'main', f.bare, other]);
+  await writeFile(path.join(other, 'later.js'), 'export const later = true;\n');
+  f.ok('git', ['add', 'later.js'], { cwd: other }); f.ok('git', ['-c', 'user.name=Other', '-c', 'user.email=other@example.test', 'commit', '-qm', 'Merged elsewhere'], { cwd: other }); f.ok('git', ['push', '-q', 'origin', 'main'], { cwd: other });
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  return { ...f, head };
+}
+
+test('check --base checks the branch from where it left its base, and refuses what would make that ambiguous', { timeout: 60000 }, async t => {
+  const f = await baseFixture(t);
+  for (const flag of [['--branch', 'main'], ['--staged']]) {
+    const refused = f.run(process.execPath, [CLI, 'check', '--base', 'main', ...flag, '--json']);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, new RegExp(`--base\\s+cannot\\s+be\\s+combined\\s+with\\s+${flag[0]}`));
+  }
+  // The base branch decides the policy, as the destination of a push does.
+  const unchecked = f.run(process.execPath, [CLI, 'check', '--base', 'gone', '--json']);
+  assert.equal(unchecked.status, 0, unchecked.stderr);
+  assert.deepEqual(JSON.parse(unchecked.stdout), { status: 'not-required' });
+  assert.deepEqual(await f.calls(), [], 'nothing is reviewed before the range is known');
+
+  const started = f.run(process.execPath, [CLI, 'check', '--base', 'main', '--json']);
+  assert.equal(started.status, 0, started.stderr);
+  const session = JSON.parse(started.stdout);
+  assert.equal(session.status, 'active');
+  const reviewed = JSON.stringify(await f.calls());
+  assert.match(reviewed, /app\.js/);
+  assert.doesNotMatch(reviewed, /later\.js/, 'commits merged to main since the branch left it are not part of the check');
+  const [pending] = f.cliJson('pending').filter(item => item.id === session.id);
+  assert.equal(pending.target, 'refs/heads/main');
+  // Without --base, a manual check against main still compares with main's current tip: another checkpoint.
+  const manual = f.run(process.execPath, [CLI, 'check', '--remote', 'origin', '--branch', 'main', '--json']);
+  assert.equal(manual.status, 0, manual.stderr);
+  assert.notEqual(JSON.parse(manual.stdout).id, session.id);
+});
+
+test('sphinx check --browser --base main answers the range a pull request shows in the local browser questionnaire', { timeout: 60000 }, async t => {
+  const f = await baseFixture(t);
+  const check = launchBrowserCheck(t, f, ['--browser', '--base', 'main']);
+  const url = await check.page();
+  const state = await check.waitForPhase(url, 'question');
+  assert.equal(state.waitingGit, false);
+  assert.doesNotMatch(JSON.stringify(await f.calls()), /later\.js/, 'commits merged to main since are not part of the check');
+  const passed = await check.watchPhase(url, 'passed');
+  assert.ok((await check.post(url, state, 'answer', { response: 'No. The existing ID is rejected before insertion.' })).ok);
+  await passed.event;
+  assert.equal(await check.done, 0, check.output());
+  assert.match(check.output(), /Understanding check complete/);
+  assert.equal(JSON.parse(await readFile(path.join(f.env.SPHINX_HOME, 'sessions', `${state.id}.json`), 'utf8')).snapshot.target.mergeBase, true);
 });

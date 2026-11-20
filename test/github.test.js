@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, githubRepository, runStampJob, scheduleStamp, statusFor, workflowTemplate } from '../src/github.js';
+import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, checkedPullRequestBranch, githubRepository, pullRequestPush, runStampJob, scheduleStamp, statusFor, workflowTemplate } from '../src/github.js';
 import { DEFAULT_CONFIG, policyHash, validateConfig, validateRepositoryConfig } from '../src/config.js';
 
 const snapshot = { event: 'pre-push', repoRoot: '/repo', head: 'b'.repeat(40), base: 'a'.repeat(40), stats: { files: 2, additions: 10, deletions: 1 }, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/feature' } };
@@ -110,6 +110,38 @@ test('a branch without a pull request gives up quietly', async t => {
   assert.equal(await runStampJob(await job(t, { comment: true, status: false }), { gh, wait: async () => {}, prTries: 3 }), 'no-pull-request');
 });
 
+test('a pass from sphinx check stamps only the pull request from the checked branch while the commit is its latest', async t => {
+  const env = await home(t), calls = [];
+  const checked = { ...snapshot, target: { ...snapshot.target, ref: 'refs/heads/main' } };
+  assert.equal(await scheduleStamp({ snapshot: checked, session, outcome: 'passed', config: config({ comment: true, status: false }), env, spawnImpl: fakeSpawn(calls), pullRequest: 'feature' }), true);
+  const scheduled = JSON.parse(await readFile(calls[0][1][1], 'utf8'));
+  assert.deepEqual([scheduled.branch, scheduled.latest], ['feature', true]);
+  assert.equal(JSON.parse(await readFile(scheduled.branchFile, 'utf8')).ref, 'refs/heads/feature');
+  const responses = head => [[/^auth/, ok()], [/commits\//, ok('sha')], [/^api user/, ok('me\n')], [/repos\/acme\/widgets --jq/, ok('')], [/pulls\?state=open&head=acme%3Afeature/, ok(JSON.stringify([{ number: 7, head }]))], [/issues\/7\/comments --paginate/, ok('')], [/issues\/7\/comments --method POST/, ok('https://github.com/c/new\n')], [/pulls\/7 --jq/, ok(`${snapshot.head}\n`)]];
+  const moved = fakeGh(responses('c'.repeat(40)));
+  assert.equal(await runStampJob(await job(t, { comment: true, status: false, latest: true }), { gh: moved.gh, wait: async () => {} }), 'not-latest');
+  assert.ok(!moved.calls.some(call => /--method POST/.test(call.args.join(' '))), 'nothing is posted for an older commit');
+  const latest = fakeGh(responses(snapshot.head));
+  assert.equal(await runStampJob(await job(t, { comment: true, status: false, latest: true }), { gh: latest.gh, wait: async () => {} }), 'done');
+  // With the commit status on, an older commit gets no status either, with or without the comment.
+  for (const comment of [false, true]) {
+    const stale = fakeGh([[/statuses\//, ok()], ...responses('c'.repeat(40))]);
+    assert.equal(await runStampJob(await job(t, { comment, status: true, latest: true }), { gh: stale.gh, wait: async () => {} }), 'not-latest');
+    assert.ok(!stale.calls.some(call => /statuses\/|--method POST/.test(call.args.join(' '))), 'nothing is posted for an older commit');
+  }
+  const current = fakeGh([[/statuses\//, ok()], ...responses(snapshot.head)]);
+  assert.equal(await runStampJob(await job(t, { comment: false, status: true, latest: true }), { gh: current.gh, wait: async () => {} }), 'done');
+  assert.ok(current.calls.some(call => /statuses\//.test(call.args.join(' '))), 'the latest commit gets its status');
+  // The pull request moves on after the first look: the comment is not written, and the status is not updated with its link.
+  const later = fakeGh([[/statuses\//, ok()], [/pulls\/7 --jq/, ok(`${'c'.repeat(40)}\n`)], ...responses(snapshot.head)]);
+  assert.equal(await runStampJob(await job(t, { comment: true, status: false, latest: true }), { gh: later.gh, wait: async () => {} }), 'not-latest');
+  assert.ok(!later.calls.some(call => /issues\/7\/comments --method POST/.test(call.args.join(' '))), 'no comment for a commit that is no longer the latest');
+  let heads = 0;
+  const between = fakeGh([[/statuses\//, ok()], [/pulls\/7 --jq/, () => ok(`${++heads > 1 ? 'c'.repeat(40) : snapshot.head}\n`)], ...responses(snapshot.head)]);
+  assert.equal(await runStampJob(await job(t, { comment: true, status: true, latest: true }), { gh: between.gh, wait: async () => {} }), 'not-latest');
+  assert.ok(!between.calls.some(call => call.input?.target_url), 'no linked status once the pull request moved on');
+});
+
 test('github settings validate, merge from .sphinxconfig, and stay out of the policy hash', () => {
   assert.throws(() => validateConfig({ ...structuredClone(DEFAULT_CONFIG), github: { status: 'yes' } }), /github/);
   assert.throws(() => validateConfig({ ...structuredClone(DEFAULT_CONFIG), github: { extra: true } }), /github/);
@@ -159,4 +191,21 @@ test('the workflow template pins the Action to the release tag, never runs pull 
   assert.match(text, /\npermissions:\n {2}checks: write\n {2}pull-requests: read\n {2}issues: read\n(?! )/);
   assert.match(text, /\n {2}cancel-in-progress: false\n/, 'a comment must not cancel a run that has already started');
   assert.doesNotMatch(text, /checkout|\brun:/, 'it never checks out or runs pull request code');
+});
+
+test('a check against a base branch is for the checked branch pull request into that base, whatever the base is', async () => {
+  const checked = (ref, sourceRef) => ({ ...snapshot, sourceRef, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, mergeBase: true } });
+  assert.equal(await pullRequestPush(checked('refs/heads/main', 'refs/heads/feature')), true, 'the page offers the stamp although main is the default branch');
+  assert.equal(await pullRequestPush(checked('refs/heads/release', 'refs/heads/feature')), true);
+  assert.equal(await pullRequestPush(checked('refs/heads/main', 'refs/heads/main')), false, 'main against itself has no pull request');
+  assert.equal(await pullRequestPush(checked('refs/heads/main', 'HEAD')), false, 'a detached HEAD names no branch');
+  assert.equal(await pullRequestPush({ ...checked('refs/heads/main', 'refs/heads/feature'), target: { remote: 'origin', url: 'https://gitlab.com/acme/widgets.git', ref: 'refs/heads/main', mergeBase: true } }), false, 'no stamp outside GitHub');
+});
+
+test('a pass from sphinx check stamps the destination pull request, or the checked branch one against the default branch or a --base', async () => {
+  const at = (ref, sourceRef, extra = {}) => ({ ...snapshot, sourceRef, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, ...extra } });
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/feature', 'refs/heads/feature')), 'refs/heads/feature', 'a check of a push to feature');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', 'refs/heads/feature')), 'refs/heads/feature', '--branch main from feature');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/release', 'refs/heads/feature', { mergeBase: true })), 'refs/heads/feature', '--base release: the pull request from feature, not one from release');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', 'refs/heads/main', { mergeBase: true })), null);
 });

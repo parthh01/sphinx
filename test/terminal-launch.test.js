@@ -101,7 +101,7 @@ test('worker runs exact check ID/cwd in an inherited TTY and records only comple
   } });
   assert.deepEqual(result, { status: 'passed', code: 0 });
   assert.equal(captured.command, process.execPath);
-  assert.deepEqual(captured.args, [record.cliPath, 'check', '--id', ID]);
+  assert.deepEqual(captured.args, [record.cliPath, 'check', '--id', ID, '--terminal']);
   assert.equal(captured.options.cwd, f.repoRoot);
   assert.equal(captured.options.stdio, 'inherit');
   assert.equal(captured.options.env.SPHINX_HOME, f.home);
@@ -216,7 +216,7 @@ test('hook delivery privately preserves only normalized Git operation context an
   assert.doesNotMatch(await readFile(f.recordFile, 'utf8'), /next-index|GIT_|PRIVATE-GIT-HEADER/);
   for (const key of [...Object.keys(operation), 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0']) assert.equal(launcherEnv[key], undefined);
   await runCheckpointTerminal({ recordFile: f.recordFile, token: record.token, env: { ...f.env, GIT_INDEX_FILE: '/wrong/index', GIT_DIR: '/wrong/repo', GIT_WORK_TREE: '/wrong/tree', GIT_COMMON_DIR: '/wrong/common', GIT_CONFIG_VALUE_0: 'PRIVATE-AMBIENT' }, isTTY: true, spawnImpl: (_command, args, values) => {
-    captured = values.env; assert.deepEqual(args.slice(-3), ['check', '--id', ID]);
+    captured = values.env; assert.deepEqual(args.slice(-4), ['check', '--id', ID, '--terminal']);
     const child = new EventEmitter(); setImmediate(() => child.emit('exit', 0)); return child;
   } });
   for (const [key, value] of Object.entries(operation)) assert.equal(captured[key], value);
