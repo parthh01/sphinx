@@ -133,14 +133,30 @@ export async function scheduleStamp({ snapshot, session, outcome, config, env = 
 /**
  * Whether a push could be for a pull request: to a GitHub remote, on a branch
  * other than the remote's default (from local refs; main and master otherwise).
+ * A check with --base is for the checked branch's pull request into that base.
  */
 export async function pullRequestPush(snapshot) {
   if (snapshot?.event !== 'pre-push' || !githubRepository(snapshot.target?.url)) return false;
+  // sphinx check --base: the checked branch's pull request into that base, whatever the base is.
+  if (snapshot.target.mergeBase) { const source = String(snapshot.sourceRef || ''); return source.startsWith('refs/heads/') && source !== snapshot.target.ref; }
   const branch = String(snapshot.target.ref || '').replace(/^refs\/heads\//, '');
   const remote = snapshot.target.remote;
   const named = /^[\w.-]+$/.test(remote || '') ? await new Promise(resolve => execFile('git', ['symbolic-ref', '--quiet', '--short', `refs/remotes/${remote}/HEAD`], { cwd: snapshot.repoRoot }, (error, stdout) => resolve(error ? '' : stdout.trim()))) : '';
   const fallback = named ? named.slice(remote.length + 1) : null;
   return fallback ? branch !== fallback : !['main', 'master'].includes(branch);
+}
+
+/**
+ * The branch whose pull request a pass from sphinx check stamps: the destination's, or
+ * for a check against the default branch or with --base, the checked local branch's.
+ * Null when there is none.
+ */
+export async function checkedPullRequestBranch(snapshot) {
+  const source = String(snapshot?.sourceRef || '');
+  const fromSource = source.startsWith('refs/heads/') && source !== snapshot?.target?.ref ? source : null;
+  // A check with --base names the branch a pull request merges into, so the pull request is the checked branch's.
+  if (snapshot?.target?.mergeBase) return fromSource;
+  return await pullRequestPush(snapshot) ? snapshot.target.ref : fromSource;
 }
 
 /** The workflow that runs the Sphinx Action, pinned to this release's tag. */
