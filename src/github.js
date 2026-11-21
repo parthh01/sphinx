@@ -104,7 +104,7 @@ export function commentBody(records, { stampHead } = {}) {
  * Record the check and hand GitHub work to a detached worker so Git never
  * waits on the network. Never throws.
  */
-export async function scheduleStamp({ snapshot, session, outcome, config, env = process.env, spawnImpl = spawn, post }) {
+export async function scheduleStamp({ snapshot, session, outcome, config, env = process.env, spawnImpl = spawn, post, pullRequest }) {
   try {
     const settings = config.github || {};
     const repo = githubRepository(snapshot.target.url);
@@ -114,13 +114,15 @@ export async function scheduleStamp({ snapshot, session, outcome, config, env = 
     const comment = typeof post === 'boolean' ? post : action || !!settings.comment;
     const status = !!settings.status && !action;
     if (!status && !comment) return false;
-    const file = branchFile(snapshot.repoRoot, snapshot.target.ref, env);
+    // From sphinx check: only the open pull request from this branch, and only while the checked commit is its latest.
+    const ref = pullRequest ? `refs/heads/${pullRequest}` : snapshot.target.ref;
+    const file = branchFile(snapshot.repoRoot, ref, env);
     const stored = await readJson(file, null).catch(() => null);
     const record = checkRecord({ session, snapshot, outcome, includeAnswers: !!settings.answers });
     const records = [...(Array.isArray(stored?.records) ? stored.records : []).filter(item => item.head !== record.head), record].slice(-RECORDS_KEPT);
-    await writeJson(file, { version: 1, repoRoot: snapshot.repoRoot, ref: snapshot.target.ref, records });
+    await writeJson(file, { version: 1, repoRoot: snapshot.repoRoot, ref, records });
     const job = path.join(githubDirectory(env), 'jobs', `${randomUUID()}.json`);
-    await writeJson(job, { version: 1, repo, sha: snapshot.head, branch: snapshot.target.ref.replace(/^refs\/heads\//, ''), branchFile: file, status, comment });
+    await writeJson(job, { version: 1, repo, sha: snapshot.head, branch: ref.replace(/^refs\/heads\//, ''), branchFile: file, status, comment, ...(pullRequest ? { latest: true } : {}) });
     const child = spawnImpl(process.execPath, [WORKER, job], { env, detached: true, stdio: 'ignore' });
     await new Promise((resolve, reject) => { child.once('error', reject); child.once('spawn', resolve); });
     child.unref();
@@ -219,32 +221,46 @@ export async function runStampJob(job, { gh = ghCli, env = process.env, wait = s
   if (!record) return 'no-record';
   const status = statusFor(record);
   const postStatus = targetUrl => api([`repos/${owner}/${repo}/statuses/${job.sha}`, '--method', 'POST'], { state: status.state, context: STATUS_CONTEXT, description: status.description, ...(targetUrl ? { target_url: targetUrl } : {}) });
-  if (job.status) await postStatus();
-  if (!job.comment) return 'done';
-
   // A pull request is usually opened right after the first push of a branch. From a
   // fork it lives in the upstream repository, with this fork's owner in its head.
-  const parent = (await api([`repos/${owner}/${repo}`, '--jq', '.parent.full_name // ""'])).stdout?.trim();
-  const places = [`${owner}/${repo}`, ...(parent ? [parent] : [])];
   let pull = null, where = null;
-  for (let attempt = 0; attempt < prTries && !pull; attempt++) {
-    if (attempt) await wait(prEveryMs);
-    for (const place of places) {
-      const listed = await api([`repos/${place}/pulls?state=open&head=${encodeURIComponent(`${owner}:${job.branch}`)}&per_page=1`, '--jq', '[.[] | {number}]']);
-      try { pull = listed.ok ? JSON.parse(listed.stdout || '[]')[0] || null : null; } catch { pull = null; }
-      if (pull) { where = place; break; }
+  const findPull = async () => {
+    const parent = (await api([`repos/${owner}/${repo}`, '--jq', '.parent.full_name // ""'])).stdout?.trim();
+    const places = [`${owner}/${repo}`, ...(parent ? [parent] : [])];
+    for (let attempt = 0; attempt < prTries && !pull; attempt++) {
+      if (attempt) await wait(prEveryMs);
+      for (const place of places) {
+        const listed = await api([`repos/${place}/pulls?state=open&head=${encodeURIComponent(`${owner}:${job.branch}`)}&per_page=1`, '--jq', '[.[] | {number, head: .head.sha}]']);
+        try { pull = listed.ok ? JSON.parse(listed.stdout || '[]')[0] || null : null; } catch { pull = null; }
+        if (pull) { where = place; break; }
+      }
     }
+  };
+  // A latest-only job (from sphinx check) posts nothing, status included, unless the commit is the pull request's head.
+  if (job.latest) {
+    await findPull();
+    if (!pull) return 'no-pull-request';
+    if (pull.head !== job.sha) return 'not-latest';
   }
+  // The pull request can move on while the requests below run, so a latest-only job asks again right before each later write.
+  const moved = async () => job.latest && (await api([`repos/${where}/pulls/${pull.number}`, '--jq', '.head.sha'])).stdout?.trim() !== job.sha;
+  if (job.status) await postStatus();
+  if (!job.comment) return 'done';
+  if (!job.latest) await findPull();
   if (!pull) return 'no-pull-request';
   const body = commentBody((await readJson(job.branchFile, null).catch(() => null))?.records || records, { stampHead: job.sha });
   // Only ever edit this person's own Sphinx comment; others on the PR keep theirs.
   const me = (await api(['user', '--jq', '.login'])).stdout?.trim();
   const existing = await api([`repos/${where}/issues/${pull.number}/comments`, '--paginate', '--jq', `.[] | select((.body | startswith("${COMMENT_MARKER}")) and .user.login == ${JSON.stringify(me || '')}) | .id`]);
   const id = existing.ok ? existing.stdout.split('\n').find(Boolean) : null;
+  if (await moved()) return 'not-latest';
   const written = id
     ? await api([`repos/${where}/issues/comments/${id}`, '--method', 'PATCH', '--jq', '.html_url'], { body })
     : await api([`repos/${where}/issues/${pull.number}/comments`, '--method', 'POST', '--jq', '.html_url'], { body });
-  if (written.ok && job.status) await postStatus(written.stdout.trim());
+  if (written.ok && job.status) {
+    if (await moved()) return 'not-latest';
+    await postStatus(written.stdout.trim());
+  }
   return written.ok ? 'done' : 'comment-failed';
 }
 

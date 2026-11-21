@@ -371,7 +371,8 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       await refreshScore(request.repoRoot, operationEnv).catch(() => {});
       let visible = store.public(session);
       publish({ ...publicFields(visible), repoRoot: request.repoRoot, phase: 'working', message: 'Preparing your understanding check…' });
-      await ensureServer(operationEnv);
+      // No page can be served (loopback binding failed): the caller asks another way.
+      try { await ensureServer(operationEnv); } catch { return { status: 'unavailable', reason: 'server', id: request.id }; }
       const notes = [];
       const recoveryUI = { warning: text => notes.push(text), note: text => notes.push(text), command: () => {} };
       const plans = await findPlans(operationEnv).catch(() => []);
@@ -380,7 +381,7 @@ export function createBrowserInterview({ env = process.env, signal, timeoutMs = 
       distance = { current: session.config?.distance ?? config.distance, next: null, scope: repoSets ? 'repository' : 'machine' };
       const target = session.snapshot.target || {}, branch = name => String(name || '').replace(/^refs\/heads\//, '');
       const source = branch(session.snapshot.sourceRef), destination = branch(target.ref);
-      resumeCommand = !waitingGit ? `sphinx check --id ${request.id}`
+      resumeCommand = !waitingGit ? `sphinx check --id ${request.id} --browser`
         : session.snapshot.event === 'pre-commit' ? 'git commit'
         : target.remote && destination ? `git push ${target.remote} ${source && source !== destination ? `${source}:${destination}` : destination}` : 'git push';
       stamp = null;

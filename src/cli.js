@@ -27,6 +27,10 @@ import { REVIEWER_PRESETS, presetOptions } from './model-presets.js';
 import { modelUsageText, modelLimitText, readUsage, summarizeUsage, printUsage, usageDir } from './usage.js';
 import { toggleYolo, yoloStatus, recentOverrides, recordOverride } from './overrides.js';
 import { runTerminalCheck } from './terminal-check.js';
+import { prefersTerminal } from './git-interview.js';
+import { createBrowserInterview } from './browser-interview.js';
+import { pullRequestPush, scheduleStamp } from './github.js';
+import { randomUUID } from 'node:crypto';
 
 const CLI_PATH = fileURLToPath(new URL('../bin/sphinx.js', import.meta.url));
 const POLICY_FLAGS = ['branches', 'events', 'level', 'distance', 'remotes'];
@@ -34,7 +38,7 @@ const MODEL_FLAGS = ['preset', 'provider', 'model', 'small', 'medium', 'large', 
 const OPTIONS = {
   install: ['yes', 'repo', 'agents', ...MODEL_FLAGS, 'launch', 'no-launch', ...POLICY_FLAGS],
   activate: ['agents', 'json'],
-  init: ['yes', 'json', 'context', 'suggest', 'apply', 'github-check', ...POLICY_FLAGS], check: ['json', 'id', 'remote', 'branch', 'staged', 'retry-review'],
+  init: ['yes', 'json', 'context', 'suggest', 'apply', 'github-check', ...POLICY_FLAGS], check: ['json', 'id', 'remote', 'branch', 'staged', 'retry-review', 'browser', 'terminal'],
   prepare: ['json', 'worker', 'retry'],
   answer: ['json', 'text'], explain: ['json'], dispute: ['json', 'text'], pending: ['json'],
   status: ['json'], config: ['json', 'distance', 'interface', ...MODEL_FLAGS], doctor: ['json'], auth: ['provider', 'base-url'], uninstall: ['repo'],
@@ -418,6 +422,7 @@ function printSession(session, terminal = ui()) {
 
 async function checkCommand(values) {
   if (values['retry-review'] && !values.id) throw new Error('--retry-review requires --id to select the failed checkpoint. Find it with sphinx pending.');
+  if (values.browser && values.terminal) throw new Error('Choose one of --browser and --terminal.');
   const { repo, config } = await repoConfig(); let session;
   if (values.id) session = await store.read(values.id);
   else if (!values.staged && !values.remote && !values.branch) {
@@ -438,10 +443,18 @@ async function checkCommand(values) {
   const controller = new AbortController(), { signal } = controller;
   // More checks may follow in the same push; only the last one asks whether to continue.
   const waitingGit = process.env.SPHINX_WAITING_GIT === '1', more = waitingGit && process.env.SPHINX_MORE_CHECKS === '1';
-  return withReadline(async ask => {
+  // A check started by hand follows interface like the Git hook. A waiting Git operation keeps its own terminal.
+  // --retry-review authorizes one more attempt, whichever interface ends up asking.
+  let retried = false;
+  if (!waitingGit && (values.browser || (!values.terminal && !prefersTerminal(config)))) {
+    if (values['retry-review']) { await store.retryReview(session.id, config); retried = true; }
+    const code = await browserCheck(session, config);
+    if (code !== null) return code;
+  }
+  const code = await withReadline(async ask => {
     const terminal = ui();
     if (values['retry-review']) {
-      await store.retryReview(session.id, config, { signal });
+      if (!retried) await store.retryReview(session.id, config, { signal });
       signal.throwIfAborted();
       terminal.note(config.maxModelCalls === null
         ? 'Resuming the review with no model-call limit. Previous usage remains counted.'
@@ -459,6 +472,36 @@ async function checkCommand(values) {
       },
     });
   }, { controller });
+  if (!waitingGit) await stampCheck(session.id, config);
+  return code;
+}
+
+// The local browser questionnaire, with no Git operation waiting. Null when it is unavailable here (CI), so the terminal asks instead.
+async function browserCheck(session, config) {
+  const controller = new AbortController(), interrupt = () => controller.abort();
+  const interview = createBrowserInterview({ signal: controller.signal });
+  process.once('SIGINT', interrupt);
+  let result;
+  try {
+    result = await interview.present({ request: { version: 1, token: randomUUID(), id: session.id, repoRoot: session.snapshot.repoRoot, createdAt: Date.now() } });
+  } finally { process.off('SIGINT', interrupt); await interview.close(); }
+  if (result.status === 'unavailable') return null;
+  const terminal = ui();
+  if (result.status !== 'passed') { terminal.note('Paused. Progress is saved. To continue:'); terminal.command(`sphinx check --id ${session.id} --browser`); return 1; }
+  terminal.success('Understanding check complete.');
+  await stampCheck(session.id, config, interview.stampChoice(session.id));
+  return 0;
+}
+
+// A pass from sphinx check stamps the pull request whose latest commit it checked:
+// its destination's, or for a check against the default branch, the checked local branch's.
+async function stampCheck(id, config, post) {
+  const session = await store.read(id).catch(() => null);
+  if (session?.status !== 'passed' || session.held) return;
+  const { snapshot } = session, source = String(snapshot.sourceRef || '');
+  const branch = await pullRequestPush(snapshot).catch(() => false) ? snapshot.target.ref
+    : source.startsWith('refs/heads/') && source !== snapshot.target.ref ? source : null;
+  if (branch) await scheduleStamp({ snapshot, session, outcome: 'passed', config, post, pullRequest: branch.slice('refs/heads/'.length) });
 }
 
 function printPending(terminal, pending) {
@@ -512,7 +555,7 @@ export function parseCommandLine(argv) {
     preset: { type: 'string' }, provider: { type: 'string' }, model: { type: 'string' }, small: { type: 'string' }, medium: { type: 'string' }, large: { type: 'string' }, 'context-model': { type: 'string' }, level: { type: 'string' }, distance: { type: 'string' }, interface: { type: 'string' }, branches: { type: 'string' }, events: { type: 'string' }, agents: { type: 'string' }, remotes: { type: 'string' },
     remote: { type: 'string' }, branch: { type: 'string' }, id: { type: 'string' }, text: { type: 'string' }, 'allow-paid': { type: 'boolean' },
     context: { type: 'string' }, 'github-check': { type: 'boolean' }, suggest: { type: 'boolean' }, apply: { type: 'string' }, worker: { type: 'boolean' }, retry: { type: 'boolean' }, reason: { type: 'string' }, 'base-url': { type: 'string' }, 'cli-billing': { type: 'string' },
-    launch: { type: 'boolean' }, 'no-launch': { type: 'boolean' }, 'retry-review': { type: 'boolean' }, 'max-model-calls': { type: 'string' }, 'max-output-tokens': { type: 'string' },
+    launch: { type: 'boolean' }, 'no-launch': { type: 'boolean' }, 'retry-review': { type: 'boolean' }, browser: { type: 'boolean' }, terminal: { type: 'boolean' }, 'max-model-calls': { type: 'string' }, 'max-output-tokens': { type: 'string' },
   } });
   const [command, id] = positionals;
   if (values.version || values.help || !command || command === 'help') return { values, command, id };

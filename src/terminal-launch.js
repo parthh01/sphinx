@@ -286,7 +286,7 @@ export async function runCheckpointTerminal({ recordFile, token, env = process.e
   let childWrite = Promise.resolve();
   const code = await new Promise(resolve => {
     let child;
-    try { child = spawnImpl(process.execPath, [record.cliPath, 'check', '--id', id], { cwd: record.repoRoot, env: { ...withoutGitContext(env), ...providerEnv, SPHINX_HOME: home, ...(record.waitingGit ? { SPHINX_WAITING_GIT: '1', ...(record.more ? { SPHINX_MORE_CHECKS: '1' } : {}) } : {}) }, stdio: 'inherit' }); }
+    try { child = spawnImpl(process.execPath, [record.cliPath, 'check', '--id', id, '--terminal'], { cwd: record.repoRoot, env: { ...withoutGitContext(env), ...providerEnv, SPHINX_HOME: home, ...(record.waitingGit ? { SPHINX_WAITING_GIT: '1', ...(record.more ? { SPHINX_MORE_CHECKS: '1' } : {}) } : {}) }, stdio: 'inherit' }); }
     catch { resolve(1); return; }
     child.once('error', () => resolve(1));
     child.once('exit', code => resolve(code ?? 1));
