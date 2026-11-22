@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, writeFile, rm, utimes, readdir } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DEFAULT_CONFIG, getPaths, writeJson, readJson } from '../src/config.js';
-import { curateContext, curateQuietly, briefFor, dropContext, contextFile } from '../src/working-context.js';
+import { curateContext, curateQuietly, briefFor, dropContext, contextFile, contextRoute } from '../src/working-context.js';
 import { collectGarbage, storageUsage } from '../src/storage.js';
 
 async function repo(t) {
@@ -106,4 +106,17 @@ test('cleanup removes expired, skipped, abandoned, and stale data, keeps recent 
   assert.equal(await readJson(big, null), null, 'The size cap removes the oldest removable data');
   assert.deepEqual(await readJson(path.join(home, 'config.json'), null), { keep: true }, 'Settings are never removed');
   assert.ok(await storageUsage(r.env) > 0);
+});
+
+test('a dedicated context route carries curation while the small route keeps reviewing small changes', async t => {
+  const r = await repo(t);
+  const prompts = [];
+  const call = async ({ config }) => { prompts.push(config); return { overview: 'Adds a flag.', items: [] }; };
+  r.config.models.context = { provider: 'claude', model: 'haiku' };
+  const head = await r.commit({ 'flag.js': 'export const flag = true;\n' }, 'add flag');
+  assert.equal((await curateContext({ repoRoot: r.root, sourceRef: SOURCE, base: r.base, head, config: r.config, env: r.env, call })).status, 'updated');
+  assert.deepEqual([prompts[0].provider, prompts[0].model], ['claude', 'haiku'], 'The curator uses models.context');
+  assert.equal(prompts[0].changeTier, 'small', 'Curation keeps the light small-change settings');
+  assert.equal((await readJson(contextFile(r.root, SOURCE, r.env))).model, 'claude:haiku', 'The saved context names the model that wrote it');
+  assert.deepEqual(contextRoute({ models: { small: { provider: 'codex', model: 'gpt-6-luna' } } }), { provider: 'codex', model: 'gpt-6-luna' }, 'Without models.context the small route curates');
 });

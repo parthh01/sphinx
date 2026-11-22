@@ -113,9 +113,10 @@ async function manifestFor(env) {
 async function repoInfo(cwd, env) {
   const root = await git(['rev-parse', '--show-toplevel'], cwd, env);
   const commonDir = await git(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd, env);
-  const worktreeValue = await git(['config', '--worktree', '--get', 'core.hooksPath'], cwd, env, [0, 1]);
-  const worktreeEnabled = await git(['config', '--get', 'extensions.worktreeConfig'], cwd, env, [0, 1]);
-  const scope = worktreeEnabled === 'true' && worktreeValue ? '--worktree' : '--local';
+  // Git refuses --worktree in a repository with linked worktrees unless the extension is on, so ask only then.
+  const worktreeEnabled = await git(['config', '--bool', '--get', 'extensions.worktreeConfig'], cwd, env, [0, 1]);
+  const worktreeValue = worktreeEnabled === 'true' ? await git(['config', '--worktree', '--get', 'core.hooksPath'], cwd, env, [0, 1]) : '';
+  const scope = worktreeValue ? '--worktree' : '--local';
   const identity = scope === '--worktree' ? root : commonDir;
   return { root, commonDir, scope, id: `repo-${hash(identity).slice(0, 20)}` };
 }

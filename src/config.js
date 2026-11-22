@@ -97,14 +97,15 @@ export function validateConfig(config) {
     if (!Number.isInteger(config[key]) || config[key] < min || config[key] > max) fail(`${key} must be an integer between ${min} and ${max}`);
   }
   if (!config.models || typeof config.models !== 'object') fail('models must define small, medium, and large routes');
-  for (const tier of ['small','medium','large']) {
+  // context is optional: the working-context curator's own route, else the small route.
+  for (const tier of ['small','medium','large', ...(Object.hasOwn(config.models, 'context') ? ['context'] : [])]) {
     const route = config.models[tier];
     if (!route || !PROVIDERS.includes(route.provider)) fail(`models.${tier}.provider is invalid`);
     if (route.provider === 'openai' && !route.model) fail(`models.${tier} needs a model ID from your endpoint, for example openai:gpt-5-mini`);
     if (route.model !== null && (typeof route.model !== 'string' || !route.model.trim())) fail(`models.${tier}.model must be a string or null`);
     if (Object.keys(route).some(k => !['provider','model'].includes(k))) fail(`unexpected field in models.${tier}`);
   }
-  if (Object.keys(config.models).some(k => !['small','medium','large'].includes(k))) fail('unknown model tier');
+  if (Object.keys(config.models).some(k => !['small','medium','large','context'].includes(k))) fail('unknown model route; use small, medium, large, or context');
   if (!config.github || typeof config.github !== 'object' || Array.isArray(config.github)) fail('github must be an object');
   for (const key of Object.keys(config.github)) if (!Object.hasOwn(DEFAULT_CONFIG.github, key) || typeof config.github[key] !== 'boolean') fail(`github.${key} must be one of status, comment, answers set to true or false`);
   if (!config.routing || typeof config.routing !== 'object') fail('routing is required');

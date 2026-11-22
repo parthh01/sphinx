@@ -338,6 +338,115 @@ test('interactive CLI stays open after review failure until the human pauses or 
   assert.equal(record.callLimit, undefined, 'ordinary interactive retries never extend the allowance');
 });
 
+// sphinx check opens the browser questionnaire with no Git operation waiting. SSH_TTY keeps a real browser from opening.
+function launchBrowserCheck(t, f, args, env = {}) {
+  const script = `Object.defineProperty(process.stdin,'isTTY',{value:true});
+    const {main}=await import(${JSON.stringify(new URL('../src/cli.js', import.meta.url).href)});
+    try { process.exitCode=await main(${JSON.stringify(['check', ...args])}); }
+    catch(error) { console.error(error.message); process.exitCode=error.exitCode||1; }`;
+  const childEnv = { ...f.env, TERM: 'dumb', NO_COLOR: '1', SSH_TTY: '/dev/null', ...env };
+  delete childEnv.CI;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { cwd: f.repo, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', data => { output += data; });
+  child.stderr.on('data', data => { output += data; });
+  const done = new Promise(resolve => child.once('close', code => resolve(code)));
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  const page = async () => {
+    const deadline = Date.now() + 8000;
+    while (!/Sphinx questionnaire: (\S+)/.test(output) && child.exitCode === null && Date.now() < deadline) await delay(20);
+    const url = output.match(/Sphinx questionnaire: (\S+)/)?.[1];
+    assert.ok(url, `No questionnaire URL:\n${output}`);
+    return url;
+  };
+  const waitForPhase = async (url, phase) => {
+    let state;
+    for (let i = 0; i < 400; i++) { state = await (await fetch(`${url}/state`)).json(); if (state.phase === phase) return state; await delay(20); }
+    assert.fail(`Phase ${state?.phase}, expected ${phase}:\n${output}`);
+  };
+  // The CLI closes the page soon after a pass or pause, so a final phase is read from the event stream opened before the action.
+  const watchPhase = async (url, phase) => {
+    const reader = (await fetch(`${url}/events`)).body.pipeThrough(new TextDecoderStream()).getReader();
+    // Wrapped, so awaiting the subscription does not also wait for the phase.
+    return { event: (async () => {
+      let buffer = '';
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) assert.fail(`Events ended before ${phase}:\n${output}`);
+          buffer += value;
+          const lines = buffer.split('\n'); buffer = lines.pop();
+          for (const line of lines) if (line.startsWith('data: ') && JSON.parse(line.slice(6)).phase === phase) return JSON.parse(line.slice(6));
+        }
+      } finally { reader.cancel().catch(() => {}); }
+    })() };
+  };
+  const post = (url, state, action, extra = {}) => fetch(`${url}/action`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: new URL(url).origin, 'X-Sphinx-Token': new URL(url).pathname.slice(1) },
+    body: JSON.stringify({ id: state.id, revision: state.revision, action, ...(action === 'answer' ? { questionId: state.question.id } : {}), ...extra }) });
+  return { done, page, waitForPhase, watchPhase, post, output: () => output };
+}
+
+test('sphinx check --browser answers a pending checkpoint in the local browser questionnaire', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  assert.notEqual(f.run('git', ['push', 'origin', 'main']).status, 0);
+  const id = f.cliJson('pending')[0].id;
+  const check = launchBrowserCheck(t, f, ['--browser']);
+  const url = await check.page();
+  const state = await check.waitForPhase(url, 'question');
+  assert.equal(state.id, id);
+  assert.equal(state.waitingGit, false, 'no Git operation waits on this page');
+  const passed = await check.watchPhase(url, 'passed');
+  assert.ok((await check.post(url, state, 'answer', { response: 'No. The existing ID is rejected before insertion.' })).ok);
+  assert.equal((await passed.event).id, id);
+  assert.equal(await check.done, 0);
+  assert.match(check.output(), /Understanding check complete/);
+  assert.doesNotMatch(check.output(), /continue \/ stop|› /, 'the terminal questionnaire never ran');
+  assert.equal(JSON.parse(await readFile(path.join(f.env.SPHINX_HOME, 'sessions', `${id}.json`), 'utf8')).status, 'passed');
+});
+
+test('sphinx check follows interface browser, and a paused page resumes in the browser', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  f.cli('config', '--interface', 'browser');
+  assert.notEqual(f.run('git', ['push', 'origin', 'main']).status, 0);
+  const id = f.cliJson('pending')[0].id;
+  const check = launchBrowserCheck(t, f, []);
+  const url = await check.page();
+  const state = await check.waitForPhase(url, 'question');
+  const paused = await check.watchPhase(url, 'paused');
+  assert.ok((await check.post(url, state, 'pause')).ok);
+  assert.equal((await paused.event).resume, `sphinx check --id ${id} --browser`);
+  assert.equal(await check.done, 1);
+  assert.match(check.output(), new RegExp(`sphinx check --id\\s+${id} --browser`));
+  assert.equal(f.cliJson('pending')[0].id, id, 'progress stays pending');
+  const both = f.run(process.execPath, [CLI, 'check', '--browser', '--terminal']);
+  assert.notEqual(both.status, 0);
+  assert.match(both.stderr + both.stdout, /one of --browser and --terminal/);
+});
+
+test('sphinx check --retry-review authorizes one retry when the browser is unavailable and the terminal asks instead', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none');
+  f.cli('config', '--max-model-calls', '20');
+  f.cli('config', '--interface', 'browser');
+  assert.notEqual(f.run('git', ['push', 'origin', 'main']).status, 0);
+  assert.equal(f.run(process.execPath, [CLI, 'check', '--json'], { env: { ...f.env, SPHINX_TEST_FAILURE: '1' } }).status, 1);
+  const before = f.cliJson('pending')[0];
+  // CI keeps the browser page from starting, so the terminal asks; its stdin is empty, so it is cancelled there.
+  const script = `Object.defineProperty(process.stdin,'isTTY',{value:true});
+    const {main}=await import(${JSON.stringify(new URL('../src/cli.js', import.meta.url).href)});
+    try { process.exitCode=await main(${JSON.stringify(['check', '--id', before.id, '--retry-review'])}); }
+    catch(error) { console.error(error.message); process.exitCode=error.exitCode||1; }`;
+  const retried = f.run(process.execPath, ['--input-type=module', '-e', script], { env: { ...f.env, TERM: 'dumb', NO_COLOR: '1' } });
+  assert.doesNotMatch(retried.stderr + retried.stdout, /Only a failed review/);
+  assert.match(retried.stdout, /Starting a new review attempt with up to 20 additional model calls/);
+  const after = f.cliJson('pending')[0];
+  assert.equal(after.usage.limit, before.usage.calls + before.usage.limit, 'the allowance is extended once');
+  assert.equal(after.reviewAttempts, 2, 'the failed attempt and one retry');
+  assert.equal(after.preparation.status, 'pending');
+});
+
 test('CLI pre-commit gate assesses staged content without waiting for terminal input', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.cli('install', '--yes', '--provider', 'claude', '--agents', 'none', '--events', 'pre-commit');

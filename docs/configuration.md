@@ -208,7 +208,7 @@ If both `.sphinxconfig` and legacy `.sphinx.json` exist, `.sphinxconfig` wins an
 
 **Manual push checks.** `sphinx check --remote origin --branch main` selects the destination; otherwise Sphinx uses the upstream. Multiple destination refs are assessed separately. Tag-only pushes and deletions do not trigger checks in v0.1.
 
-**Pull request branches.** Set `"branches": ["*"]` to check pushes to every branch. The first push of a new branch is checked from where it left the remote's default branch (the same range the pull request shows), using local remote-tracking refs; later pushes check only the new commits.
+**Pull request branches.** Set `"branches": ["*"]` to check pushes to every branch. The first push of a new branch is checked from where it left the remote's default branch (the same range the pull request shows), using local remote-tracking refs; later pushes check only the new commits. A force push after rebasing the branch onto work already on the remote (`git pull --rebase`, `git rebase origin/main`) is checked the same way as a first push, from where the branch now leaves the remote's checked branches, so the commits the rebase brought in don't count as the branch's change. This holds when the branch it went onto has moved on again since, and for a local branch pushed under another name when the remote branch is its upstream. Other rewrites are checked against the tip they overwrite: an amend, a rewind, or a push that replaces another branch (`feature:main`).
 
 ## Project context
 
@@ -265,6 +265,19 @@ After commits, merges, rewrites, and checkouts, Sphinx schedules a detached revi
 - Preparation expects the push that `git push` makes, or that `git push -u <remote> HEAD` makes where `git push` needs a destination: the branch of the same name on the push remote, unless `remote.<name>.push` maps it elsewhere or `push.default` is `upstream`. A first push is prepared from where the branch left the remote, as the push check computes it.
 - A push to another destination, or to a remote that changed since your last fetch, needs a fresh review at push time. Pre-commit checks always review on demand. Run `git fetch` if remote history is missing.
 
+### Working context
+
+Before each background review, one short call updates the branch's working context: an overview and a few notes on where the unpushed work lives and what to check. The push-time reviewer starts from it instead of exploring the repository, verifies it against the code, and never cites it as evidence. Only the diff the curator has not seen yet is sent, and ignored files are never read. The context is removed once the push goes through.
+
+The call runs on the small route by default. To give it a cheaper model without changing how small changes are checked, set a dedicated route; `small` returns to the default:
+
+```sh
+sphinx config --context-model claude:haiku
+sphinx config --context-model small
+```
+
+Presets and `--provider` leave this route unchanged. Set `workingContext: false` in `config.json` to turn the call off. Its usage appears under `context` in `sphinx usage`.
+
 ## GitHub commit status and pull requests
 
 When you push to GitHub and a check passes, Sphinx marks the pushed commit with a `sphinx/understanding` commit status, for example "Sphinx stamped · 3 questions, 2 first try". It shows next to the commit and in the pull request's checks. A skipped check is marked as a failure ("Understanding check skipped"). Yolo pushes and commit checkpoints are not marked.
@@ -293,7 +306,7 @@ sphinx init --github-check     # writes .github/workflows/sphinx.yml; commit and
 
 How it fits together:
 
-- **On the contributor's machine:** after a pass, Sphinx comments on the branch's pull request with a summary and an encoded stamp for that exact commit. For a pull request from a fork, the comment goes on the upstream pull request. The questionnaire shows "Post the Sphinx stamp to the pull request" for pushes that look like a pull request (a GitHub remote, not its default branch). It is on by default when the repository has the Sphinx workflow, and otherwise follows `github.comment`.
+- **On the contributor's machine:** after a pass, Sphinx comments on the branch's pull request with a summary and an encoded stamp for that exact commit. For a pull request from a fork, the comment goes on the upstream pull request. The questionnaire shows "Post the Sphinx stamp to the pull request" for pushes that look like a pull request (a GitHub remote, not its default branch). It is on by default when the repository has the Sphinx workflow, and otherwise follows `github.comment`. A pass from `sphinx check` stamps too: the pull request from the checked destination, or for a check against the default branch (`--branch main`), the one from your checked local branch, and only while the checked commit is that pull request's latest.
 - **In the repository:** the Action runs when a pull request is opened or updated and when a comment is posted or edited. It reads the newest stamp for the pull request's latest commit, from the author or someone with write access, and writes the **Sphinx** check: stamped, with the number of questions, first-try results, depth, distance, and reviewer; failed if the check was skipped; or neutral ("No Sphinx stamp for this commit") until the author passes. With `require: true` in the workflow, a missing stamp fails the check instead.
 - **Safety:** the workflow uses `pull_request_target` and `issue_comment` so it can write checks for fork pull requests, and it never checks out or runs pull request code. It reads comments through the API only. It needs `checks: write` and read access to pull requests and issues.
 - When a repository runs the Action, Sphinx skips the separate commit status, since the check replaces it.
@@ -304,7 +317,7 @@ The workflow pins the Action to a Sphinx release tag (`parthh01/sphinx/action@v0
 
 ## Browser or terminal
 
-`interface` in `config.json` chooses where a push's questions appear. Set it with `sphinx config --interface <auto|browser|terminal>`.
+`interface` in `config.json` chooses where a push's questions appear, and where `sphinx check` asks. Set it with `sphinx config --interface <auto|browser|terminal>`. `sphinx check --browser` or `--terminal` overrides it for one run; with no Git operation waiting, the page ends on the pass, and a paused page names `sphinx check --id <id> --browser` to reopen it.
 
 | Value | Behavior |
 | --- | --- |

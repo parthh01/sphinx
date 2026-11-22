@@ -52,9 +52,12 @@ code { font-family: var(--mono), ui-monospace, Menlo, monospace; font-size: .86e
 .top { display: flex; justify-content: space-between; align-items: center; padding: 28px 0; }
 .wordmark { display: inline-flex; align-items: center; gap: 10px; font: 400 26px/1 var(--serif); text-decoration: none; letter-spacing: -.01em; }
 .wordmark .logo { color: var(--accent); }
-.top nav { display: flex; gap: 24px; font-size: 15px; color: var(--muted); }
+.top nav { display: flex; align-items: center; gap: 24px; font-size: 15px; color: var(--muted); }
 .top nav a { text-decoration: none; }
 .top nav a:hover { color: var(--ink); }
+.badges { display: inline-flex; gap: 6px; align-items: center; }
+.badges img { display: block; }
+@media (max-width: 520px) { .top nav { min-width: 0; flex-wrap: wrap; justify-content: flex-end; gap: 8px 20px; } }
 
 /* Hero */
 .hero { padding: 72px 0 64px; }

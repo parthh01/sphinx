@@ -9,7 +9,7 @@ import { loadIgnorePolicy } from './ignore.js';
 
 // A brief, continuously curated orientation for the push-time reviewer: what
 // the unpushed work on a branch does, where it lives, and what to watch. After
-// each commit one call on the user's small-change model updates it from the new diff, adding,
+// each commit one call on the user's working-context route (models.context, else the small-change route) updates it from the new diff, adding,
 // editing, or removing items, so the reviewer can get up to speed without
 // spending its own calls exploring. It is a hint, never evidence: every file
 // it mentions is pinned to the blob the curator saw, and items about files
@@ -27,6 +27,9 @@ async function git(root, args, env, optional = false) {
     return stdout;
   } catch (error) { if (optional) return null; throw error; }
 }
+
+/** The curator's route: models.context when set, otherwise the small-change route. */
+export const contextRoute = config => config.models?.context ?? config.models?.small ?? null;
 
 export const contextsDirectory = (env = process.env) => path.join(getPaths(env).home, 'context');
 export const contextFile = (repoRoot, sourceRef, env = process.env) => path.join(contextsDirectory(env), `${digest(`${repoRoot}\0${sourceRef}`)}.json`);
@@ -55,14 +58,14 @@ async function blobs(root, rev, files, env) {
 const isAncestor = async (root, ancestor, rev, env) => ancestor && (await git(root, ['merge-base', '--is-ancestor', ancestor, rev], env, true)) !== null;
 
 /**
- * Bring the branch's working context up to date with head in one free-model
- * call. Only the diff the curator has not seen is sent (base..head after a
- * rewrite). Ignored paths are never read. Requires an OpenRouter key.
+ * Bring the branch's working context up to date with head in one call on the
+ * working-context route (models.context, else the small-change route). Only
+ * the diff the curator has not seen is sent (base..head after a rewrite).
+ * Ignored paths are never read. Unavailable when neither route is configured.
  */
 export async function curateContext({ repoRoot, sourceRef, base, head, config, env = process.env, call }) {
-  if (config.workingContext === false || !config.models?.small?.provider) return { status: 'unavailable' };
-  // The cheapest model the user already chose: their small-change route.
-  const route = config.models.small;
+  const route = contextRoute(config);
+  if (config.workingContext === false || !route?.provider) return { status: 'unavailable' };
   const file = contextFile(repoRoot, sourceRef, env);
   const previous = await readJson(file, null).catch(() => null);
   if (previous?.curatedThrough === head) return { status: 'current' };
@@ -129,7 +132,7 @@ export async function directorySize(directory) {
 }
 
 
-/** Curate on the small-change route, waiting once on a rate limit; never throws. */
+/** Curate on the working-context route, waiting once on a rate limit; never throws. */
 export async function curateQuietly({ wait, ...options }) {
   const run = options.call ?? (async args => (await import('./evaluator.js')).createEvaluator({ env: args.env }).runModel(args));
   const call = args => withUsagePurpose('context', () => run(args));

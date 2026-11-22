@@ -191,7 +191,7 @@ test('Git asks inline on its own terminal, else opens a window', async () => {
     let spawned;
     const result = await runGitTerminalCheck({ request: { id: 'abc' }, env: { A: '1' }, openTty: () => 99, spawnImpl: (...args) => { spawned = args; return fakeChild(code); }, openWindow: () => assert.fail('no window when a terminal is visible') });
     assert.equal(result.status, status);
-    assert.deepEqual(spawned[1].slice(1), ['check', '--id', 'abc']);
+    assert.deepEqual(spawned[1].slice(1), ['check', '--id', 'abc', '--terminal']);
     assert.deepEqual(spawned[2].stdio, [99, 99, 99]);
     assert.equal(spawned[2].env.SPHINX_WAITING_GIT, '1');
     assert.equal(spawned[2].env.SPHINX_MORE_CHECKS, undefined);
