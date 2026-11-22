@@ -435,7 +435,7 @@ async function checkCommand(values) {
   }
   if (session && session.snapshot.repoRoot !== repo.root) throw new Error('This checkpoint belongs to a different repository.');
   if (!session) {
-    const snapshot = values.staged ? await git.commitSnapshot({ cwd: repo.root, config }) : await git.manualSnapshot({ cwd: repo.root, config, remote: values.remote, branch: values.branch, base: values.base });
+    const snapshot = values.staged ? await git.commitSnapshot({ cwd: repo.root, config }) : await git.manualSnapshot({ cwd: repo.root, config, remote: values.remote, branch: values.branch, base: values.base, notice: message => process.stderr.write(`${message}\n`) });
     if (!snapshot) { if (values.json) json({ status: 'not-required' }); else ui().success('No assessment required by the current policy.'); return 0; }
     session = await store.ensure(snapshot, config);
   }

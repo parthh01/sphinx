@@ -603,7 +603,9 @@ test('a check against a base branch never stands in for a push, even when the ra
   await command(cwd, 'push', 'origin', 'main');
   await command(cwd, 'switch', '-c', 'feature');
   await commit(cwd, { 'feature.txt': 'feature\n' });
-  const checked = await manualSnapshot({ cwd, config: defaults, base: 'main' });
+  const notices = [];
+  const checked = await manualSnapshot({ cwd, config: defaults, base: 'main', notice: message => notices.push(message) });
+  assert.deepEqual(notices, [], 'a full clone has nothing to fetch, so nothing to announce');
   const pushed = await manualSnapshot({ cwd, config: defaults, branch: 'main' });
   assert.equal(checked.base, forked); assert.equal(pushed.base, forked);
   assert.notEqual(checked.id, pushed.id);
@@ -617,8 +619,10 @@ test('a check against a base branch in a shallow clone fetches the history it ne
     t.after(() => rm(cwd, { recursive: true, force: true }));
     await command(cwd, 'clone', '-q', '--depth', '1', ...args, `file://${f.remote}`, '.');
     assert.equal(await command(cwd, 'rev-parse', '--is-shallow-repository'), 'true');
-    const snapshot = await manualSnapshot({ cwd, config: defaults, base: 'main' });
+    const notices = [];
+    const snapshot = await manualSnapshot({ cwd, config: defaults, base: 'main', notice: message => notices.push(message) });
     assert.equal(snapshot.base, f.forked, `clone ${args.join(' ')}`);
+    assert.deepEqual(notices, ['This clone is shallow; fetching the history of origin/main to find where the branch left it…'], 'says why it pauses before fetching');
     assert.deepEqual(snapshot.files, ['feature.txt']);
   }
 });

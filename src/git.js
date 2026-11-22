@@ -316,7 +316,7 @@ async function pushSnapshot({ repo, remote, remoteUrl, ref, base, head, sourceRe
 // reached it since as changes this branch undoes. Plain Git, so it works with any
 // host. The target says so, so this check never stands in for a push, which is
 // assessed against its own range.
-async function mergeBaseSnapshot({ repo, localRef, remote, branch, config, env }) {
+async function mergeBaseSnapshot({ repo, localRef, remote, branch, config, env, notice = () => {} }) {
   const root = repo.root;
   const ref = branch.startsWith('refs/') ? branch : `refs/heads/${branch}`;
   if (!ref.startsWith('refs/heads/') || await git(root, ['check-ref-format', ref], { allowFailure: true }) === null) throw new Error(`Invalid base branch: ${branch}`);
@@ -337,7 +337,9 @@ async function mergeBaseSnapshot({ repo, localRef, remote, branch, config, env }
   let base = await mergeBase();
   // A shallow clone (as CI makes) can stop short of where the branch left its base,
   // so no merge base shows. Fetch the rest of the history once and look again.
+  // That fetch can take a while on a large repository, so say what the pause is first.
   if (!base && (await git(root, ['rev-parse', '--is-shallow-repository'])).trim() === 'true') {
+    notice(`This clone is shallow; fetching the history of ${remote}/${name} to find where the branch left it…`);
     if (await git(root, ['fetch', '--quiet', '--no-tags', '--unshallow', '--', remote, ref], { timeout: 300000, allowFailure: true }) === null) {
       throw new Error(`This clone is shallow, and Sphinx could not fetch the history it needs to find where the branch left ${remote}/${name}. Run git fetch --unshallow ${remote}, then retry.`);
     }
@@ -364,7 +366,7 @@ export async function commitSnapshot({ cwd = process.cwd(), config, env = proces
 }
 
 export async function manualSnapshot(options) {
-  const { cwd = process.cwd(), config, branch, base, env = process.env } = options;
+  const { cwd = process.cwd(), config, branch, base, env = process.env, notice } = options;
   const repo = await repository(cwd);
   const localRef = (await git(repo.root, ['symbolic-ref', '--quiet', 'HEAD'], { allowFailure: true }))?.trim();
   const upstream = localRef
@@ -372,7 +374,7 @@ export async function manualSnapshot(options) {
     : [];
   if (base) {
     if (!config.enabled || !config.events.includes('pre-push')) return null;
-    return mergeBaseSnapshot({ repo, localRef, remote: options.remote || upstream[0] || 'origin', branch: base, config, env });
+    return mergeBaseSnapshot({ repo, localRef, remote: options.remote || upstream[0] || 'origin', branch: base, config, env, notice });
   }
   const remote = options.remote || upstream[0] || 'origin';
   const destination = branch || (upstream[0] === remote && upstream[1]) || localRef;
