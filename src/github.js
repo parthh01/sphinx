@@ -104,11 +104,15 @@ export function commentBody(records, { stampHead } = {}) {
  * Record the check and hand GitHub work to a detached worker so Git never
  * waits on the network. Never throws.
  */
-export async function scheduleStamp({ snapshot, session, outcome, config, env = process.env, spawnImpl = spawn, post, pullRequest }) {
+export async function scheduleStamp({ snapshot, session, outcome, config, env = process.env, spawnImpl = spawn, post, pullRequest, headUrl }) {
   try {
     const settings = config.github || {};
-    const repo = githubRepository(snapshot.target.url);
-    if (snapshot.event !== 'pre-push' || !repo) return false;
+    const target = githubRepository(snapshot.target.url);
+    if (snapshot.event !== 'pre-push' || !target) return false;
+    // A branch from a fork checked against upstream (--base main --remote upstream): its pull
+    // request is the fork's, so the job starts from the fork, which leads to upstream as for a push.
+    const fork = pullRequest ? githubRepository(headUrl) : null;
+    const repo = fork?.host === target.host ? fork : target;
     // With the Sphinx Action, its check run replaces the commit status and reads the comment.
     const action = await usesSphinxAction(snapshot.repoRoot);
     const comment = typeof post === 'boolean' ? post : action || !!settings.comment;

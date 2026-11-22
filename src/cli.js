@@ -505,7 +505,10 @@ async function stampCheck(id, config, post) {
   if (session?.status !== 'passed' || session.held) return;
   const { snapshot } = session;
   const branch = await checkedPullRequestBranch(snapshot).catch(() => null);
-  if (branch) await scheduleStamp({ snapshot, session, outcome: 'passed', config, post, pullRequest: branch.slice('refs/heads/'.length) });
+  if (!branch) return;
+  // A --base check may name another remote than the one the branch is pushed to (a fork's upstream).
+  const headUrl = snapshot.target?.mergeBase ? await git.branchPushUrl(snapshot.repoRoot, branch).catch(() => null) : null;
+  await scheduleStamp({ snapshot, session, outcome: 'passed', config, post, pullRequest: branch.slice('refs/heads/'.length), headUrl });
 }
 
 function printPending(terminal, pending) {

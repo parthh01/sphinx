@@ -63,6 +63,22 @@ test('stamping is skipped for other hosts, commits, and when turned off, and nev
   assert.deepEqual({ ...job, branchFile: undefined }, { version: 1, repo: { host: 'github.com', owner: 'acme', repo: 'widgets' }, sha: snapshot.head, branch: 'feature', branchFile: undefined, status: true, comment: false });
 });
 
+test('a --base check against upstream from a fork starts the stamp job from the fork the branch is pushed to', async t => {
+  const env = await home(t), calls = [];
+  const checked = { ...snapshot, sourceRef: 'refs/heads/feature', target: { remote: 'upstream', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/main', mergeBase: true } };
+  const repoOf = async headUrl => {
+    calls.length = 0;
+    assert.equal(await scheduleStamp({ snapshot: checked, session, outcome: 'passed', config: config({}), env, spawnImpl: fakeSpawn(calls), pullRequest: 'feature', headUrl }), true);
+    return JSON.parse(await readFile(calls[0][1][1], 'utf8')).repo;
+  };
+  assert.deepEqual(await repoOf('https://github.com/me/widgets.git'), { host: 'github.com', owner: 'me', repo: 'widgets' });
+  assert.deepEqual(await repoOf(null), { host: 'github.com', owner: 'acme', repo: 'widgets' }, 'no push remote: the checked remote, as before');
+  assert.deepEqual(await repoOf('git@gitlab.com:me/widgets.git'), { host: 'github.com', owner: 'acme', repo: 'widgets' }, 'a push remote on another host is not where the pull request is');
+  calls.length = 0;
+  await scheduleStamp({ snapshot, session, outcome: 'passed', config: config({}), env, spawnImpl: fakeSpawn(calls), headUrl: 'https://github.com/me/widgets.git' });
+  assert.equal(JSON.parse(await readFile(calls[0][1][1], 'utf8')).repo.owner, 'acme', 'a push stamps the repository it went to');
+});
+
 function fakeGh(responses) {
   const calls = [];
   const gh = async (args, options) => {
@@ -172,6 +188,16 @@ test('from a fork, the stamp goes to the upstream pull request', async t => {
     [/upstream\/widgets\/issues\/9\/comments --paginate/, ok('')], [/upstream\/widgets\/issues\/9\/comments --method POST/, ok('https://github.com/c/9\n')]]);
   assert.equal(await runStampJob(await job(t, { comment: true, status: false }), { gh, wait: async () => {} }), 'done');
   assert.ok(calls.some(call => /upstream\/widgets\/issues\/9\/comments --method POST/.test(call.args.join(' '))));
+});
+
+test('a pass from sphinx check on a fork branch stamps the upstream pull request while the commit is its head', async t => {
+  const head = JSON.stringify([{ number: 9, head: snapshot.head }]);
+  const { gh, calls } = fakeGh([[/^auth/, ok()], [/repos\/me\/widgets\/commits\//, ok('sha')], [/^api user/, ok('me\n')], [/repos\/me\/widgets --jq/, ok('acme/widgets\n')],
+    [/repos\/me\/widgets\/pulls\?/, ok('[]')], [/repos\/acme\/widgets\/pulls\?state=open&head=me%3Afeature/, ok(head)], [/acme\/widgets\/pulls\/9 --jq/, ok(`${snapshot.head}\n`)],
+    [/acme\/widgets\/issues\/9\/comments --paginate/, ok('')], [/acme\/widgets\/issues\/9\/comments --method POST/, ok('https://github.com/c/9\n')]]);
+  const forked = await job(t, { repo: { host: 'github.com', owner: 'me', repo: 'widgets' }, comment: true, status: false, latest: true });
+  assert.equal(await runStampJob(forked, { gh, wait: async () => {} }), 'done');
+  assert.ok(calls.some(call => /acme\/widgets\/issues\/9\/comments --method POST/.test(call.args.join(' '))));
 });
 
 test('a repository running the Sphinx Action gets the comment instead of a commit status', async t => {
