@@ -352,8 +352,10 @@ async function mergeBaseSnapshot({ repo, localRef, remote, branch, config, env, 
   // the pause is first.
   if ((await git(root, ['rev-parse', '--is-shallow-repository'])).trim() === 'true' && (!base || await cutAbove(root, base, [tip, head]))) {
     notice(`This clone is shallow; fetching the history of ${remote}/${name} to find where the branch left it…`);
-    if (await git(root, ['fetch', '--quiet', '--no-tags', '--unshallow', '--', remote, ref], { timeout: 300000, allowFailure: true }) === null) {
-      throw new Error(`This clone is shallow, and Sphinx could not fetch the history it needs to find where the branch left ${remote}/${name}. Run git fetch --unshallow ${remote}, then retry.`);
+    // A timeout kills Git rather than failing it, so it throws instead of returning null.
+    const fetched = await git(root, ['fetch', '--quiet', '--no-tags', '--unshallow', '--', remote, ref], { timeout: 300000, allowFailure: true }).catch(() => null);
+    if (fetched === null) {
+      throw new Error(`This clone is shallow, and Sphinx could not fetch the history it needs to find where the branch left ${remote}/${name}: the fetch failed or took more than 5 minutes. Run git fetch --unshallow ${remote} yourself, which has no time limit, then retry.`);
     }
     base = await mergeBase();
   }

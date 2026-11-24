@@ -627,6 +627,20 @@ test('a check against a base branch in a shallow clone fetches the history it ne
   }
 });
 
+test('a check against a base branch in a shallow clone says what to run when the history cannot be fetched', async t => {
+  const f = await baseFixture(t);
+  const cwd = await mkdtemp(join(tmpdir(), 'sphinx-base-shallow-'));
+  const broken = await mkdtemp(join(tmpdir(), 'sphinx-base-broken-'));
+  t.after(() => Promise.all([rm(cwd, { recursive: true, force: true }), rm(broken, { recursive: true, force: true })]));
+  await command(cwd, 'clone', '-q', '--depth', '1', '--no-single-branch', '--branch', 'feature', `file://${f.remote}`, '.');
+  // The same branches with no objects behind them: listing them works, fetching history does not.
+  await command(broken, 'init', '--bare', '-q', '-b', 'main');
+  await writeFile(join(broken, 'packed-refs'), await command(f.remote, 'for-each-ref', '--format=%(objectname) %(refname)') + '\n');
+  await command(cwd, 'remote', 'set-url', 'origin', `file://${broken}`);
+  await assert.rejects(manualSnapshot({ cwd, config: defaults, base: 'main' }),
+    /could not fetch the history it needs to find where the branch left origin\/main: the fetch failed or took more than 5 minutes\. Run git fetch --unshallow origin yourself, which has no time limit, then retry\./);
+});
+
 test('a check against a base branch in a shallow clone does not stop at an older ancestor that a merged branch reaches', async t => {
   // main A → B → T; feature leaves at B (F0, F1) and merges a side branch that left at A.
   const cwd = await fixture(t);
