@@ -627,6 +627,36 @@ test('a check against a base branch in a shallow clone fetches the history it ne
   }
 });
 
+test('a check against a base branch in a shallow clone does not stop at an older ancestor that a merged branch reaches', async t => {
+  // main A → B → T; feature leaves at B (F0, F1) and merges a side branch that left at A.
+  const cwd = await fixture(t);
+  const remote = await mkdtemp(join(tmpdir(), 'sphinx-base-remote-'));
+  t.after(() => rm(remote, { recursive: true, force: true }));
+  await command(remote, 'init', '--bare', '-b', 'main');
+  await command(cwd, 'remote', 'add', 'origin', remote);
+  await commit(cwd, { 'a.txt': 'a\n' });
+  await command(cwd, 'switch', '-c', 'side');
+  await commit(cwd, { 'side.txt': 'side\n' });
+  await command(cwd, 'switch', 'main');
+  const forked = await commit(cwd, { 'b.txt': 'b\n' });
+  await command(cwd, 'switch', '-c', 'feature');
+  await commit(cwd, { 'f0.txt': 'f0\n' });
+  await commit(cwd, { 'f1.txt': 'f1\n' });
+  await command(cwd, 'merge', '-q', '--no-edit', 'side');
+  await command(cwd, 'switch', 'main');
+  await commit(cwd, { 't.txt': 't\n' });
+  await command(cwd, 'push', 'origin', 'main', 'feature');
+  // Three deep from the merge, the clone stops at F0 (whose parent is B) and at A, so A alone looks shared.
+  const clone = await mkdtemp(join(tmpdir(), 'sphinx-base-shallow-'));
+  t.after(() => rm(clone, { recursive: true, force: true }));
+  await command(clone, 'clone', '-q', '--depth', '3', '--branch', 'feature', `file://${remote}`, '.');
+  const notices = [];
+  const snapshot = await manualSnapshot({ cwd: clone, config: defaults, base: 'main', notice: message => notices.push(message) });
+  assert.equal(snapshot.base, forked, 'where the branch left main, not the side branch fork point');
+  assert.deepEqual(snapshot.files, ['f0.txt', 'f1.txt', 'side.txt']);
+  assert.equal(notices.length, 1);
+});
+
 test('a check against a base branch follows the branch policy, uses the remote it is given, and says what is missing', async t => {
   const f = await baseFixture(t);
   await command(f.cwd, 'push', 'origin', `${f.forked}:refs/heads/release`);
@@ -637,6 +667,7 @@ test('a check against a base branch follows the branch policy, uses the remote i
   const check = changes => manualSnapshot({ cwd: f.cwd, config: { ...defaults, branches: ['*'] }, ...changes });
   await assert.rejects(check({ base: 'gone' }), /The base branch gone is not on origin\./);
   await assert.rejects(check({ base: 'main', remote: 'missing' }), /--base needs a configured remote; missing is not one/);
+  assert.equal(await manualSnapshot({ cwd: f.cwd, config: defaults, base: 'release', remote: 'missing' }), null, 'a branch the policy leaves out needs no remote');
   await assert.rejects(check({ base: 'refs/tags/v1' }), /Invalid base branch: refs\/tags\/v1/);
 
   // A branch from a fork: it tracks the fork, and the base lives on the upstream remote.

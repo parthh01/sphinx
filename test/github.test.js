@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { COMMENT_MARKER, STATUS_CONTEXT, checkRecord, commentBody, checkedPullRequestBranch, githubRepository, pullRequestPush, runStampJob, scheduleStamp, statusFor, workflowTemplate } from '../src/github.js';
 import { DEFAULT_CONFIG, policyHash, validateConfig, validateRepositoryConfig } from '../src/config.js';
 
+const exec = promisify(execFile);
 const snapshot = { event: 'pre-push', repoRoot: '/repo', head: 'b'.repeat(40), base: 'a'.repeat(40), stats: { files: 2, additions: 10, deletions: 1 }, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/feature' } };
 const question = (id, prompt) => ({ id, prompt, choices: [], expectedAnswer: 'PRIVATE_KEY_TEXT', rationale: 'PRIVATE_RATIONALE', acceptance: { prediction: 'PRIVATE_PREDICTION', causalReason: 'x' } });
 const session = {
@@ -202,10 +205,44 @@ test('a check against a base branch is for the checked branch pull request into 
   assert.equal(await pullRequestPush({ ...checked('refs/heads/main', 'refs/heads/feature'), target: { remote: 'origin', url: 'https://gitlab.com/acme/widgets.git', ref: 'refs/heads/main', mergeBase: true } }), false, 'no stamp outside GitHub');
 });
 
-test('a pass from sphinx check stamps the destination pull request, or the checked branch one against the default branch or a --base', async () => {
-  const at = (ref, sourceRef, extra = {}) => ({ ...snapshot, sourceRef, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, ...extra } });
+// A real repository whose origin is acme/widgets with main as its default branch, so
+// nothing depends on a checkout that happens to exist on the machine.
+async function widgetsRepository(t) {
+  const root = await mkdtemp(join(tmpdir(), 'sphinx-github-repo-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const git = (...args) => exec('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'user.name=Sphinx test', '-c', 'user.email=sphinx@example.invalid', ...args], {
+    cwd: root, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+  });
+  await git('init', '-q', '-b', 'main');
+  await git('commit', '-q', '--allow-empty', '-m', 'start');
+  await git('remote', 'add', 'origin', 'git@github.com:acme/widgets.git');
+  await git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+  await git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+  return { root, git };
+}
+
+test('a pass from sphinx check stamps the destination pull request, or the checked branch one against the default branch or a --base', async t => {
+  const { root } = await widgetsRepository(t);
+  const at = (ref, sourceRef, extra = {}) => ({ ...snapshot, repoRoot: root, sourceRef, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, ...extra } });
   assert.equal(await checkedPullRequestBranch(at('refs/heads/feature', 'refs/heads/feature')), 'refs/heads/feature', 'a check of a push to feature');
   assert.equal(await checkedPullRequestBranch(at('refs/heads/main', 'refs/heads/feature')), 'refs/heads/feature', '--branch main from feature');
   assert.equal(await checkedPullRequestBranch(at('refs/heads/release', 'refs/heads/feature', { mergeBase: true })), 'refs/heads/feature', '--base release: the pull request from feature, not one from release');
   assert.equal(await checkedPullRequestBranch(at('refs/heads/main', 'refs/heads/main', { mergeBase: true })), null);
+});
+
+test('a pass from sphinx check stamps the pull request by the name the checked branch has on GitHub', async t => {
+  const { root, git } = await widgetsRepository(t);
+  await git('branch', 'local-feature');
+  await git('update-ref', 'refs/remotes/origin/feature', 'HEAD');
+  await git('branch', '--set-upstream-to=origin/feature', 'local-feature');
+  const at = (ref, extra = {}) => ({ ...snapshot, repoRoot: root, sourceRef: 'refs/heads/local-feature', target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, ...extra } });
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', { mergeBase: true })), 'refs/heads/feature', '--base main: local-feature tracks origin/feature');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/main')), 'refs/heads/feature', '--branch main from local-feature');
+  // Tracking a branch in another repository (a fork) says nothing of its name in this one.
+  await git('remote', 'add', 'fork', 'git@github.com:someone/widgets.git');
+  await git('update-ref', 'refs/remotes/fork/feature', 'HEAD');
+  await git('branch', '--set-upstream-to=fork/feature', 'local-feature');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', { mergeBase: true })), 'refs/heads/local-feature');
+  await git('branch', '--unset-upstream', 'local-feature');
+  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', { mergeBase: true })), 'refs/heads/local-feature', 'no upstream: its own name');
 });

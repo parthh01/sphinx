@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { policyHash } from './config.js';
@@ -316,13 +316,23 @@ async function pushSnapshot({ repo, remote, remoteUrl, ref, base, head, sourceRe
 // reached it since as changes this branch undoes. Plain Git, so it works with any
 // host. The target says so, so this check never stands in for a push, which is
 // assessed against its own range.
+// Whether a shallow clone cuts the history between base and any of tips: a shallow
+// boundary there hides commits, so a merge base found below it may not be the real one.
+async function cutAbove(root, base, tips) {
+  const file = path.resolve(root, (await git(root, ['rev-parse', '--git-path', 'shallow'])).trim());
+  const boundaries = new Set((await readFile(file, 'utf8').catch(() => '')).split('\n').filter(Boolean));
+  if (!boundaries.size) return false;
+  const above = (await git(root, ['rev-list', ...tips, '--not', base])).split('\n');
+  return above.some(commit => boundaries.has(commit));
+}
+
 async function mergeBaseSnapshot({ repo, localRef, remote, branch, config, env, notice = () => {} }) {
   const root = repo.root;
   const ref = branch.startsWith('refs/') ? branch : `refs/heads/${branch}`;
   if (!ref.startsWith('refs/heads/') || await git(root, ['check-ref-format', ref], { allowFailure: true }) === null) throw new Error(`Invalid base branch: ${branch}`);
   const name = ref.slice('refs/heads/'.length);
-  if (!(await git(root, ['remote'])).split('\n').includes(remote)) throw new Error(`--base needs a configured remote; ${remote} is not one. Choose it with --remote.`);
   if (!triggered(config, 'pre-push', name, remote)) return null;
+  if (!(await git(root, ['remote'])).split('\n').includes(remote)) throw new Error(`--base needs a configured remote; ${remote} is not one. Choose it with --remote.`);
   const remoteUrl = (await git(root, ['remote', 'get-url', '--push', remote])).trim();
   const listing = await git(root, ['ls-remote', '--refs', '--', remote, ref]);
   const tip = listing.split('\n').map(line => line.split('\t')).find(parts => parts[1] === ref)?.[0];
@@ -335,10 +345,12 @@ async function mergeBaseSnapshot({ repo, localRef, remote, branch, config, env, 
   await ensureCommit(root, tip, remote, true);
   const mergeBase = async () => (await git(root, ['merge-base', tip, head], { allowFailure: true }))?.trim();
   let base = await mergeBase();
-  // A shallow clone (as CI makes) can stop short of where the branch left its base,
-  // so no merge base shows. Fetch the rest of the history once and look again.
-  // That fetch can take a while on a large repository, so say what the pause is first.
-  if (!base && (await git(root, ['rev-parse', '--is-shallow-repository'])).trim() === 'true') {
+  // A shallow clone (as CI makes) can stop short of where the branch left its base:
+  // no merge base shows, or a cut-off history (a merged side branch reaching further
+  // back) shows an older common ancestor instead. Fetch the rest of the history once
+  // and look again. That fetch can take a while on a large repository, so say what
+  // the pause is first.
+  if ((await git(root, ['rev-parse', '--is-shallow-repository'])).trim() === 'true' && (!base || await cutAbove(root, base, [tip, head]))) {
     notice(`This clone is shallow; fetching the history of ${remote}/${name} to find where the branch left it…`);
     if (await git(root, ['fetch', '--quiet', '--no-tags', '--unshallow', '--', remote, ref], { timeout: 300000, allowFailure: true }) === null) {
       throw new Error(`This clone is shallow, and Sphinx could not fetch the history it needs to find where the branch left ${remote}/${name}. Run git fetch --unshallow ${remote}, then retry.`);

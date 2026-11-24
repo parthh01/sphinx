@@ -146,6 +146,18 @@ export async function pullRequestPush(snapshot) {
   return fallback ? branch !== fallback : !['main', 'master'].includes(branch);
 }
 
+// The name a local branch has in the pull request's repository: the branch it tracks
+// when that is on the same GitHub repository (Git lets the two names differ), else its own.
+async function remoteBranch(snapshot, ref) {
+  const run = args => new Promise(resolve => execFile('git', args, { cwd: snapshot.repoRoot }, (error, stdout) => resolve(error ? '' : stdout.trim())));
+  const [remote, remoteRef] = (await run(['for-each-ref', '--format=%(upstream:remotename)%00%(upstream:remoteref)', ref])).split('\0');
+  if (!remote || !remoteRef?.startsWith('refs/heads/')) return ref;
+  const tracked = githubRepository(await run(['remote', 'get-url', '--push', remote]));
+  const target = githubRepository(snapshot.target?.url);
+  const same = tracked && target && [tracked.host, tracked.owner, tracked.repo].join('/').toLowerCase() === [target.host, target.owner, target.repo].join('/').toLowerCase();
+  return same ? remoteRef : ref;
+}
+
 /**
  * The branch whose pull request a pass from sphinx check stamps: the destination's, or
  * for a check against the default branch or with --base, the checked local branch's.
@@ -153,7 +165,7 @@ export async function pullRequestPush(snapshot) {
  */
 export async function checkedPullRequestBranch(snapshot) {
   const source = String(snapshot?.sourceRef || '');
-  const fromSource = source.startsWith('refs/heads/') && source !== snapshot?.target?.ref ? source : null;
+  const fromSource = source.startsWith('refs/heads/') && source !== snapshot?.target?.ref ? await remoteBranch(snapshot, source) : null;
   // A check with --base names the branch a pull request merges into, so the pull request is the checked branch's.
   if (snapshot?.target?.mergeBase) return fromSource;
   return await pullRequestPush(snapshot) ? snapshot.target.ref : fromSource;
