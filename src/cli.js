@@ -29,7 +29,7 @@ import { toggleYolo, yoloStatus, recentOverrides, recordOverride } from './overr
 import { runTerminalCheck } from './terminal-check.js';
 import { prefersTerminal } from './git-interview.js';
 import { createBrowserInterview } from './browser-interview.js';
-import { pullRequestPush, scheduleStamp } from './github.js';
+import { checkedPullRequestBranch, scheduleStamp } from './github.js';
 import { randomUUID } from 'node:crypto';
 
 const CLI_PATH = fileURLToPath(new URL('../bin/sphinx.js', import.meta.url));
@@ -38,7 +38,7 @@ const MODEL_FLAGS = ['preset', 'provider', 'model', 'small', 'medium', 'large', 
 const OPTIONS = {
   install: ['yes', 'repo', 'agents', ...MODEL_FLAGS, 'launch', 'no-launch', ...POLICY_FLAGS],
   activate: ['agents', 'json'],
-  init: ['yes', 'json', 'context', 'suggest', 'apply', 'github-check', ...POLICY_FLAGS], check: ['json', 'id', 'remote', 'branch', 'staged', 'retry-review', 'browser', 'terminal'],
+  init: ['yes', 'json', 'context', 'suggest', 'apply', 'github-check', ...POLICY_FLAGS], check: ['json', 'id', 'remote', 'branch', 'base', 'staged', 'retry-review', 'browser', 'terminal'],
   prepare: ['json', 'worker', 'retry'],
   answer: ['json', 'text'], explain: ['json'], dispute: ['json', 'text'], pending: ['json'],
   status: ['json'], config: ['json', 'distance', 'interface', ...MODEL_FLAGS], doctor: ['json'], auth: ['provider', 'base-url'], uninstall: ['repo'],
@@ -423,14 +423,19 @@ function printSession(session, terminal = ui()) {
 async function checkCommand(values) {
   if (values['retry-review'] && !values.id) throw new Error('--retry-review requires --id to select the failed checkpoint. Find it with sphinx pending.');
   if (values.browser && values.terminal) throw new Error('Choose one of --browser and --terminal.');
+  // --base names both the destination and where the change starts, so nothing else may select them.
+  if (values.base !== undefined) {
+    if (!values.base) throw new Error('--base needs the branch the change will merge into, for example --base main.');
+    for (const flag of ['branch', 'staged', 'id']) if (values[flag]) throw new Error(`--base cannot be combined with --${flag}.`);
+  }
   const { repo, config } = await repoConfig(); let session;
   if (values.id) session = await store.read(values.id);
-  else if (!values.staged && !values.remote && !values.branch) {
+  else if (!values.staged && !values.remote && !values.branch && values.base === undefined) {
     for (const candidate of await store.pending(repo.root)) if (await git.revalidateSnapshot(candidate.snapshot, config)) { session = candidate; break; }
   }
   if (session && session.snapshot.repoRoot !== repo.root) throw new Error('This checkpoint belongs to a different repository.');
   if (!session) {
-    const snapshot = values.staged ? await git.commitSnapshot({ cwd: repo.root, config }) : await git.manualSnapshot({ cwd: repo.root, config, remote: values.remote, branch: values.branch });
+    const snapshot = values.staged ? await git.commitSnapshot({ cwd: repo.root, config }) : await git.manualSnapshot({ cwd: repo.root, config, remote: values.remote, branch: values.branch, base: values.base, notice: message => process.stderr.write(`${message}\n`) });
     if (!snapshot) { if (values.json) json({ status: 'not-required' }); else ui().success('No assessment required by the current policy.'); return 0; }
     session = await store.ensure(snapshot, config);
   }
@@ -498,9 +503,8 @@ async function browserCheck(session, config) {
 async function stampCheck(id, config, post) {
   const session = await store.read(id).catch(() => null);
   if (session?.status !== 'passed' || session.held) return;
-  const { snapshot } = session, source = String(snapshot.sourceRef || '');
-  const branch = await pullRequestPush(snapshot).catch(() => false) ? snapshot.target.ref
-    : source.startsWith('refs/heads/') && source !== snapshot.target.ref ? source : null;
+  const { snapshot } = session;
+  const branch = await checkedPullRequestBranch(snapshot).catch(() => null);
   if (branch) await scheduleStamp({ snapshot, session, outcome: 'passed', config, post, pullRequest: branch.slice('refs/heads/'.length) });
 }
 
@@ -553,7 +557,7 @@ export function parseCommandLine(argv) {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
     help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' }, json: { type: 'boolean' }, yes: { type: 'boolean' }, repo: { type: 'boolean' }, staged: { type: 'boolean' },
     preset: { type: 'string' }, provider: { type: 'string' }, model: { type: 'string' }, small: { type: 'string' }, medium: { type: 'string' }, large: { type: 'string' }, 'context-model': { type: 'string' }, level: { type: 'string' }, distance: { type: 'string' }, interface: { type: 'string' }, branches: { type: 'string' }, events: { type: 'string' }, agents: { type: 'string' }, remotes: { type: 'string' },
-    remote: { type: 'string' }, branch: { type: 'string' }, id: { type: 'string' }, text: { type: 'string' }, 'allow-paid': { type: 'boolean' },
+    remote: { type: 'string' }, branch: { type: 'string' }, base: { type: 'string' }, id: { type: 'string' }, text: { type: 'string' }, 'allow-paid': { type: 'boolean' },
     context: { type: 'string' }, 'github-check': { type: 'boolean' }, suggest: { type: 'boolean' }, apply: { type: 'string' }, worker: { type: 'boolean' }, retry: { type: 'boolean' }, reason: { type: 'string' }, 'base-url': { type: 'string' }, 'cli-billing': { type: 'string' },
     launch: { type: 'boolean' }, 'no-launch': { type: 'boolean' }, 'retry-review': { type: 'boolean' }, browser: { type: 'boolean' }, terminal: { type: 'boolean' }, 'max-model-calls': { type: 'string' }, 'max-output-tokens': { type: 'string' },
   } });

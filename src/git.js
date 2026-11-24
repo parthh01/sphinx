@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { policyHash } from './config.js';
@@ -296,12 +296,72 @@ export async function pushSnapshots({ cwd = process.cwd(), remote, remoteUrl, in
     const sourceRef = await pushSource(repo.root, localRef);
     const rebased = !ZERO.test(old) && await rebasedOntoPushedWork(repo.root, remote, config, sourceRef, ref, old, head);
     const base = ZERO.test(old) || rebased ? await branchPoint(repo.root, remote, head, config) : old;
-    if (base) await ensureCommit(repo.root, base, remote, true);
-    const tree = (await git(repo.root, ['rev-parse', `${head}^{tree}`])).trim();
-    const snapshot = await buildSnapshot({ repo, event: 'pre-push', target: { remote, url: remoteUrl || '', ref }, base, head, tree, sourceRef, config, env });
+    const snapshot = await pushSnapshot({ repo, remote, remoteUrl, ref, base, head, sourceRef, config, env });
     if (snapshot) snapshots.push(snapshot);
   }
   return snapshots;
+}
+
+// One push checkpoint once its base is chosen. head must already be available locally.
+async function pushSnapshot({ repo, remote, remoteUrl, ref, base, head, sourceRef, config, env, mergeBase = false }) {
+  if (base) await ensureCommit(repo.root, base, remote, true);
+  const tree = (await git(repo.root, ['rev-parse', `${head}^{tree}`])).trim();
+  const target = { remote, url: remoteUrl || '', ref, ...(mergeBase ? { mergeBase: true } : {}) };
+  return buildSnapshot({ repo, event: 'pre-push', target, base, head, tree, sourceRef, config, env });
+}
+
+// A branch checked against the branch it will merge into (sphinx check --base), the
+// range its pull request or merge request shows: HEAD from where it left that branch
+// (their merge base). The branch's current tip would also count the commits that
+// reached it since as changes this branch undoes. Plain Git, so it works with any
+// host. The target says so, so this check never stands in for a push, which is
+// assessed against its own range.
+// Whether a shallow clone cuts the history between base and any of tips: a shallow
+// boundary there hides commits, so a merge base found below it may not be the real one.
+async function cutAbove(root, base, tips) {
+  const file = path.resolve(root, (await git(root, ['rev-parse', '--git-path', 'shallow'])).trim());
+  const boundaries = new Set((await readFile(file, 'utf8').catch(() => '')).split('\n').filter(Boolean));
+  if (!boundaries.size) return false;
+  const above = (await git(root, ['rev-list', ...tips, '--not', base])).split('\n');
+  return above.some(commit => boundaries.has(commit));
+}
+
+async function mergeBaseSnapshot({ repo, localRef, remote, branch, config, env, notice = () => {} }) {
+  const root = repo.root;
+  const ref = branch.startsWith('refs/') ? branch : `refs/heads/${branch}`;
+  if (!ref.startsWith('refs/heads/') || await git(root, ['check-ref-format', ref], { allowFailure: true }) === null) throw new Error(`Invalid base branch: ${branch}`);
+  const name = ref.slice('refs/heads/'.length);
+  if (!triggered(config, 'pre-push', name, remote)) return null;
+  if (!(await git(root, ['remote'])).split('\n').includes(remote)) throw new Error(`--base needs a configured remote; ${remote} is not one. Choose it with --remote.`);
+  const remoteUrl = (await git(root, ['remote', 'get-url', '--push', remote])).trim();
+  const listing = await git(root, ['ls-remote', '--refs', '--', remote, ref]);
+  const tip = listing.split('\n').map(line => line.split('\t')).find(parts => parts[1] === ref)?.[0];
+  if (!tip || !OID.test(tip)) throw new Error(`The base branch ${name} is not on ${remote}.`);
+  const head = (await git(root, ['rev-parse', '--verify', 'HEAD'])).trim();
+  // The merge base needs the base branch's history; fetch it when this clone is behind.
+  if (await git(root, ['cat-file', '-e', `${tip}^{commit}`], { allowFailure: true }) === null) {
+    await git(root, ['fetch', '--quiet', '--no-tags', '--', remote, ref], { timeout: 300000 });
+  }
+  await ensureCommit(root, tip, remote, true);
+  const mergeBase = async () => (await git(root, ['merge-base', tip, head], { allowFailure: true }))?.trim();
+  let base = await mergeBase();
+  // A shallow clone (as CI makes) can stop short of where the branch left its base:
+  // no merge base shows, or a cut-off history (a merged side branch reaching further
+  // back) shows an older common ancestor instead. Fetch the rest of the history once
+  // and look again. That fetch can take a while on a large repository, so say what
+  // the pause is first.
+  if ((await git(root, ['rev-parse', '--is-shallow-repository'])).trim() === 'true' && (!base || await cutAbove(root, base, [tip, head]))) {
+    notice(`This clone is shallow; fetching the history of ${remote}/${name} to find where the branch left it…`);
+    // A timeout kills Git rather than failing it, so it throws instead of returning null.
+    const fetched = await git(root, ['fetch', '--quiet', '--no-tags', '--unshallow', '--', remote, ref], { timeout: 300000, allowFailure: true }).catch(() => null);
+    if (fetched === null) {
+      throw new Error(`This clone is shallow, and Sphinx could not fetch the history it needs to find where the branch left ${remote}/${name}: the fetch failed or took more than 5 minutes. Run git fetch --unshallow ${remote} yourself, which has no time limit, then retry.`);
+    }
+    base = await mergeBase();
+  }
+  if (!base) throw new Error(`HEAD shares no history with ${remote}/${name}.`);
+  const sourceRef = await pushSource(root, localRef || 'HEAD');
+  return pushSnapshot({ repo, remote, remoteUrl, ref, base, head, sourceRef, config, env, mergeBase: true });
 }
 
 export async function commitSnapshot({ cwd = process.cwd(), config, env = process.env }) {
@@ -320,12 +380,16 @@ export async function commitSnapshot({ cwd = process.cwd(), config, env = proces
 }
 
 export async function manualSnapshot(options) {
-  const { cwd = process.cwd(), config, branch, env = process.env } = options;
+  const { cwd = process.cwd(), config, branch, base, env = process.env, notice } = options;
   const repo = await repository(cwd);
   const localRef = (await git(repo.root, ['symbolic-ref', '--quiet', 'HEAD'], { allowFailure: true }))?.trim();
   const upstream = localRef
     ? (await git(repo.root, ['for-each-ref', '--format=%(upstream:remotename)%00%(upstream:remoteref)', localRef])).trim().split('\0')
     : [];
+  if (base) {
+    if (!config.enabled || !config.events.includes('pre-push')) return null;
+    return mergeBaseSnapshot({ repo, localRef, remote: options.remote || upstream[0] || 'origin', branch: base, config, env, notice });
+  }
   const remote = options.remote || upstream[0] || 'origin';
   const destination = branch || (upstream[0] === remote && upstream[1]) || localRef;
   if (!destination) throw new Error('No destination branch is known. Supply --branch when assessing detached HEAD.');
