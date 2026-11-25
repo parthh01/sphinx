@@ -63,6 +63,22 @@ test('stamping is skipped for other hosts, commits, and when turned off, and nev
   assert.deepEqual({ ...job, branchFile: undefined }, { version: 1, repo: { host: 'github.com', owner: 'acme', repo: 'widgets' }, sha: snapshot.head, branch: 'feature', branchFile: undefined, status: true, comment: false });
 });
 
+test('a --base check against upstream from a fork starts the stamp job from the fork the branch is pushed to', async t => {
+  const env = await home(t), calls = [];
+  const checked = { ...snapshot, sourceRef: 'refs/heads/feature', target: { remote: 'upstream', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/main', mergeBase: true } };
+  const repoOf = async headUrl => {
+    calls.length = 0;
+    assert.equal(await scheduleStamp({ snapshot: checked, session, outcome: 'passed', config: config({}), env, spawnImpl: fakeSpawn(calls), pullRequest: 'feature', headUrl }), true);
+    return JSON.parse(await readFile(calls[0][1][1], 'utf8')).repo;
+  };
+  assert.deepEqual(await repoOf('https://github.com/me/widgets.git'), { host: 'github.com', owner: 'me', repo: 'widgets' });
+  assert.deepEqual(await repoOf(null), { host: 'github.com', owner: 'acme', repo: 'widgets' }, 'no push remote: the checked remote, as before');
+  assert.deepEqual(await repoOf('git@gitlab.com:me/widgets.git'), { host: 'github.com', owner: 'acme', repo: 'widgets' }, 'a push remote on another host is not where the pull request is');
+  calls.length = 0;
+  await scheduleStamp({ snapshot, session, outcome: 'passed', config: config({}), env, spawnImpl: fakeSpawn(calls), headUrl: 'https://github.com/me/widgets.git' });
+  assert.equal(JSON.parse(await readFile(calls[0][1][1], 'utf8')).repo.owner, 'acme', 'a push stamps the repository it went to');
+});
+
 function fakeGh(responses) {
   const calls = [];
   const gh = async (args, options) => {
@@ -174,6 +190,16 @@ test('from a fork, the stamp goes to the upstream pull request', async t => {
   assert.ok(calls.some(call => /upstream\/widgets\/issues\/9\/comments --method POST/.test(call.args.join(' '))));
 });
 
+test('a pass from sphinx check on a fork branch stamps the upstream pull request while the commit is its head', async t => {
+  const head = JSON.stringify([{ number: 9, head: snapshot.head }]);
+  const { gh, calls } = fakeGh([[/^auth/, ok()], [/repos\/me\/widgets\/commits\//, ok('sha')], [/^api user/, ok('me\n')], [/repos\/me\/widgets --jq/, ok('acme/widgets\n')],
+    [/repos\/me\/widgets\/pulls\?/, ok('[]')], [/repos\/acme\/widgets\/pulls\?state=open&head=me%3Afeature/, ok(head)], [/acme\/widgets\/pulls\/9 --jq/, ok(`${snapshot.head}\n`)],
+    [/acme\/widgets\/issues\/9\/comments --paginate/, ok('')], [/acme\/widgets\/issues\/9\/comments --method POST/, ok('https://github.com/c/9\n')]]);
+  const forked = await job(t, { repo: { host: 'github.com', owner: 'me', repo: 'widgets' }, comment: true, status: false, latest: true });
+  assert.equal(await runStampJob(forked, { gh, wait: async () => {} }), 'done');
+  assert.ok(calls.some(call => /acme\/widgets\/issues\/9\/comments --method POST/.test(call.args.join(' '))));
+});
+
 test('a repository running the Sphinx Action gets the comment instead of a commit status', async t => {
   const env = await home(t), calls = [];
   const repoRoot = join(env.SPHINX_HOME, 'repo');
@@ -221,13 +247,15 @@ async function widgetsRepository(t) {
   return { root, git };
 }
 
+const stampedRef = async snapshot => (await checkedPullRequestBranch(snapshot))?.ref;
+
 test('a pass from sphinx check stamps the destination pull request, or the checked branch one against the default branch or a --base', async t => {
   const { root } = await widgetsRepository(t);
   const at = (ref, sourceRef, extra = {}) => ({ ...snapshot, repoRoot: root, sourceRef, target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, ...extra } });
-  assert.equal(await checkedPullRequestBranch(at('refs/heads/feature', 'refs/heads/feature')), 'refs/heads/feature', 'a check of a push to feature');
-  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', 'refs/heads/feature')), 'refs/heads/feature', '--branch main from feature');
-  assert.equal(await checkedPullRequestBranch(at('refs/heads/release', 'refs/heads/feature', { mergeBase: true })), 'refs/heads/feature', '--base release: the pull request from feature, not one from release');
-  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', 'refs/heads/main', { mergeBase: true })), null);
+  assert.equal(await stampedRef(at('refs/heads/feature', 'refs/heads/feature')), 'refs/heads/feature', 'a check of a push to feature');
+  assert.equal(await stampedRef(at('refs/heads/main', 'refs/heads/feature')), 'refs/heads/feature', '--branch main from feature');
+  assert.equal(await stampedRef(at('refs/heads/release', 'refs/heads/feature', { mergeBase: true })), 'refs/heads/feature', '--base release: the pull request from feature, not one from release');
+  assert.equal(await stampedRef(at('refs/heads/main', 'refs/heads/main', { mergeBase: true })), undefined);
 });
 
 test('a pass from sphinx check stamps the pull request by the name the checked branch has on GitHub', async t => {
@@ -236,13 +264,47 @@ test('a pass from sphinx check stamps the pull request by the name the checked b
   await git('update-ref', 'refs/remotes/origin/feature', 'HEAD');
   await git('branch', '--set-upstream-to=origin/feature', 'local-feature');
   const at = (ref, extra = {}) => ({ ...snapshot, repoRoot: root, sourceRef: 'refs/heads/local-feature', target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref, ...extra } });
-  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', { mergeBase: true })), 'refs/heads/feature', '--base main: local-feature tracks origin/feature');
-  assert.equal(await checkedPullRequestBranch(at('refs/heads/main')), 'refs/heads/feature', '--branch main from local-feature');
+  assert.equal(await stampedRef(at('refs/heads/main', { mergeBase: true })), 'refs/heads/feature', '--base main: local-feature tracks origin/feature');
+  assert.equal(await stampedRef(at('refs/heads/main')), 'refs/heads/feature', '--branch main from local-feature');
   // Tracking a branch in another repository (a fork) says nothing of its name in this one.
   await git('remote', 'add', 'fork', 'git@github.com:someone/widgets.git');
   await git('update-ref', 'refs/remotes/fork/feature', 'HEAD');
   await git('branch', '--set-upstream-to=fork/feature', 'local-feature');
-  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', { mergeBase: true })), 'refs/heads/local-feature');
+  assert.equal(await stampedRef(at('refs/heads/main')), 'refs/heads/local-feature', '--branch main; a --base check goes through the fork, below');
   await git('branch', '--unset-upstream', 'local-feature');
-  assert.equal(await checkedPullRequestBranch(at('refs/heads/main', { mergeBase: true })), 'refs/heads/local-feature', 'no upstream: its own name');
+  assert.equal(await stampedRef(at('refs/heads/main', { mergeBase: true })), 'refs/heads/local-feature', 'no upstream: its own name');
+});
+
+test('a --base check from a fork stamps the pull request from the fork, by the name the branch is pushed under', async t => {
+  const { root, git } = await widgetsRepository(t);
+  // Pin push.default, so that a developer's global setting cannot change where Git pushes.
+  await git('config', 'push.default', 'simple');
+  await git('remote', 'add', 'fork', 'https://github.com/me/widgets.git');
+  await git('remote', 'set-url', '--push', 'fork', 'git@github.com:me/widgets.git');
+  await git('branch', 'local-feature');
+  const base = { ...snapshot, repoRoot: root, sourceRef: 'refs/heads/local-feature', target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/main', mergeBase: true } };
+  const fork = { ref: 'refs/heads/local-feature', headUrl: 'git@github.com:me/widgets.git' };
+  assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/local-feature', headUrl: null }, 'pushed nowhere: the checked remote, as before');
+  await git('update-ref', 'refs/remotes/fork/feature', 'HEAD');
+  await git('branch', '--set-upstream-to=fork/feature', 'local-feature');
+  assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/feature', headUrl: fork.headUrl }, 'tracks fork/feature: the fork, by its name there, with the push URL');
+  assert.deepEqual(await checkedPullRequestBranch({ ...base, target: { ...base.target, mergeBase: undefined } }), { ref: 'refs/heads/local-feature', headUrl: null }, '--branch main: unchanged');
+  // A triangular workflow: the branch tracks the branch it merges into, and is pushed to the fork under its own name.
+  await git('branch', '--set-upstream-to=origin/main', 'local-feature');
+  await git('config', 'branch.local-feature.pushRemote', 'fork');
+  assert.deepEqual(await checkedPullRequestBranch(base), fork, 'branch.<name>.pushRemote, not the tracked main');
+  await git('config', '--unset', 'branch.local-feature.pushRemote');
+  await git('config', 'remote.pushDefault', 'fork');
+  assert.deepEqual(await checkedPullRequestBranch(base), fork, 'remote.pushDefault');
+  await git('config', '--unset', 'remote.pushDefault');
+  assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/local-feature', headUrl: null }, 'pushed to origin, tracking origin/main: its own name, never main');
+  // remote.<name>.push names the branch on the fork, whatever it tracks.
+  await git('config', 'remote.pushDefault', 'fork');
+  await git('config', 'remote.fork.push', 'refs/heads/local-feature:refs/heads/review-me');
+  assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/review-me', headUrl: fork.headUrl }, 'remote.pushDefault and remote.<name>.push');
+  await git('config', '--unset', 'remote.pushDefault');
+  await git('config', '--unset', 'remote.fork.push');
+  await git('config', 'branch.local-feature.pushRemote', 'elsewhere');
+  await git('remote', 'add', 'elsewhere', 'git@gitlab.com:me/widgets.git');
+  assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/local-feature', headUrl: null }, 'pushed to another host: the checked remote');
 });

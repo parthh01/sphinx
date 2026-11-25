@@ -504,8 +504,10 @@ async function stampCheck(id, config, post) {
   const session = await store.read(id).catch(() => null);
   if (session?.status !== 'passed' || session.held) return;
   const { snapshot } = session;
-  const branch = await checkedPullRequestBranch(snapshot).catch(() => null);
-  if (branch) await scheduleStamp({ snapshot, session, outcome: 'passed', config, post, pullRequest: branch.slice('refs/heads/'.length) });
+  const pullRequest = await checkedPullRequestBranch(snapshot).catch(() => null);
+  if (!pullRequest) return;
+  // headUrl: a --base check of a branch pushed to another repository than the checked remote (a fork's upstream).
+  await scheduleStamp({ snapshot, session, outcome: 'passed', config, post, pullRequest: pullRequest.ref.slice('refs/heads/'.length), headUrl: pullRequest.headUrl });
 }
 
 function printPending(terminal, pending) {

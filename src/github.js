@@ -4,6 +4,7 @@ import { readdir, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getPaths, readJson, writeJson } from './config.js';
+import { pushDestination } from './git.js';
 
 // After Git continues, a detached worker marks the pushed commit on GitHub with
 // a `sphinx/understanding` commit status and, if the user opts in, keeps one
@@ -104,11 +105,15 @@ export function commentBody(records, { stampHead } = {}) {
  * Record the check and hand GitHub work to a detached worker so Git never
  * waits on the network. Never throws.
  */
-export async function scheduleStamp({ snapshot, session, outcome, config, env = process.env, spawnImpl = spawn, post, pullRequest }) {
+export async function scheduleStamp({ snapshot, session, outcome, config, env = process.env, spawnImpl = spawn, post, pullRequest, headUrl }) {
   try {
     const settings = config.github || {};
-    const repo = githubRepository(snapshot.target.url);
-    if (snapshot.event !== 'pre-push' || !repo) return false;
+    const target = githubRepository(snapshot.target.url);
+    if (snapshot.event !== 'pre-push' || !target) return false;
+    // A branch from a fork checked against upstream (--base main --remote upstream): its pull
+    // request is the fork's, so the job starts from the fork, which leads to upstream as for a push.
+    const fork = pullRequest ? githubRepository(headUrl) : null;
+    const repo = fork?.host === target.host ? fork : target;
     // With the Sphinx Action, its check run replaces the commit status and reads the comment.
     const action = await usesSphinxAction(snapshot.repoRoot);
     const comment = typeof post === 'boolean' ? post : action || !!settings.comment;
@@ -146,29 +151,39 @@ export async function pullRequestPush(snapshot) {
   return fallback ? branch !== fallback : !['main', 'master'].includes(branch);
 }
 
-// The name a local branch has in the pull request's repository: the branch it tracks
-// when that is on the same GitHub repository (Git lets the two names differ), else its own.
-async function remoteBranch(snapshot, ref) {
-  const run = args => new Promise(resolve => execFile('git', args, { cwd: snapshot.repoRoot }, (error, stdout) => resolve(error ? '' : stdout.trim())));
-  const [remote, remoteRef] = (await run(['for-each-ref', '--format=%(upstream:remotename)%00%(upstream:remoteref)', ref])).split('\0');
-  if (!remote || !remoteRef?.startsWith('refs/heads/')) return ref;
-  const tracked = githubRepository(await run(['remote', 'get-url', '--push', remote]));
-  const target = githubRepository(snapshot.target?.url);
-  const same = tracked && target && [tracked.host, tracked.owner, tracked.repo].join('/').toLowerCase() === [target.host, target.owner, target.repo].join('/').toLowerCase();
-  return same ? remoteRef : ref;
+const sameRepository = (a, b) => !!a && !!b && [a.host, a.owner, a.repo].join('/').toLowerCase() === [b.host, b.owner, b.repo].join('/').toLowerCase();
+
+// Where a local branch is pushed, as git push resolves it: that remote's push URL, and the
+// branch's name there. A branch pushed under another name than the one Git would pick
+// is named by the branch it tracks on that remote, unless that is the checked branch
+// itself (in a triangular workflow, the branch tracks the branch it merges into).
+async function pushedBranch(snapshot, ref) {
+  const destination = await pushDestination(snapshot.repoRoot, ref).catch(() => null);
+  if (!destination) return { ref, url: null };
+  const base = snapshot.target?.ref;
+  const name = [destination.ref, destination.tracked].find(candidate => candidate && candidate !== ref && candidate !== base) || ref;
+  const url = await new Promise(resolve => execFile('git', ['remote', 'get-url', '--push', destination.remote], { cwd: snapshot.repoRoot }, (error, stdout) => resolve(error ? '' : stdout.trim())));
+  return { ref: name, url: url || null };
 }
 
 /**
- * The branch whose pull request a pass from sphinx check stamps: the destination's, or
- * for a check against the default branch or with --base, the checked local branch's.
- * Null when there is none.
+ * The pull request a pass from sphinx check stamps, as { ref, headUrl }: the destination's
+ * branch, or for a check against the default branch or with --base, the checked local
+ * branch by the name it has where it is pushed. headUrl is set for a --base check of a
+ * branch pushed to another repository than the checked one (a fork checked against
+ * upstream), whose pull request is looked up from there. Null when there is none.
  */
 export async function checkedPullRequestBranch(snapshot) {
   const source = String(snapshot?.sourceRef || '');
-  const fromSource = source.startsWith('refs/heads/') && source !== snapshot?.target?.ref ? await remoteBranch(snapshot, source) : null;
-  // A check with --base names the branch a pull request merges into, so the pull request is the checked branch's.
-  if (snapshot?.target?.mergeBase) return fromSource;
-  return await pullRequestPush(snapshot) ? snapshot.target.ref : fromSource;
+  const own = source.startsWith('refs/heads/') && source !== snapshot?.target?.ref;
+  if (!snapshot?.target?.mergeBase && await pullRequestPush(snapshot)) return { ref: snapshot.target.ref, headUrl: null };
+  if (!own) return null;
+  const pushed = await pushedBranch(snapshot, source);
+  const target = githubRepository(snapshot.target?.url), head = githubRepository(pushed.url);
+  if (sameRepository(head, target)) return { ref: pushed.ref, headUrl: null };
+  // A check with --base names the branch a pull request merges into, so the pull request is the checked branch's, wherever it is pushed.
+  if (snapshot.target.mergeBase && head && head.host === target?.host) return { ref: pushed.ref, headUrl: pushed.url };
+  return { ref: source, headUrl: null };
 }
 
 /** The workflow that runs the Sphinx Action, pinned to this release's tag. */
