@@ -5,7 +5,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { getPaths, loadConfig, policyHash, readJson, writeJson } from './config.js';
-import { matches, pushSnapshots, repository, revalidateSnapshot } from './git.js';
+import { matches, pushDestination, pushSnapshots, repository, revalidateSnapshot } from './git.js';
 import { yoloStatus } from './overrides.js';
 import { createSessionStore } from './sessions.js';
 import { curateQuietly } from './working-context.js';
@@ -96,20 +96,9 @@ async function trackingRef(root, remote, ref, env) {
 // value, so pushSnapshots starts from the branch point exactly as the hook will.
 // All commands below read local config/refs; none contact a remote.
 async function expectedSnapshots(root, sourceRef, head, config, env) {
-  const setting = key => git(root, ['config', '--get', key], env, true);
-  const mode = await setting('push.default');
-  if (mode === 'nothing') return [];
-  const branch = sourceRef.slice('refs/heads/'.length);
-  const upstreamRemote = await setting(`branch.${branch}.remote`);
-  let remote = await setting(`branch.${branch}.pushRemote`) || await setting('remote.pushDefault') || upstreamRemote;
-  if (!remote) {
-    const remotes = (await git(root, ['remote'], env)).split('\n').filter(Boolean);
-    remote = remotes.includes('origin') ? 'origin' : remotes.length === 1 ? remotes[0] : '';
-  }
-  // %(push:remoteref) is set only when remote.<name>.push maps this branch.
-  const [mapped, upstream] = (await git(root, ['for-each-ref', '--format=%(push:remoteref)%00%(upstream:remoteref)', sourceRef], env, true)).split('\0');
-  const ref = mapped || (remote === upstreamRemote && ['upstream', 'tracking'].includes(mode) && upstream) || sourceRef;
-  if (!remote || remote === '.' || !ref.startsWith('refs/heads/')) return [];
+  const destination = await pushDestination(root, sourceRef, { env });
+  if (!destination || !destination.ref.startsWith('refs/heads/')) return [];
+  const { remote, ref } = destination;
   if (!config.branches.some(pattern => matches(pattern, ref.slice(11))) || !config.remotes.some(pattern => matches(pattern, remote))) return [];
   const tracking = await trackingRef(root, remote, ref, env);
   if (!tracking) return [];

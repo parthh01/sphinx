@@ -4,6 +4,7 @@ import { readdir, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getPaths, readJson, writeJson } from './config.js';
+import { pushDestination } from './git.js';
 
 // After Git continues, a detached worker marks the pushed commit on GitHub with
 // a `sphinx/understanding` commit status and, if the user opts in, keeps one
@@ -152,20 +153,17 @@ export async function pullRequestPush(snapshot) {
 
 const sameRepository = (a, b) => !!a && !!b && [a.host, a.owner, a.repo].join('/').toLowerCase() === [b.host, b.owner, b.repo].join('/').toLowerCase();
 
-// Where a local branch is pushed: the remote Git pushes it to (branch.<name>.pushRemote,
-// remote.pushDefault, then the remote it tracks), that remote's URL, and the branch's name
-// there. The name is the one Git resolves for the push, else the tracked branch's when it
-// tracks that same remote (Git lets the two names differ) and is not the checked branch,
-// else its own, which is what a push to another remote than the tracked one sends (a
-// triangular workflow, where the branch tracks the branch it merges into).
+// Where a local branch is pushed, as git push resolves it: that remote's push URL, and the
+// branch's name there. A branch pushed under another name than the one Git would pick
+// is named by the branch it tracks on that remote, unless that is the checked branch
+// itself (in a triangular workflow, the branch tracks the branch it merges into).
 async function pushedBranch(snapshot, ref) {
-  const run = args => new Promise(resolve => execFile('git', args, { cwd: snapshot.repoRoot }, (error, stdout) => resolve(error ? '' : stdout.trim())));
-  const [remote, push, upstream, upstreamRef] = (await run(['for-each-ref', '--format=%(push:remotename)%00%(push)%00%(upstream:remotename)%00%(upstream:remoteref)', ref])).split('\0');
-  if (!remote) return { ref, url: null };
-  const tracking = `refs/remotes/${remote}/`;
-  const name = push?.startsWith(tracking) ? `refs/heads/${push.slice(tracking.length)}`
-    : upstream === remote && upstreamRef?.startsWith('refs/heads/') && upstreamRef !== snapshot.target?.ref ? upstreamRef : ref;
-  return { ref: name, url: await run(['remote', 'get-url', '--push', remote]) || null };
+  const destination = await pushDestination(snapshot.repoRoot, ref).catch(() => null);
+  if (!destination) return { ref, url: null };
+  const base = snapshot.target?.ref;
+  const name = [destination.ref, destination.tracked].find(candidate => candidate && candidate !== ref && candidate !== base) || ref;
+  const url = await new Promise(resolve => execFile('git', ['remote', 'get-url', '--push', destination.remote], { cwd: snapshot.repoRoot }, (error, stdout) => resolve(error ? '' : stdout.trim())));
+  return { ref: name, url: url || null };
 }
 
 /**

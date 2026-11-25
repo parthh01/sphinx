@@ -298,6 +298,12 @@ test('a --base check from a fork stamps the pull request from the fork, by the n
   assert.deepEqual(await checkedPullRequestBranch(base), fork, 'remote.pushDefault');
   await git('config', '--unset', 'remote.pushDefault');
   assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/local-feature', headUrl: null }, 'pushed to origin, tracking origin/main: its own name, never main');
+  // remote.<name>.push names the branch on the fork, whatever it tracks.
+  await git('config', 'remote.pushDefault', 'fork');
+  await git('config', 'remote.fork.push', 'refs/heads/local-feature:refs/heads/review-me');
+  assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/review-me', headUrl: fork.headUrl }, 'remote.pushDefault and remote.<name>.push');
+  await git('config', '--unset', 'remote.pushDefault');
+  await git('config', '--unset', 'remote.fork.push');
   await git('config', 'branch.local-feature.pushRemote', 'elsewhere');
   await git('remote', 'add', 'elsewhere', 'git@gitlab.com:me/widgets.git');
   assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/local-feature', headUrl: null }, 'pushed to another host: the checked remote');

@@ -5,7 +5,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { commitSnapshot, manualSnapshot, matches, pushSnapshots, repository, revalidateSnapshot } from '../src/git.js';
+import { commitSnapshot, manualSnapshot, matches, pushDestination, pushSnapshots, repository, revalidateSnapshot } from '../src/git.js';
 
 const exec = promisify(execFile);
 const home = await mkdtemp(join(tmpdir(), 'sphinx-git-home-'));
@@ -695,4 +695,38 @@ test('a check against a base branch follows the branch policy, uses the remote i
   assert.equal(snapshot.target.remote, 'upstream');
   assert.equal(snapshot.base, f.forked);
   assert.deepEqual(snapshot.files, ['feature.txt']);
+});
+
+test('pushDestination is where git push sends a branch, read from local config and refs only', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'sphinx-push-destination-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+  const at = ref => pushDestination(cwd, ref, { env });
+  await command(cwd, 'init', '-q', '-b', 'main');
+  await command(cwd, '-c', 'user.name=Sphinx', '-c', 'user.email=sphinx@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'start');
+  await command(cwd, 'branch', 'topic');
+  assert.equal(await at('refs/heads/topic'), null, 'no remote');
+  assert.equal(await at('HEAD'), null);
+  await command(cwd, 'remote', 'add', 'upstream', 'git@github.com:acme/widgets.git');
+  assert.deepEqual(await at('refs/heads/topic'), { remote: 'upstream', ref: 'refs/heads/topic', tracked: null }, 'the only remote');
+  await command(cwd, 'remote', 'add', 'origin', 'git@github.com:me/widgets.git');
+  assert.deepEqual(await at('refs/heads/topic'), { remote: 'origin', ref: 'refs/heads/topic', tracked: null }, 'origin among several');
+  await command(cwd, 'update-ref', 'refs/remotes/upstream/main', 'HEAD');
+  await command(cwd, 'branch', '--set-upstream-to=upstream/main', 'topic');
+  assert.deepEqual(await at('refs/heads/topic'), { remote: 'upstream', ref: 'refs/heads/topic', tracked: 'refs/heads/main' }, 'the tracked remote; simple keeps the name');
+  await command(cwd, 'config', 'push.default', 'upstream');
+  assert.deepEqual(await at('refs/heads/topic'), { remote: 'upstream', ref: 'refs/heads/main', tracked: null }, 'push.default upstream goes to the tracked branch');
+  await command(cwd, 'config', 'push.default', 'current');
+  assert.deepEqual(await at('refs/heads/topic'), { remote: 'upstream', ref: 'refs/heads/topic', tracked: null });
+  await command(cwd, 'config', 'push.default', 'nothing');
+  assert.equal(await at('refs/heads/topic'), null, 'push.default nothing names no destination');
+  await command(cwd, 'config', '--unset', 'push.default');
+  await command(cwd, 'config', 'remote.pushDefault', 'origin');
+  assert.deepEqual(await at('refs/heads/topic'), { remote: 'origin', ref: 'refs/heads/topic', tracked: null }, 'remote.pushDefault: tracking upstream says nothing of the name on origin');
+  await command(cwd, 'config', 'remote.origin.push', 'refs/heads/topic:refs/heads/review-me');
+  assert.deepEqual(await at('refs/heads/topic'), { remote: 'origin', ref: 'refs/heads/review-me', tracked: null }, 'remote.<name>.push maps the name');
+  await command(cwd, 'config', 'branch.topic.pushRemote', 'upstream');
+  assert.deepEqual(await at('refs/heads/topic'), { remote: 'upstream', ref: 'refs/heads/topic', tracked: 'refs/heads/main' }, 'branch.<name>.pushRemote wins');
+  await command(cwd, 'config', 'branch.topic.pushRemote', '.');
+  assert.equal(await at('refs/heads/topic'), null, 'the "." remote');
 });

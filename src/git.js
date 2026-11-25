@@ -12,13 +12,13 @@ const OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const ZERO = /^0+$/;
 const hash = value => createHash('sha256').update(value).digest('hex');
 
-async function git(cwd, args, { allowFailure = false, maxBuffer = 4 * 1024 * 1024, timeout = 30000, input } = {}) {
+async function git(cwd, args, { allowFailure = false, maxBuffer = 4 * 1024 * 1024, timeout = 30000, input, env = process.env } = {}) {
   try {
     const running = exec('git', [
       '--no-pager', '--literal-pathspecs', '-c', 'core.fsmonitor=false', ...args,
     ], {
       cwd, encoding: 'utf8', maxBuffer, timeout,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' },
+      env: { ...env, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' },
     });
     running.child.stdin.on('error', () => {});
     running.child.stdin.end(input);
@@ -377,6 +377,40 @@ export async function commitSnapshot({ cwd = process.cwd(), config, env = proces
     repo, event: 'pre-commit', target: { remote: null, url: null, ref },
     base: head, head, tree: `index:${hash(indexIdentity)}`, sourceRef: ref, config, staged: true, indexIdentity, env,
   });
+}
+
+/**
+ * Where git push sends a local branch, from local config and refs only, or null when
+ * plain git push names no destination (push.default nothing, no remote, or the "." remote).
+ *
+ * remote: branch.<name>.pushRemote, remote.pushDefault, the remote it tracks, then origin
+ * or the only remote. ref: the branch there, as remote.<name>.push maps it, or the tracked
+ * branch under push.default upstream or tracking when it tracks that remote, else the
+ * same name (what git push sends, or the git push -u <remote> HEAD run where it refuses).
+ * tracked: under push.default simple, the branch it tracks on that remote under another
+ * name, which plain git push refuses to reach: a branch tracked there was pushed there by
+ * name, so a pull request from it has that name. Otherwise null.
+ */
+export async function pushDestination(cwd, sourceRef, { env = process.env } = {}) {
+  if (!String(sourceRef || '').startsWith('refs/heads/')) return null;
+  const run = async args => (await git(cwd, args, { allowFailure: true, env }))?.trim() || '';
+  const setting = key => run(['config', '--get', key]);
+  const mode = await setting('push.default');
+  if (mode === 'nothing') return null;
+  const branch = sourceRef.slice('refs/heads/'.length);
+  const upstreamRemote = await setting(`branch.${branch}.remote`);
+  let remote = await setting(`branch.${branch}.pushRemote`) || await setting('remote.pushDefault') || upstreamRemote;
+  if (!remote) {
+    const remotes = (await run(['remote'])).split('\n').filter(Boolean);
+    remote = remotes.includes('origin') ? 'origin' : remotes.length === 1 ? remotes[0] : '';
+  }
+  if (!remote || remote === '.') return null;
+  // %(push:remoteref) is set only when remote.<name>.push maps this branch.
+  const [mapped, upstream] = (await run(['for-each-ref', '--format=%(push:remoteref)%00%(upstream:remoteref)', sourceRef])).split('\0');
+  const sameRemote = remote === upstreamRemote && upstream?.startsWith('refs/heads/');
+  const ref = mapped || (sameRemote && ['upstream', 'tracking'].includes(mode) && upstream) || sourceRef;
+  const tracked = !mapped && sameRemote && ['', 'simple'].includes(mode) && upstream !== sourceRef ? upstream : null;
+  return { remote, ref, tracked };
 }
 
 export async function manualSnapshot(options) {
