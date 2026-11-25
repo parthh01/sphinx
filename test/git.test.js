@@ -481,6 +481,53 @@ test('a rebased branch pushed under another name is recognised when that remote 
   assert.equal(viaHead.base, main);
 });
 
+test('a branch rebased on a detached HEAD and pushed as HEAD:feature is recognised when HEAD came from the replaced tip', async t => {
+  const { cwd, pushed, main } = await rebaseFixture(t);
+  // A scratch worktree on the pushed tip, as an agent makes to rebase without touching the developer's checkout.
+  const scratch = await mkdtemp(join(tmpdir(), 'sphinx-git-scratch-'));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const wt = join(scratch, 'wt');
+  await command(cwd, 'worktree', 'add', '-q', '--detach', wt, 'refs/remotes/origin/feature');
+  await command(wt, 'rebase', '-q', 'refs/remotes/origin/main');
+  const head = await command(wt, 'rev-parse', 'HEAD');
+  const [snapshot] = await pushSnapshots({ cwd: wt, remote: 'origin', remoteUrl, config, input: `HEAD ${head} refs/heads/feature ${pushed}\n` });
+  assert.equal(snapshot.base, main);
+  assert.deepEqual(snapshot.files, ['feature.js']);
+  // The same in the main checkout, detached from the branch with git checkout --detach.
+  await command(cwd, 'checkout', '-q', '--detach', 'feature');
+  await command(cwd, 'rebase', '-q', 'main');
+  const rebased = await command(cwd, 'rev-parse', 'HEAD');
+  const [checkout] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input: `HEAD ${rebased} refs/heads/feature ${pushed}\n` });
+  assert.equal(checkout.base, main);
+  assert.deepEqual(checkout.files, ['feature.js']);
+});
+
+test('a detached HEAD that moved onto other history since the replaced tip is checked against that tip', async t => {
+  const { cwd, main } = await rebaseFixture(t);
+  // A second pushed commit, so the push adds more than one commit, all on origin/feature: every other rebase condition holds.
+  const pushed = await commit(cwd, { 'more.js': 'export const more = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/feature', pushed);
+  // HEAD sat on main's tip, then checked out the feature: HEAD:main overwrites main with another branch's work.
+  await command(cwd, 'checkout', '-q', '--detach', 'main');
+  await command(cwd, 'checkout', '-q', '--detach', pushed);
+  const input = `HEAD ${pushed} refs/heads/main ${main}\n`;
+  const [checkout] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
+  assert.equal(checkout.base, main);
+  assert.deepEqual(checkout.files, ['feature.js', 'more.js', 'theirs.js']);
+  // A reset onto the feature is a jump too.
+  await command(cwd, 'checkout', '-q', '--detach', 'main');
+  await command(cwd, 'reset', '-q', '--hard', pushed);
+  const [reset] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
+  assert.equal(reset.base, main);
+  assert.deepEqual(reset.files, ['feature.js', 'more.js', 'theirs.js']);
+  // So is git update-ref HEAD, as agents and scripts do: its reflog entry has an empty subject.
+  await command(cwd, 'checkout', '-q', '--detach', 'main');
+  await command(cwd, 'update-ref', 'HEAD', pushed);
+  const [updateRef] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
+  assert.equal(updateRef.base, main);
+  assert.deepEqual(updateRef.files, ['feature.js', 'more.js', 'theirs.js']);
+});
+
 test('a rebase that leaves nothing of the branch\'s own is not a change', async t => {
   const { cwd, pushed } = await rebaseFixture(t);
   // main took the branch's change (a squash merge), then moved on; the rebase drops the branch's commit.
