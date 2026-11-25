@@ -503,20 +503,29 @@ test('a branch rebased on a detached HEAD and pushed as HEAD:feature is recognis
 });
 
 test('a detached HEAD that moved onto other history since the replaced tip is checked against that tip', async t => {
-  const { cwd, pushed, main } = await rebaseFixture(t);
+  const { cwd, main } = await rebaseFixture(t);
+  // A second pushed commit, so the push adds more than one commit, all on origin/feature: every other rebase condition holds.
+  const pushed = await commit(cwd, { 'more.js': 'export const more = 1;\n' });
+  await command(cwd, 'update-ref', 'refs/remotes/origin/feature', pushed);
   // HEAD sat on main's tip, then checked out the feature: HEAD:main overwrites main with another branch's work.
   await command(cwd, 'checkout', '-q', '--detach', 'main');
   await command(cwd, 'checkout', '-q', '--detach', pushed);
   const input = `HEAD ${pushed} refs/heads/main ${main}\n`;
   const [checkout] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
   assert.equal(checkout.base, main);
-  assert.deepEqual(checkout.files, ['feature.js', 'theirs.js']);
+  assert.deepEqual(checkout.files, ['feature.js', 'more.js', 'theirs.js']);
   // A reset onto the feature is a jump too.
   await command(cwd, 'checkout', '-q', '--detach', 'main');
   await command(cwd, 'reset', '-q', '--hard', pushed);
   const [reset] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
   assert.equal(reset.base, main);
-  assert.deepEqual(reset.files, ['feature.js', 'theirs.js']);
+  assert.deepEqual(reset.files, ['feature.js', 'more.js', 'theirs.js']);
+  // So is git update-ref HEAD, as agents and scripts do: its reflog entry has an empty subject.
+  await command(cwd, 'checkout', '-q', '--detach', 'main');
+  await command(cwd, 'update-ref', 'HEAD', pushed);
+  const [updateRef] = await pushSnapshots({ cwd, remote: 'origin', remoteUrl, config, input });
+  assert.equal(updateRef.base, main);
+  assert.deepEqual(updateRef.files, ['feature.js', 'more.js', 'theirs.js']);
 });
 
 test('a rebase that leaves nothing of the branch\'s own is not a change', async t => {

@@ -251,18 +251,25 @@ async function pushesOwnBranch(root, remote, sourceRef, ref, old, head) {
 }
 
 // A detached HEAD pushed as HEAD:feature (a scratch worktree made with git worktree add
-// --detach wt origin/feature, then rebased) updates feature's own copy when HEAD's reflog
-// leads from the tip the push replaces to the pushed commit through rewrites only: a
-// rebase, commits, amends. A checkout or a reset on the way means HEAD may have moved onto
+// --detach wt origin/feature, then rebased) updates feature's own copy when every entry in
+// HEAD's reflog from the pushed commit back to the tip the push replaces is a known
+// rewrite: a rebase, a commit or amend, a cherry-pick. Any other entry, a checkout, a
+// reset, or the empty subject git update-ref HEAD writes, means HEAD may have moved onto
 // other history, such as another branch's work about to overwrite feature, so the push is
-// checked against the tip it replaces, as before. Reflog subjects are not translated.
+// checked against the tip it replaces, as before. The entry that reached the replaced tip
+// is how HEAD got there and is not judged. Reflog subjects are not translated. The walk
+// stops after REFLOG_WALK_LIMIT entries, so a long-lived checkout stays cheap; a replaced
+// tip further back falls back to the check against it.
+const REFLOG_WALK_LIMIT = 500;
+const REWRITE_SUBJECT = /^(?:rebase|commit|cherry-pick)\b/;
+
 async function rewroteReplacedTip(root, old, head) {
-  const log = await git(root, ['log', '--walk-reflogs', '--format=%H%x09%gs', 'HEAD', '--'], { allowFailure: true });
+  const log = await git(root, ['log', '--walk-reflogs', `--max-count=${REFLOG_WALK_LIMIT}`, '--format=%H%x09%gs', 'HEAD', '--'], { allowFailure: true });
   const entries = (log || '').split('\n').filter(Boolean).map(line => line.split('\t'));
   if (entries[0]?.[0] !== head) return false;
   for (const [oid, subject = ''] of entries) {
     if (oid === old) return true;
-    if (/^(checkout|reset): /.test(subject)) return false;
+    if (!REWRITE_SUBJECT.test(subject)) return false;
   }
   return false;
 }
