@@ -379,20 +379,6 @@ export async function commitSnapshot({ cwd = process.cwd(), config, env = proces
   });
 }
 
-/**
- * The push URL of the remote a branch is pushed to, by Git's own order
- * (branch.<name>.pushRemote, then remote.pushDefault, then branch.<name>.remote),
- * or null. A branch from a fork is pushed to the fork, whatever remote it was checked against.
- */
-export async function branchPushUrl(cwd, branchRef) {
-  if (!String(branchRef || '').startsWith('refs/heads/')) return null;
-  const name = branchRef.slice('refs/heads/'.length);
-  const setting = async key => (await git(cwd, ['config', '--get', key], { allowFailure: true }))?.trim() || '';
-  const remote = await setting(`branch.${name}.pushRemote`) || await setting('remote.pushDefault') || await setting(`branch.${name}.remote`);
-  if (!remote || !(await git(cwd, ['remote'])).split('\n').includes(remote)) return null;
-  return (await git(cwd, ['remote', 'get-url', '--push', remote], { allowFailure: true }))?.trim() || null;
-}
-
 export async function manualSnapshot(options) {
   const { cwd = process.cwd(), config, branch, base, env = process.env, notice } = options;
   const repo = await repository(cwd);

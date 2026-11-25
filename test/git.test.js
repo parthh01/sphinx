@@ -5,7 +5,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { branchPushUrl, commitSnapshot, manualSnapshot, matches, pushSnapshots, repository, revalidateSnapshot } from '../src/git.js';
+import { commitSnapshot, manualSnapshot, matches, pushSnapshots, repository, revalidateSnapshot } from '../src/git.js';
 
 const exec = promisify(execFile);
 const home = await mkdtemp(join(tmpdir(), 'sphinx-git-home-'));
@@ -695,23 +695,4 @@ test('a check against a base branch follows the branch policy, uses the remote i
   assert.equal(snapshot.target.remote, 'upstream');
   assert.equal(snapshot.base, f.forked);
   assert.deepEqual(snapshot.files, ['feature.txt']);
-});
-
-test('a branch is pushed where Git would push it: its push remote, the default push remote, then the remote it tracks', async t => {
-  const cwd = await mkdtemp(join(tmpdir(), 'sphinx-push-url-'));
-  t.after(() => rm(cwd, { recursive: true, force: true }));
-  await command(cwd, 'init', '-q', '-b', 'feature');
-  await command(cwd, 'remote', 'add', 'upstream', 'git@github.com:acme/widgets.git');
-  await command(cwd, 'remote', 'add', 'origin', 'https://github.com/me/widgets.git');
-  await command(cwd, 'remote', 'set-url', '--push', 'origin', 'git@github.com:me/widgets.git');
-  assert.equal(await branchPushUrl(cwd, 'refs/heads/feature'), null, 'a branch that tracks nothing names no remote');
-  await command(cwd, 'config', 'branch.feature.remote', 'upstream');
-  assert.equal(await branchPushUrl(cwd, 'refs/heads/feature'), 'git@github.com:acme/widgets.git');
-  await command(cwd, 'config', 'remote.pushDefault', 'origin');
-  assert.equal(await branchPushUrl(cwd, 'refs/heads/feature'), 'git@github.com:me/widgets.git', 'the push URL, not the fetch URL');
-  await command(cwd, 'config', 'branch.feature.pushRemote', 'upstream');
-  assert.equal(await branchPushUrl(cwd, 'refs/heads/feature'), 'git@github.com:acme/widgets.git');
-  await command(cwd, 'config', 'branch.feature.pushRemote', 'gone');
-  assert.equal(await branchPushUrl(cwd, 'refs/heads/feature'), null, 'a remote that is not configured');
-  assert.equal(await branchPushUrl(cwd, 'HEAD'), null);
 });
