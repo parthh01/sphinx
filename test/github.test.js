@@ -236,9 +236,14 @@ test('a check against a base branch is for the checked branch pull request into 
 async function widgetsRepository(t) {
   const root = await mkdtemp(join(tmpdir(), 'sphinx-github-repo-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const git = (...args) => exec('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'user.name=Sphinx test', '-c', 'user.email=sphinx@example.invalid', ...args], {
-    cwd: root, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
-  });
+  // The resolver runs Git with process.env, so isolate it too from the developer's Git config
+  // (a global remote.pushDefault or push.default would change where Git pushes).
+  for (const [name, value] of Object.entries({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' })) {
+    const before = process.env[name];
+    process.env[name] = value;
+    t.after(() => { if (before === undefined) delete process.env[name]; else process.env[name] = before; });
+  }
+  const git = (...args) => exec('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'user.name=Sphinx test', '-c', 'user.email=sphinx@example.invalid', ...args], { cwd: root, env: process.env });
   await git('init', '-q', '-b', 'main');
   await git('commit', '-q', '--allow-empty', '-m', 'start');
   await git('remote', 'add', 'origin', 'git@github.com:acme/widgets.git');
@@ -333,6 +338,13 @@ test('a pass from sphinx check names the branch as it is on the remote, not by i
   assert.equal(await stampedRef(base), 'refs/heads/local-feature', 'push.default=current: its own name, not cache/local-feature');
   await git('config', 'remote.origin.push', 'refs/heads/local-feature:refs/heads/reviewed');
   assert.equal(await stampedRef(base), 'refs/heads/reviewed', 'a push refspec: where it maps the branch, not cache/reviewed');
+  // A fetch refspec that covers only review leaves %(push) empty; push.default still decides.
+  await git('config', '--unset', 'remote.origin.push');
+  await git('config', 'remote.origin.fetch', '+refs/heads/review:refs/remotes/origin/review');
+  await git('update-ref', 'refs/remotes/origin/review', 'HEAD');
+  assert.equal(await stampedRef(base), 'refs/heads/local-feature', 'push.default=current, no tracking ref for the push: its own name, not review');
+  await git('config', 'push.default', 'upstream');
+  assert.equal(await stampedRef(base), 'refs/heads/review', 'push.default=upstream: still the tracked branch');
 });
 
 test('a check against the default branch of a branch pushed to a fork stamps the branch it tracks, as before --base', async t => {

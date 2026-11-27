@@ -157,20 +157,23 @@ const sameRepository = (a, b) => !!a && !!b && [a.host, a.owner, a.repo].join('/
 
 // Where a local branch is pushed: the remote Git pushes it to (branch.<name>.pushRemote,
 // remote.pushDefault, the remote it tracks, then origin or the only remote), that remote's
-// URL, and the branch's name there. The name is the one a push refspec maps it to, else
-// the tracked branch's when the push goes to it (Git lets the two names differ) and it is
-// not the checked branch, else its own, which is what push.default=current and a push to
-// another remote than the tracked one send (a triangular workflow, where the branch tracks
-// the branch it merges into). Also returns the tracked branch, as { remote, ref }.
+// URL, and the branch's name there. The name is the one a push refspec maps it to, else,
+// under push.default=upstream or simple, the tracked branch's when it is on that remote
+// (Git lets the two names differ) and is not the checked branch, else its own, which is
+// what push.default=current sends and what a push to another remote than the tracked one
+// sends (a triangular workflow, where the branch tracks the branch it merges into). The
+// push mode decides, not %(push), which is empty when no fetch refspec covers the branch.
+// Also returns the tracked branch, as { remote, ref }.
 async function pushedBranch(snapshot, ref) {
   const run = args => gitOutput(snapshot.repoRoot, args);
-  const [explicit, push, pushRef, upstream, upstreamTracking, upstreamRef] = (await run(['for-each-ref', '--format=%(push:remotename)%00%(push)%00%(push:remoteref)%00%(upstream:remotename)%00%(upstream)%00%(upstream:remoteref)', ref])).split('\0');
+  const [explicit, push, pushRef, upstream, upstreamRef] = (await run(['for-each-ref', '--format=%(push:remotename)%00%(push)%00%(push:remoteref)%00%(upstream:remotename)%00%(upstream:remoteref)', ref])).split('\0');
   const tracked = { remote: upstream || null, ref: upstreamRef?.startsWith('refs/heads/') ? upstreamRef : null };
   // %(push:remotename) is empty when Git falls back to its default remote, though %(push) is set.
   const remotes = explicit || !push ? [] : (await run(['remote'])).split('\n').filter(Boolean);
   const remote = explicit || (remotes.includes('origin') ? 'origin' : remotes.length === 1 ? remotes[0] : '');
   if (!remote) return { ref, url: null, tracked };
-  const toTracked = upstream === remote && tracked.ref && tracked.ref !== snapshot.target?.ref && (!push || push === upstreamTracking);
+  const mode = await run(['config', '--get', 'push.default']) || 'simple';
+  const toTracked = ['simple', 'upstream', 'tracking'].includes(mode) && upstream === remote && tracked.ref && tracked.ref !== snapshot.target?.ref;
   const name = pushRef?.startsWith('refs/heads/') ? pushRef : toTracked ? tracked.ref : ref;
   return { ref: name, url: await run(['remote', 'get-url', '--push', remote]) || null, tracked };
 }
