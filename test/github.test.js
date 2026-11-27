@@ -302,3 +302,48 @@ test('a --base check from a fork stamps the pull request from the fork, by the n
   await git('remote', 'add', 'elsewhere', 'git@gitlab.com:me/widgets.git');
   assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/local-feature', headUrl: null }, 'pushed to another host: the checked remote');
 });
+
+test('a --base check from a fork finds the fork when Git pushes to its default remote, which it does not name', async t => {
+  // Here origin is the fork and upstream the checked repository; local-feature tracks nothing.
+  const { root, git } = await widgetsRepository(t);
+  await git('remote', 'rename', 'origin', 'fork');
+  await git('remote', 'set-url', 'fork', 'git@github.com:me/widgets.git');
+  await git('config', 'push.default', 'current');
+  await git('branch', 'local-feature');
+  const base = { ...snapshot, repoRoot: root, sourceRef: 'refs/heads/local-feature', target: { remote: 'upstream', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/main', mergeBase: true } };
+  const fork = { ref: 'refs/heads/local-feature', headUrl: 'git@github.com:me/widgets.git' };
+  assert.deepEqual(await checkedPullRequestBranch(base), fork, 'the only remote, whatever its name');
+  await git('remote', 'add', 'upstream', 'git@github.com:acme/widgets.git');
+  assert.deepEqual(await checkedPullRequestBranch(base), { ref: 'refs/heads/local-feature', headUrl: null }, 'several remotes, none named origin: Git pushes nowhere');
+  await git('remote', 'rename', 'fork', 'origin');
+  assert.deepEqual(await checkedPullRequestBranch(base), fork, 'origin, among several');
+});
+
+test('a pass from sphinx check names the branch as it is on the remote, not by its tracking ref there', async t => {
+  const { root, git } = await widgetsRepository(t);
+  await git('config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/cache/*');
+  await git('branch', 'local-feature');
+  await git('config', 'branch.local-feature.remote', 'origin');
+  await git('config', 'branch.local-feature.merge', 'refs/heads/review');
+  await git('update-ref', 'refs/remotes/origin/cache/review', 'HEAD');
+  const base = { ...snapshot, repoRoot: root, sourceRef: 'refs/heads/local-feature', target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/main', mergeBase: true } };
+  await git('config', 'push.default', 'upstream');
+  assert.equal(await stampedRef(base), 'refs/heads/review', 'push.default=upstream: the tracked branch');
+  await git('config', 'push.default', 'current');
+  assert.equal(await stampedRef(base), 'refs/heads/local-feature', 'push.default=current: its own name, not cache/local-feature');
+  await git('config', 'remote.origin.push', 'refs/heads/local-feature:refs/heads/reviewed');
+  assert.equal(await stampedRef(base), 'refs/heads/reviewed', 'a push refspec: where it maps the branch, not cache/reviewed');
+});
+
+test('a check against the default branch of a branch pushed to a fork stamps the branch it tracks, as before --base', async t => {
+  const { root, git } = await widgetsRepository(t);
+  await git('config', 'push.default', 'simple');
+  await git('remote', 'add', 'fork', 'git@github.com:me/widgets.git');
+  await git('branch', 'local-feature');
+  await git('update-ref', 'refs/remotes/origin/feature', 'HEAD');
+  await git('branch', '--set-upstream-to=origin/feature', 'local-feature');
+  await git('config', 'branch.local-feature.pushRemote', 'fork');
+  const at = (extra = {}) => ({ ...snapshot, repoRoot: root, sourceRef: 'refs/heads/local-feature', target: { remote: 'origin', url: 'git@github.com:acme/widgets.git', ref: 'refs/heads/main', ...extra } });
+  assert.deepEqual(await checkedPullRequestBranch(at()), { ref: 'refs/heads/feature', headUrl: null }, '--branch main: origin/feature, as before');
+  assert.deepEqual(await checkedPullRequestBranch(at({ mergeBase: true })), { ref: 'refs/heads/local-feature', headUrl: 'git@github.com:me/widgets.git' }, '--base main: the fork');
+});

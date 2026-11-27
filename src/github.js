@@ -150,22 +150,29 @@ export async function pullRequestPush(snapshot) {
   return fallback ? branch !== fallback : !['main', 'master'].includes(branch);
 }
 
+// A Git command's trimmed output, or '' when it fails.
+const gitOutput = (cwd, args) => new Promise(resolve => execFile('git', args, { cwd }, (error, stdout) => resolve(error ? '' : stdout.trim())));
+
 const sameRepository = (a, b) => !!a && !!b && [a.host, a.owner, a.repo].join('/').toLowerCase() === [b.host, b.owner, b.repo].join('/').toLowerCase();
 
 // Where a local branch is pushed: the remote Git pushes it to (branch.<name>.pushRemote,
-// remote.pushDefault, then the remote it tracks), that remote's URL, and the branch's name
-// there. The name is the one Git resolves for the push, else the tracked branch's when it
-// tracks that same remote (Git lets the two names differ) and is not the checked branch,
-// else its own, which is what a push to another remote than the tracked one sends (a
-// triangular workflow, where the branch tracks the branch it merges into).
+// remote.pushDefault, the remote it tracks, then origin or the only remote), that remote's
+// URL, and the branch's name there. The name is the one a push refspec maps it to, else
+// the tracked branch's when the push goes to it (Git lets the two names differ) and it is
+// not the checked branch, else its own, which is what push.default=current and a push to
+// another remote than the tracked one send (a triangular workflow, where the branch tracks
+// the branch it merges into). Also returns the tracked branch, as { remote, ref }.
 async function pushedBranch(snapshot, ref) {
-  const run = args => new Promise(resolve => execFile('git', args, { cwd: snapshot.repoRoot }, (error, stdout) => resolve(error ? '' : stdout.trim())));
-  const [remote, push, upstream, upstreamRef] = (await run(['for-each-ref', '--format=%(push:remotename)%00%(push)%00%(upstream:remotename)%00%(upstream:remoteref)', ref])).split('\0');
-  if (!remote) return { ref, url: null };
-  const tracking = `refs/remotes/${remote}/`;
-  const name = push?.startsWith(tracking) ? `refs/heads/${push.slice(tracking.length)}`
-    : upstream === remote && upstreamRef?.startsWith('refs/heads/') && upstreamRef !== snapshot.target?.ref ? upstreamRef : ref;
-  return { ref: name, url: await run(['remote', 'get-url', '--push', remote]) || null };
+  const run = args => gitOutput(snapshot.repoRoot, args);
+  const [explicit, push, pushRef, upstream, upstreamTracking, upstreamRef] = (await run(['for-each-ref', '--format=%(push:remotename)%00%(push)%00%(push:remoteref)%00%(upstream:remotename)%00%(upstream)%00%(upstream:remoteref)', ref])).split('\0');
+  const tracked = { remote: upstream || null, ref: upstreamRef?.startsWith('refs/heads/') ? upstreamRef : null };
+  // %(push:remotename) is empty when Git falls back to its default remote, though %(push) is set.
+  const remotes = explicit || !push ? [] : (await run(['remote'])).split('\n').filter(Boolean);
+  const remote = explicit || (remotes.includes('origin') ? 'origin' : remotes.length === 1 ? remotes[0] : '');
+  if (!remote) return { ref, url: null, tracked };
+  const toTracked = upstream === remote && tracked.ref && tracked.ref !== snapshot.target?.ref && (!push || push === upstreamTracking);
+  const name = pushRef?.startsWith('refs/heads/') ? pushRef : toTracked ? tracked.ref : ref;
+  return { ref: name, url: await run(['remote', 'get-url', '--push', remote]) || null, tracked };
 }
 
 /**
@@ -185,7 +192,11 @@ export async function checkedPullRequestBranch(snapshot) {
   if (sameRepository(head, target)) return { ref: pushed.ref, headUrl: null };
   // A check with --base names the branch a pull request merges into, so the pull request is the checked branch's, wherever it is pushed.
   if (snapshot.target.mergeBase && head && head.host === target?.host) return { ref: pushed.ref, headUrl: pushed.url };
-  return { ref: source, headUrl: null };
+  // Otherwise the checked remote, by the name of the branch it tracks there (as before this
+  // resolver), unless that is the checked branch itself, which a triangular branch tracks.
+  const run = args => gitOutput(snapshot.repoRoot, args);
+  const tracked = pushed.tracked.ref && pushed.tracked.ref !== snapshot.target.ref ? githubRepository(await run(['remote', 'get-url', '--push', pushed.tracked.remote])) : null;
+  return { ref: sameRepository(tracked, target) ? pushed.tracked.ref : source, headUrl: null };
 }
 
 /** The workflow that runs the Sphinx Action, pinned to this release's tag. */
